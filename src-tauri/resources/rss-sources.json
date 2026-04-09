@@ -1,0 +1,80 @@
+[
+  {
+    "id": "openai-blog",
+    "name": "OpenAI Blog",
+    "url": "https://openai.com/news/rss.xml",
+    "enabled": true
+  },
+  {
+    "id": "google-deepmind-blog",
+    "name": "Google DeepMind Blog",
+    "url": "https://blog.google/technology/ai/rss/",
+    "enabled": true
+  },
+  {
+    "id": "hugging-face-blog",
+    "name": "Hugging Face Blog",
+    "url": "https://huggingface.co/blog/feed.xml",
+    "enabled": true
+  },
+  {
+    "id": "langchain-blog",
+    "name": "LangChain Blog",
+    "url": "https://blog.langchain.dev/rss/",
+    "enabled": true
+  },
+  {
+    "id": "github-blog",
+    "name": "GitHub Blog",
+    "url": "https://github.blog/feed/",
+    "enabled": true
+  },
+  {
+    "id": "hacker-news",
+    "name": "Hacker News Frontpage",
+    "url": "https://hnrss.org/frontpage",
+    "enabled": true
+  },
+  {
+    "id": "simon-willison",
+    "name": "Simon Willison",
+    "url": "https://simonwillison.net/atom/everything/",
+    "enabled": true
+  },
+  {
+    "id": "microsoft-research",
+    "name": "Microsoft Research",
+    "url": "https://www.microsoft.com/en-us/research/feed/",
+    "enabled": true
+  },
+  {
+    "id": "arxiv-ai",
+    "name": "ArXiv AI",
+    "url": "https://arxiv.org/rss/cs.AI",
+    "enabled": true
+  },
+  {
+    "id": "venturebeat-ai",
+    "name": "VentureBeat AI",
+    "url": "https://venturebeat.com/category/ai/feed/",
+    "enabled": true
+  },
+  {
+    "id": "mit-technology-review-ai",
+    "name": "MIT Technology Review AI",
+    "url": "https://www.technologyreview.com/feed/",
+    "enabled": true
+  },
+  {
+    "id": "the-gradient",
+    "name": "The Gradient",
+    "url": "https://thegradient.pub/feed/",
+    "enabled": true
+  },
+  {
+    "id": "ai-weekly",
+    "name": "AI Weekly",
+    "url": "https://aiweekly.co/feed/",
+    "enabled": true
+  }
+]
