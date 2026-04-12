@@ -40,7 +40,7 @@ pub async fn validate_api_key(api_key: &str) -> Result<()> {
 
 pub async fn summarize_and_score_batch(
     api_key: &str,
-    interest_profile: &str,
+    interest_context: &str,
     articles: &[FeedArticle],
 ) -> Result<Vec<LlmResult>> {
     let trimmed_key = api_key.trim();
@@ -56,7 +56,11 @@ pub async fn summarize_and_score_batch(
         .enumerate()
         .map(|(index, article)| {
             format!(
-                "INDEX: {index}\nTITLE: {}\nCONTENT: {}",
+                "INDEX: {index}\nSOURCE: {}\nDISCIPLINE: {:?}\nSOURCE_KIND: {:?}\nRESOURCE_TYPE: {:?}\nTITLE: {}\nCONTENT: {}",
+                article.source_name,
+                article.discipline,
+                article.source_kind,
+                article.resource_type,
                 article.title,
                 truncate(&article.content, 1600)
             )
@@ -76,7 +80,7 @@ Rules:\n\
 - fit_score must be an integer from 0 to 100.\n\
 - Do not output markdown, code fences, explanation, or extra keys.\n\
 \n\
-User interest profile:\n{interest_profile}\n\
+Personalization context:\n{interest_context}\n\
 \n\
 Articles:\n{article_payload}"
     );
@@ -117,15 +121,19 @@ Articles:\n{article_payload}"
 
 pub async fn summarize_and_score_single(
     api_key: &str,
-    interest_profile: &str,
+    interest_context: &str,
     article: &FeedArticle,
 ) -> Result<LlmResult> {
-    let mut results = summarize_and_score_batch(api_key, interest_profile, std::slice::from_ref(article))
-        .await
-        .with_context(|| format!("single article scoring failed: {}", article.title))?;
-    results
-        .pop()
-        .ok_or_else(|| anyhow!("single article scoring returned no result: {}", article.title))
+    let mut results =
+        summarize_and_score_batch(api_key, interest_context, std::slice::from_ref(article))
+            .await
+            .with_context(|| format!("single article scoring failed: {}", article.title))?;
+    results.pop().ok_or_else(|| {
+        anyhow!(
+            "single article scoring returned no result: {}",
+            article.title
+        )
+    })
 }
 
 fn extract_message_content(payload: &Value) -> Option<String> {
@@ -149,11 +157,19 @@ fn extract_message_content(payload: &Value) -> Option<String> {
     }
 }
 
-async fn score_batch_once(api_key: &str, body: &Value, expected_len: usize) -> Result<Vec<LlmResult>> {
+async fn score_batch_once(
+    api_key: &str,
+    body: &Value,
+    expected_len: usize,
+) -> Result<Vec<LlmResult>> {
     let payload = send_chat_completion_with_retries(api_key, body).await?;
     let raw_content = extract_message_content(&payload).context("missing llm response content")?;
-    let normalized = normalize_json_response(&raw_content)
-        .ok_or_else(|| anyhow!("no parseable JSON found in model response: {}", truncate(&raw_content, 200)))?;
+    let normalized = normalize_json_response(&raw_content).ok_or_else(|| {
+        anyhow!(
+            "no parseable JSON found in model response: {}",
+            truncate(&raw_content, 200)
+        )
+    })?;
     let json_value: Value = serde_json::from_str(&normalized)
         .with_context(|| format!("model JSON parse failed: {}", truncate(&raw_content, 200)))?;
     parse_batch_result(&json_value, expected_len)
@@ -186,7 +202,11 @@ async fn send_chat_completion_with_retries(api_key: &str, body: &Value) -> Resul
     Err(last_error.unwrap_or_else(|| anyhow!("unknown llm request failure")))
 }
 
-async fn send_chat_completion_once(client: &reqwest::Client, api_key: &str, body: &Value) -> Result<Value> {
+async fn send_chat_completion_once(
+    client: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+) -> Result<Value> {
     let response = client
         .post(chat_completions_url())
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
@@ -379,10 +399,10 @@ fn parse_llm_result(value: &Value) -> Result<LlmResult> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("missing recommendation_reason"))?
         .to_string();
-    let fit_level = parse_fit_level(value.get("fit_level"))
-        .ok_or_else(|| anyhow!("unrecognized fit_level"))?;
-    let fit_score = parse_fit_score(value.get("fit_score"))
-        .ok_or_else(|| anyhow!("unrecognized fit_score"))?;
+    let fit_level =
+        parse_fit_level(value.get("fit_level")).ok_or_else(|| anyhow!("unrecognized fit_level"))?;
+    let fit_score =
+        parse_fit_score(value.get("fit_score")).ok_or_else(|| anyhow!("unrecognized fit_score"))?;
 
     Ok(LlmResult {
         summary,

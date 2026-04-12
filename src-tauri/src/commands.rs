@@ -63,6 +63,18 @@ pub async fn save_settings(
 pub fn open_article(app: AppHandle, article_id: i64) -> Result<Snapshot, String> {
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::mark_article_opened(&conn, article_id).map_err(|err| err.to_string())?;
+    let source_id = db::article_source_id(&conn, article_id).map_err(|err| err.to_string())?;
+    db::log_user_event(
+        &conn,
+        "open-article",
+        Some(article_id),
+        source_id.as_deref(),
+        Some(r#"{"origin":"main"}"#),
+    )
+    .map_err(|err| err.to_string())?;
+    let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
+    let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)
+        .map_err(|err| err.to_string())?;
     service::sync_windows(&app, false).map_err(|err| err.to_string())?;
     service::snapshot(&app, false).map_err(|err| err.to_string())
 }
@@ -70,7 +82,23 @@ pub fn open_article(app: AppHandle, article_id: i64) -> Result<Snapshot, String>
 #[tauri::command]
 pub fn toggle_favorite(app: AppHandle, article_id: i64) -> Result<Snapshot, String> {
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
-    db::toggle_favorite(&conn, article_id).map_err(|err| err.to_string())?;
+    let is_favorite = db::toggle_favorite(&conn, article_id).map_err(|err| err.to_string())?;
+    let source_id = db::article_source_id(&conn, article_id).map_err(|err| err.to_string())?;
+    db::log_user_event(
+        &conn,
+        if is_favorite {
+            "favorite-added"
+        } else {
+            "favorite-removed"
+        },
+        Some(article_id),
+        source_id.as_deref(),
+        None,
+    )
+    .map_err(|err| err.to_string())?;
+    let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
+    let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)
+        .map_err(|err| err.to_string())?;
     service::snapshot(&app, false).map_err(|err| err.to_string())
 }
 

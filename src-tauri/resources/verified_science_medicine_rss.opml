@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>Verified Science & Medicine RSS Catalog (Physics, Chemistry, Biology, Medicine)</title>
+    <dateCreated>Sun, 12 Apr 2026 15:02:16 GMT</dateCreated>
+    <ownerName>OpenAI ChatGPT</ownerName>
+  </head>
+  <body>
+    <outline text="Verified Science &amp; Medicine RSS Catalog (36 feeds)" title="Verified Science &amp; Medicine RSS Catalog (36 feeds)">
+      <outline text="Physics / 物理学" title="Physics / 物理学">
+        <outline text="Journals &amp; Research" title="Journals &amp; Research">
+          <outline text="APS Physics Magazine — Recent Articles" title="APS Physics Magazine — Recent Articles" type="rss" xmlUrl="http://feeds.aps.org/rss/recent/physics.xml" htmlUrl="https://physics.aps.org/"/>
+          <outline text="Nature Physics" title="Nature Physics" type="rss" xmlUrl="https://www.nature.com/nphys.rss" htmlUrl="https://www.nature.com/nphys/"/>
+          <outline text="Nature Physics Topic Feed" title="Nature Physics Topic Feed" type="rss" xmlUrl="https://www.nature.com/subjects/physics.rss" htmlUrl="https://www.nature.com/subjects/physics"/>
+          <outline text="Physics World" title="Physics World" type="rss" xmlUrl="https://physicsworld.com/feed/" htmlUrl="https://physicsworld.com/"/>
+        </outline>
+        <outline text="Blogs" title="Blogs">
+          <outline text="Shtetl-Optimized (Scott Aaronson)" title="Shtetl-Optimized (Scott Aaronson)" type="rss" xmlUrl="https://scottaaronson.blog/?feed=rss2" htmlUrl="https://scottaaronson.blog/"/>
+        </outline>
+        <outline text="Podcasts / Streaming" title="Podcasts / Streaming">
+          <outline text="Physics World Weekly Podcast" title="Physics World Weekly Podcast" type="rss" xmlUrl="https://physicsworld.com/feed/podcast-weekly" htmlUrl="https://physicsworld.com/podcasts/"/>
+        </outline>
+      </outline>
+      <outline text="Chemistry / 化学" title="Chemistry / 化学">
+        <outline text="Journals &amp; Research" title="Journals &amp; Research">
+          <outline text="Chemistry World" title="Chemistry World" type="rss" xmlUrl="https://www.chemistryworld.com/rss" htmlUrl="https://www.chemistryworld.com/"/>
+          <outline text="Chemical Science (RSC)" title="Chemical Science (RSC)" type="rss" xmlUrl="https://feeds.rsc.org/rss/sc" htmlUrl="https://pubs.rsc.org/en/journals/journalissues/sc"/>
+          <outline text="Analyst (RSC)" title="Analyst (RSC)" type="rss" xmlUrl="https://feeds.rsc.org/rss/an" htmlUrl="https://pubs.rsc.org/en/journals/journalissues/an"/>
+          <outline text="Physical Chemistry Chemical Physics (RSC)" title="Physical Chemistry Chemical Physics (RSC)" type="rss" xmlUrl="https://feeds.rsc.org/rss/cp" htmlUrl="https://pubs.rsc.org/en/journals/journalissues/cp"/>
+          <outline text="C&amp;EN — Most Recent" title="C&amp;EN — Most Recent" type="rss" xmlUrl="https://cen.acs.org/feeds/rss/latestnews.xml" htmlUrl="https://cen.acs.org/"/>
+          <outline text="C&amp;EN — Biological Chemistry" title="C&amp;EN — Biological Chemistry" type="rss" xmlUrl="https://cen.acs.org/feeds/rss/topic/biologicalChemistry.xml" htmlUrl="https://cen.acs.org/"/>
+          <outline text="C&amp;EN — Physical Chemistry" title="C&amp;EN — Physical Chemistry" type="rss" xmlUrl="https://cen.acs.org/feeds/rss/topic/physicalChemistry.xml" htmlUrl="https://cen.acs.org/"/>
+        </outline>
+        <outline text="Blogs" title="Blogs">
+          <outline text="In the Pipeline (Derek Lowe)" title="In the Pipeline (Derek Lowe)" type="rss" xmlUrl="https://www.science.org/blogs/pipeline/feed" htmlUrl="https://www.science.org/blogs/pipeline"/>
+        </outline>
+        <outline text="Podcasts / Streaming" title="Podcasts / Streaming">
+          <outline text="Stereo Chemistry (C&amp;EN Podcast)" title="Stereo Chemistry (C&amp;EN Podcast)" type="rss" xmlUrl="https://stereochemistry.libsyn.com/rss" htmlUrl="https://cen.acs.org/explore/podcasts/stereo-chemistry.html"/>
+          <outline text="Chemistry in its Element" title="Chemistry in its Element" type="rss" xmlUrl="https://chemistryinitselement.libsyn.com/rss" htmlUrl="https://www.chemistryworld.com/chemistry-in-its-element-the-elements/218.subject"/>
+        </outline>
+      </outline>
+      <outline text="Biology / 生物学" title="Biology / 生物学">
+        <outline text="Preprints &amp; Journals" title="Preprints &amp; Journals">
+          <outline text="bioRxiv — Recent Issues" title="bioRxiv — Recent Issues" type="rss" xmlUrl="https://www.biorxiv.org/rss/recent.xml" htmlUrl="https://www.biorxiv.org/rss"/>
+          <outline text="Nature — Biological Sciences" title="Nature — Biological Sciences" type="rss" xmlUrl="https://www.nature.com/subjects/biological-sciences.rss" htmlUrl="https://www.nature.com/subjects/biological-sciences"/>
+          <outline text="Nature — Biological Sciences (Nature Journal Only)" title="Nature — Biological Sciences (Nature Journal Only)" type="rss" xmlUrl="https://www.nature.com/subjects/biological-sciences/nature.rss" htmlUrl="https://www.nature.com/subjects/biological-sciences/nature"/>
+        </outline>
+        <outline text="Podcasts / Streaming" title="Podcasts / Streaming">
+          <outline text="This Week in Microbiology (TWiM)" title="This Week in Microbiology (TWiM)" type="rss" xmlUrl="https://feeds.feedburner.com/twim" htmlUrl="https://www.microbe.tv/twim/"/>
+          <outline text="This Week in Evolution (TWiEVO)" title="This Week in Evolution (TWiEVO)" type="rss" xmlUrl="https://twievo.libsyn.com/rss" htmlUrl="https://www.microbe.tv/twievo/"/>
+        </outline>
+      </outline>
+      <outline text="Medicine / 医学" title="Medicine / 医学">
+        <outline text="Journals" title="Journals">
+          <outline text="NEJM — Table of Contents" title="NEJM — Table of Contents" type="rss" xmlUrl="https://www.nejm.org/action/showFeed?feed=rss&amp;jc=nejm&amp;type=etoc" htmlUrl="https://www.nejm.org/"/>
+          <outline text="JAMA — Current Issue" title="JAMA — Current Issue" type="rss" xmlUrl="https://jamanetwork.com/rss/site_3/67.xml" htmlUrl="https://jamanetwork.com/journals/jama"/>
+          <outline text="JAMA — Online First" title="JAMA — Online First" type="rss" xmlUrl="https://jamanetwork.com/rss/site_3/onlineFirst_67.xml" htmlUrl="https://jamanetwork.com/journals/jama"/>
+          <outline text="JAMA — Latest Research, Reviews, and Viewpoints" title="JAMA — Latest Research, Reviews, and Viewpoints" type="rss" xmlUrl="https://jamanetwork.com/rss/site_3/latestIssue_67.xml" htmlUrl="https://jamanetwork.com/journals/jama"/>
+          <outline text="BMJ Evidence-Based Medicine — Current Issue" title="BMJ Evidence-Based Medicine — Current Issue" type="rss" xmlUrl="https://ebm.bmj.com/rss/current.xml" htmlUrl="https://ebm.bmj.com/pages/rss-feeds"/>
+          <outline text="BMJ Evidence-Based Medicine — Recent Issues" title="BMJ Evidence-Based Medicine — Recent Issues" type="rss" xmlUrl="https://ebm.bmj.com/rss/recent.xml" htmlUrl="https://ebm.bmj.com/pages/rss-feeds"/>
+          <outline text="BMJ Evidence-Based Medicine — Ahead of Print" title="BMJ Evidence-Based Medicine — Ahead of Print" type="rss" xmlUrl="https://ebm.bmj.com/rss/ahead.xml" htmlUrl="https://ebm.bmj.com/pages/rss-feeds"/>
+          <outline text="DailyMed — Label Updates" title="DailyMed — Label Updates" type="rss" xmlUrl="https://dailymed.nlm.nih.gov/dailymed/rss.cfm" htmlUrl="https://dailymed.nlm.nih.gov/dailymed/rss-updates.cfm"/>
+        </outline>
+        <outline text="Regulators &amp; Safety" title="Regulators &amp; Safety">
+          <outline text="FDA MedWatch Safety Alerts" title="FDA MedWatch Safety Alerts" type="rss" xmlUrl="http://www.fda.gov/AboutFDA/ContactFDA/StayInformed/RSSFeeds/MedWatch/rss.xml" htmlUrl="https://www.fda.gov/safety/medwatch-fda-safety-information-and-adverse-event-reporting-program/medwatch-rss-feed"/>
+        </outline>
+        <outline text="Podcasts / Streaming" title="Podcasts / Streaming">
+          <outline text="NEJM This Week" title="NEJM This Week" type="rss" xmlUrl="https://podcast.nejm.org/nejm_audio_summaries.xml" htmlUrl="https://www.nejm.org/multimedia/nejm-this-week"/>
+          <outline text="NEJM Interviews" title="NEJM Interviews" type="rss" xmlUrl="https://podcast.nejm.org/nejm_audio_interview.xml" htmlUrl="https://www.nejm.org/multimedia/nejm-interviews"/>
+          <outline text="NEJM Intention to Treat" title="NEJM Intention to Treat" type="rss" xmlUrl="https://intention-to-treat-podcast.nejm.org/feed.xml" htmlUrl="https://intention-to-treat-podcast.nejm.org/"/>
+          <outline text="JAMA Editors' Summary" title="JAMA Editors' Summary" type="rss" xmlUrl="https://jamaeditorsaudiosummary.libsyn.com/rss" htmlUrl="https://jamanetwork.com/journals/jama/pages/audio-commentary"/>
+          <outline text="JAMA Clinical Reviews" title="JAMA Clinical Reviews" type="rss" xmlUrl="https://jamaclinicalreviews.libsyn.com/rss" htmlUrl="https://jamanetwork.com/journals/jama/pages/jama-clinical-reviews"/>
+          <outline text="JAMA Medical News" title="JAMA Medical News" type="rss" xmlUrl="https://jamamedicalnews.libsyn.com/rss" htmlUrl="https://jamanetwork.com/pages/audio"/>
+        </outline>
+      </outline>
+    </outline>
+  </body>
+</opml>

@@ -26,13 +26,26 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "pet", WindowUrl::App("index.html".into()))
         .title("Briefy Pet")
         .inner_size(188.0, 196.0)
-        .transparent(true)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
         .position(32.0, 720.0)
         .visible(true)
+        .build()?;
+    Ok(())
+}
+
+fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
+    WindowBuilder::new(app, "bubble", WindowUrl::App("index.html".into()))
+        .title("Briefy Pet Bubble")
+        .inner_size(380.0, 260.0)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .position(240.0, 620.0)
+        .visible(false)
         .build()?;
     Ok(())
 }
@@ -95,6 +108,7 @@ fn main() {
             }
 
             build_pet_window(app)?;
+            build_bubble_window(app)?;
 
             if should_scan {
                 service::ensure_scheduler(&app.handle());

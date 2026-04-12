@@ -1,5 +1,5 @@
 use tauri::{
-    AppHandle, Manager, CustomMenuItem, SystemTray, SystemTrayEvent, SystemTrayMenu,
+    AppHandle, CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
     SystemTrayMenuItem,
 };
 

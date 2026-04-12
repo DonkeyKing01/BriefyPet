@@ -2,13 +2,24 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { appWindow } from "@tauri-apps/api/window";
 import {
   bootstrap,
+  bubbleAction,
   openArticle,
   petDoubleClick,
   saveSettings,
   setActiveView,
   toggleFavorite
 } from "./api";
-import type { Article, FitLevel, Snapshot } from "./types";
+import type {
+  Article,
+  ContentPoolStat,
+  Discipline,
+  FitLevel,
+  RssSource,
+  SettingsPayload,
+  Snapshot,
+  SourceKind,
+  UserDisciplinePreference
+} from "./types";
 
 const PET_STATUS_LABELS = {
   loading: "加载中",
@@ -20,10 +31,10 @@ const PET_STATUS_LABELS = {
 
 const PET_STATUS_HINTS = {
   loading: "",
-  "needs-config": "双击去设置",
-  scanning: "扫描中",
-  idle: "",
-  "new-info": "有新内容"
+  "needs-config": "先去完善配置",
+  scanning: "正在按源类型调度抓取",
+  idle: "当前没有高优提醒",
+  "new-info": "双击或点气泡查看"
 } as const;
 
 const PET_ASSET_BY_STATUS = {
@@ -53,6 +64,43 @@ const PET_ASSET_BY_STATUS = {
     size: 160
   }
 } as const;
+
+const DISCIPLINE_LABELS: Record<Discipline, string> = {
+  technology: "科技",
+  humanities: "娱乐",
+  news: "新闻观点",
+  "social-science": "社科",
+  science: "科学",
+  medicine: "医学",
+  life: "成长",
+  other: "商业"
+};
+
+const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+  "academic-journal": "学术杂志",
+  "official-announcement": "官方公告",
+  "technical-blog": "技术博客",
+  "community-hotspot": "社区热点"
+};
+
+const RESOURCE_TYPE_LABELS = {
+  article: "文章",
+  podcast: "播客",
+  video: "视频",
+  twitter: "社交源",
+  other: "其他"
+} as const;
+
+const DISCIPLINE_ORDER: Discipline[] = [
+  "technology",
+  "social-science",
+  "other",
+  "life",
+  "news",
+  "humanities",
+  "science",
+  "medicine"
+];
 
 function useSnapshotPolling(enabled: boolean, intervalMs: number) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -124,6 +172,28 @@ function fitLabel(level: FitLevel) {
   return "低";
 }
 
+function sortDisciplinePrefs(items: UserDisciplinePreference[]) {
+  return [...items].sort(
+    (left, right) =>
+      DISCIPLINE_ORDER.indexOf(left.discipline) - DISCIPLINE_ORDER.indexOf(right.discipline)
+  );
+}
+
+function groupSources(sources: RssSource[]) {
+  const grouped = new Map<Discipline, Map<SourceKind, RssSource[]>>();
+  for (const source of sources) {
+    if (!grouped.has(source.discipline)) {
+      grouped.set(source.discipline, new Map());
+    }
+    const disciplineGroup = grouped.get(source.discipline)!;
+    if (!disciplineGroup.has(source.sourceKind)) {
+      disciplineGroup.set(source.sourceKind, []);
+    }
+    disciplineGroup.get(source.sourceKind)!.push(source);
+  }
+  return grouped;
+}
+
 function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
   const status = snapshot?.petStatus ?? "loading";
   const articleCount = snapshot?.activeReminder?.articleCount ?? 0;
@@ -190,6 +260,35 @@ function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
+function BubbleWindow({ snapshot }: { snapshot: Snapshot | null }) {
+  const reminder = snapshot?.activeReminder;
+
+  if (!reminder) {
+    return <div className="bubble-empty" />;
+  }
+
+  return (
+    <div className="bubble-window">
+      <div className="bubble-card">
+        <p className="bubble-kicker">Briefy-pet 提醒</p>
+        <h2>你有 {reminder.articleCount} 条新内容</h2>
+        <p className="bubble-copy">
+          当前提醒跨 {reminder.partitionCount} 个分区，桌宠已经切到提醒状态。你可以立刻进入主界面，也可以只延后当前这一批。
+        </p>
+        <div className="bubble-actions">
+          <button onClick={() => void bubbleAction("view")}>立即查看</button>
+          <button className="ghost" onClick={() => void bubbleAction("snooze")}>
+            稍后 30 分钟
+          </button>
+          <button className="ghost" onClick={() => void bubbleAction("ignore")}>
+            忽略本次
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ArticleGroup({
   title,
   articles,
@@ -215,14 +314,28 @@ function ArticleGroup({
           onClick={() => onOpen(article.id)}
         >
           <span className="article-card-title">{article.title}</span>
-          <span className="article-card-subtitle">{article.sourceName}</span>
+          <span className="article-card-subtitle">
+            {article.sourceName} · {DISCIPLINE_LABELS[article.discipline]}
+          </span>
           <span className="article-card-meta">
             <span>{article.fitScore} 分</span>
+            <span>{SOURCE_KIND_LABELS[article.sourceKind]}</span>
             {article.isFavorite && <span>已收藏</span>}
           </span>
         </button>
       ))}
     </section>
+  );
+}
+
+function SourceStatCard({ stat }: { stat: ContentPoolStat }) {
+  return (
+    <div className="pool-stat-card">
+      <strong>{SOURCE_KIND_LABELS[stat.sourceKind]}</strong>
+      <span>{stat.totalArticles} 条分区池内容</span>
+      <span>提醒候选 {stat.candidateCount} 条</span>
+      <span>最高分 {stat.topScore ?? "暂无"}</span>
+    </div>
   );
 }
 
@@ -233,14 +346,14 @@ function MainWindow({
   error
 }: {
   snapshot: Snapshot | null;
-  setSnapshot: (snapshot: Snapshot) => void;
+  setSnapshot: React.Dispatch<React.SetStateAction<Snapshot | null>>;
   loading: boolean;
   error: string | null;
 }) {
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const grouped = useMemo(
+  const groupedArticles = useMemo(
     () => ({
       fresh: (snapshot?.articles ?? []).filter((article) => article.isNew),
       all: snapshot?.articles ?? [],
@@ -250,7 +363,20 @@ function MainWindow({
   );
 
   const selectedArticle =
-    snapshot?.articles.find((article) => article.id === snapshot.selectedArticleId) ?? null;
+    snapshot?.articles.find((article) => article.id === snapshot.selectedArticleId) ??
+    groupedArticles.fresh[0] ??
+    groupedArticles.all[0] ??
+    null;
+
+  const disciplinePrefs = useMemo(
+    () => sortDisciplinePrefs(snapshot?.settings.disciplines ?? []),
+    [snapshot?.settings.disciplines]
+  );
+
+  const groupedSources = useMemo(
+    () => groupSources(snapshot?.settings.rssSources ?? []),
+    [snapshot?.settings.rssSources]
+  );
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -259,20 +385,29 @@ function MainWindow({
     }
 
     const formData = new FormData(event.currentTarget);
+    const disciplines = disciplinePrefs.map((item) => ({
+      discipline: item.discipline,
+      enabled: formData.get(`discipline-enabled-${item.discipline}`) === "on",
+      preference: String(formData.get(`discipline-pref-${item.discipline}`) ?? "")
+    }));
     const rssSources = snapshot.settings.rssSources.map((source) => ({
       ...source,
-      enabled: formData.get(source.id) === "on"
+      enabled: formData.get(`source-${source.id}`) === "on"
     }));
+
+    const payload: SettingsPayload = {
+      apiKey: String(formData.get("apiKey") ?? ""),
+      autoStart: formData.get("autoStart") === "on",
+      disciplines,
+      memoryModeEnabled: formData.get("memoryModeEnabled") === "on",
+      memorySummary: String(formData.get("memorySummary") ?? ""),
+      rssSources
+    };
 
     setSaving(true);
     setSubmitError(null);
     try {
-      const next = await saveSettings({
-        apiKey: String(formData.get("apiKey") ?? ""),
-        interestProfile: String(formData.get("interestProfile") ?? ""),
-        autoStart: formData.get("autoStart") === "on",
-        rssSources
-      });
+      const next = await saveSettings(payload);
       setSnapshot(next);
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "保存设置失败");
@@ -286,7 +421,7 @@ function MainWindow({
       <header className="topbar">
         <div className="topbar-copy">
           <h1>Briefy-pet</h1>
-          <p>桌面上的信息提醒伙伴</p>
+          <p>面向普通用户的信息雷达桌宠，按学科偏好和源类型进行分层提醒。</p>
         </div>
         <div className="topbar-actions">
           <span className={`status-badge status-${snapshot?.petStatus ?? "loading"}`}>
@@ -310,15 +445,36 @@ function MainWindow({
       <section className="overview-strip">
         <div className="overview-card">
           <span className="overview-label">提醒状态</span>
-          <strong>{snapshot?.activeReminder ? `${snapshot.activeReminder.articleCount} 条待提醒` : "当前无提醒"}</strong>
+          <strong>
+            {snapshot?.activeReminder
+              ? `${snapshot.activeReminder.articleCount} 条待提醒 / ${snapshot.activeReminder.partitionCount} 个分区`
+              : "当前无提醒"}
+          </strong>
         </div>
         <div className="overview-card">
-          <span className="overview-label">API Key</span>
-          <strong>{snapshot?.apiKeyValid ? "已验证可用" : "待验证或无效"}</strong>
+          <span className="overview-label">目录与订阅池</span>
+          <strong>
+            {snapshot?.sourceSummary.enabledSources ?? 0} / {snapshot?.sourceSummary.totalSources ?? 0} 个有效信源
+          </strong>
         </div>
         <div className="overview-card">
           <span className="overview-label">最近抓取</span>
           <strong>{formatTime(snapshot?.lastScanAt ?? null)}</strong>
+        </div>
+      </section>
+
+      <section className="overview-strip compact">
+        <div className="overview-card">
+          <span className="overview-label">待调度信源</span>
+          <strong>{snapshot?.sourceSummary.dueSources ?? 0}</strong>
+        </div>
+        <div className="overview-card">
+          <span className="overview-label">已选学科</span>
+          <strong>{snapshot?.sourceSummary.selectedDisciplines ?? 0}</strong>
+        </div>
+        <div className="overview-card">
+          <span className="overview-label">目录异常项</span>
+          <strong>{snapshot?.sourceSummary.postponedSources ?? 0}</strong>
         </div>
       </section>
 
@@ -331,17 +487,9 @@ function MainWindow({
         <form className="settings-view" onSubmit={handleSave}>
           <section className="settings-card">
             <div className="settings-section-head">
-              <h2>基础配置</h2>
-              <p>先提供有效 API Key，再让 Briefy-pet 进入抓取和分析流程。</p>
+              <h2>启动门槛</h2>
+              <p>本版必须同时满足 API Key、至少 1 个有效学科、以及每个已选学科的偏好描述，系统才会进入抓取与推送。</p>
             </div>
-            <label>
-              <span>我的兴趣偏好</span>
-              <textarea
-                name="interestProfile"
-                defaultValue={snapshot.settings.interestProfile}
-                placeholder="例如：AI 产品、效率工具、前端工程、独立开发"
-              />
-            </label>
             <label>
               <span>API Key 设置</span>
               <input
@@ -351,33 +499,118 @@ function MainWindow({
                 placeholder="输入你的 API Key"
               />
             </label>
-          </section>
-
-          <section className="settings-card">
-            <div className="settings-section-head">
-              <h2>内置 RSS 源</h2>
-              <p>第一版只支持启用或禁用内置源，不支持自定义新增。</p>
-            </div>
-            <div className="rss-list">
-              {snapshot.settings.rssSources.map((source) => (
-                <label key={source.id} className="rss-item">
-                  <input name={source.id} type="checkbox" defaultChecked={source.enabled} />
-                  <div>
-                    <strong>{source.name}</strong>
-                    <span>{source.url}</span>
-                  </div>
-                </label>
-              ))}
-            </div>
             <label className="checkbox-row">
-              <input name="autoStart" type="checkbox" defaultChecked={snapshot.settings.autoStart} />
+              <input
+                name="autoStart"
+                type="checkbox"
+                defaultChecked={snapshot.settings.autoStart}
+              />
               <span>开机启动</span>
             </label>
           </section>
 
+          <section className="settings-card">
+            <div className="settings-section-head">
+              <h2>结构化兴趣</h2>
+              <p>勾选需要运营的模块，并为每个已选模块写 1 到 2 句偏好。系统会按模块和源桶完成抓取与排序。</p>
+            </div>
+            <div className="discipline-grid">
+              {disciplinePrefs.map((item) => {
+                return (
+                  <div key={item.discipline} className="discipline-card">
+                    <label className="discipline-toggle">
+                      <input
+                        name={`discipline-enabled-${item.discipline}`}
+                        type="checkbox"
+                        defaultChecked={item.enabled}
+                      />
+                      <span>{DISCIPLINE_LABELS[item.discipline]}</span>
+                    </label>
+                    <textarea
+                      name={`discipline-pref-${item.discipline}`}
+                      defaultValue={item.preference}
+                      placeholder={`写下你在${DISCIPLINE_LABELS[item.discipline]}方向真正想收到的内容`}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-section-head">
+              <h2>每日兴趣记忆</h2>
+              <p>系统会根据打开详情、收藏和提醒操作汇总出每日兴趣总结。你可以关闭自动记忆，也可以直接编辑当前摘要。</p>
+            </div>
+            <label className="checkbox-row">
+              <input
+                name="memoryModeEnabled"
+                type="checkbox"
+                defaultChecked={snapshot.settings.memoryModeEnabled}
+              />
+              <span>启用每日兴趣记忆</span>
+            </label>
+            <label>
+              <span>当前兴趣摘要</span>
+              <textarea
+                name="memorySummary"
+                defaultValue={snapshot.settings.memorySummary}
+                placeholder="系统会在这里生成或保留你确认后的兴趣摘要"
+              />
+            </label>
+            {snapshot.memory && (
+              <div className="memory-card">
+                <strong>{snapshot.memory.dayKey}</strong>
+                <p>{snapshot.memory.generatedSummary}</p>
+                <span>今日行为计数：{snapshot.memory.eventCount}</span>
+              </div>
+            )}
+          </section>
+
+          <section className="settings-card">
+            <div className="settings-section-head">
+              <h2>源池开关</h2>
+              <p>源按模块和二级源桶分组，所有模块均参与当前版本的抓取与提醒。</p>
+            </div>
+            <div className="source-groups">
+              {DISCIPLINE_ORDER.filter((discipline) => groupedSources.has(discipline)).map((discipline) => (
+                <section key={discipline} className="source-discipline-block">
+                  <div className="source-discipline-head">
+                    <h3>{DISCIPLINE_LABELS[discipline]}</h3>
+                  </div>
+                  {Array.from(groupedSources.get(discipline)!.entries()).map(([sourceKind, sources]) => (
+                    <div key={`${discipline}-${sourceKind}`} className="source-kind-block">
+                      <div className="source-kind-head">
+                        <strong>{SOURCE_KIND_LABELS[sourceKind]}</strong>
+                        <span>{sources.length} 个</span>
+                      </div>
+                      <div className="rss-list">
+                        {sources.map((source) => (
+                          <label key={source.id} className="rss-item">
+                            <input
+                              name={`source-${source.id}`}
+                              type="checkbox"
+                              defaultChecked={source.enabled}
+                            />
+                            <div>
+                              <strong>{source.name}</strong>
+                              <span>
+                                {RESOURCE_TYPE_LABELS[source.resourceType]} · {source.url}
+                              </span>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </section>
+              ))}
+            </div>
+          </section>
+
           <div className="settings-actions">
             <button type="submit" disabled={saving}>
-              {saving ? "验证并保存中..." : "保存设置"}
+              {saving ? "验证并保存中..." : "保存并重新进入调度"}
             </button>
           </div>
         </form>
@@ -388,7 +621,7 @@ function MainWindow({
           <aside className="article-list-panel">
             <ArticleGroup
               title="新内容"
-              articles={grouped.fresh}
+              articles={groupedArticles.fresh}
               selectedId={snapshot.selectedArticleId}
               onOpen={(articleId) => {
                 void openArticle(articleId).then(setSnapshot);
@@ -396,7 +629,7 @@ function MainWindow({
             />
             <ArticleGroup
               title="全部"
-              articles={grouped.all}
+              articles={groupedArticles.all}
               selectedId={snapshot.selectedArticleId}
               onOpen={(articleId) => {
                 void openArticle(articleId).then(setSnapshot);
@@ -404,7 +637,7 @@ function MainWindow({
             />
             <ArticleGroup
               title="收藏"
-              articles={grouped.favorite}
+              articles={groupedArticles.favorite}
               selectedId={snapshot.selectedArticleId}
               onOpen={(articleId) => {
                 void openArticle(articleId).then(setSnapshot);
@@ -413,11 +646,20 @@ function MainWindow({
           </aside>
 
           <section className="article-detail-panel">
+            <div className="pool-stat-grid">
+              {snapshot.contentPoolStats.map((stat) => (
+                <SourceStatCard key={stat.sourceKind} stat={stat} />
+              ))}
+            </div>
+
             {selectedArticle ? (
               <article className="article-detail">
                 <div className="detail-head">
                   <div>
-                    <p className="detail-source">{selectedArticle.sourceName}</p>
+                    <p className="detail-source">
+                      {selectedArticle.sourceName} · {DISCIPLINE_LABELS[selectedArticle.discipline]} ·{" "}
+                      {SOURCE_KIND_LABELS[selectedArticle.sourceKind]}
+                    </p>
                     <h2>{selectedArticle.title}</h2>
                   </div>
                   <button onClick={() => void toggleFavorite(selectedArticle.id).then(setSnapshot)}>
@@ -427,12 +669,21 @@ function MainWindow({
 
                 <div className="detail-highlight">
                   <strong>{selectedArticle.fitScore} 分</strong>
+                  <span>{fitLabel(selectedArticle.fitLevel)} 契合度</span>
                 </div>
 
                 <dl className="detail-meta">
                   <div>
                     <dt>摘要</dt>
                     <dd>{selectedArticle.summary}</dd>
+                  </div>
+                  <div>
+                    <dt>来源元数据</dt>
+                    <dd>
+                      {DISCIPLINE_LABELS[selectedArticle.discipline]} /{" "}
+                      {SOURCE_KIND_LABELS[selectedArticle.sourceKind]} /{" "}
+                      {RESOURCE_TYPE_LABELS[selectedArticle.resourceType]}
+                    </dd>
                   </div>
                   <div>
                     <dt>链接</dt>
@@ -443,10 +694,6 @@ function MainWindow({
                     </dd>
                   </div>
                   <div>
-                    <dt>来源</dt>
-                    <dd>{selectedArticle.sourceName}</dd>
-                  </div>
-                  <div>
                     <dt>发布时间</dt>
                     <dd>{formatArticleTime(selectedArticle.publishedAt)}</dd>
                   </div>
@@ -455,13 +702,13 @@ function MainWindow({
                     <dd>{formatArticleTime(selectedArticle.fetchedAt)}</dd>
                   </div>
                   <div>
-                    <dt>LLM 推荐理由</dt>
+                    <dt>推荐理由</dt>
                     <dd>{selectedArticle.recommendationReason}</dd>
                   </div>
                 </dl>
               </article>
             ) : (
-              <div className="panel-empty">还没有可展示内容，等待抓取结果。</div>
+              <div className="panel-empty">还没有可展示内容，等待调度和抓取结果。</div>
             )}
           </section>
         </div>
@@ -472,7 +719,7 @@ function MainWindow({
 
 export default function App() {
   const [windowLabel, setWindowLabel] = useState(() => appWindow.label);
-  const pollIntervalMs = windowLabel === "main" ? 1500 : 400;
+  const pollIntervalMs = windowLabel === "main" ? 1800 : 400;
   const { snapshot, setSnapshot, loading, error } = useSnapshotPolling(true, pollIntervalMs);
 
   useEffect(() => {
@@ -503,6 +750,10 @@ export default function App() {
 
   if (windowLabel === "pet") {
     return <PetWindow snapshot={snapshot} />;
+  }
+
+  if (windowLabel === "bubble") {
+    return <BubbleWindow snapshot={snapshot} />;
   }
 
   return (
