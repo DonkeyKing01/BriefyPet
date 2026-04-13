@@ -1,6 +1,6 @@
 # BriefyPet
 
-BriefyPet 是一个基于 Tauri + React + Rust 的 Windows 桌宠应用，目标是把高价值信息提醒做成低打扰的桌面陪伴体验。
+BriefyPet 是一个基于 Tauri + React + Rust 的 macOS 桌宠应用，目标是把高价值信息提醒做成低打扰的桌面陪伴体验。
 
 当前仓库是私有协作仓库，`reference/` 目录只作为本地参考资料使用，不纳入版本控制。
 
@@ -36,7 +36,7 @@ BriefyPet 是一个基于 Tauri + React + Rust 的 Windows 桌宠应用，目标
 - npm
 - Rust
 - Tauri CLI
-- Windows 环境下构建安装包
+- macOS 环境下构建安装包
 
 ## 安装依赖
 
@@ -84,17 +84,25 @@ npm run tauri -- build
 npm run tauri -- build --debug
 ```
 
+如需构建通用 mac 包，可先安装 Rust 双架构目标后执行：
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run tauri -- build --target universal-apple-darwin
+```
+
 ## 当前打包产物
 
-当前 Windows 安装包目标使用 NSIS。
+当前 macOS 安装包目标使用 Tauri 的 `app` 与 `dmg` bundle。
 
 典型输出路径：
 
 ```text
-src-tauri/target/release/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe
+src-tauri/target/release/bundle/dmg/Briefy-pet_0.1.0_aarch64.dmg
+src-tauri/target/release/bundle/macos/Briefy-pet.app
 ```
 
-这是适合直接发给测试用户安装的文件；不要把 `target/debug` 或裸 `exe` 当成正式分发物。
+其中 `.dmg` 是优先给测试用户分发的安装包；不要把 `target/debug`、裸二进制或未封装目录当成正式分发物。
 
 ## 版本控制说明
 

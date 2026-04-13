@@ -160,6 +160,7 @@ dependencies = [
  "atom_syndication",
  "chrono",
  "futures",
+ "quick-xml 0.38.4",
  "reqwest",
  "rss",
  "rusqlite",

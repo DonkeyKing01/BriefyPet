@@ -3,7 +3,10 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 
-use crate::models::{FeedArticle, FitLevel, LlmResult};
+use crate::{
+    models::{FeedArticle, FitLevel, LlmResult, SourceKind},
+    policy,
+};
 
 const OPENAI_COMPAT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-chat";
@@ -40,7 +43,7 @@ pub async fn validate_api_key(api_key: &str) -> Result<()> {
 
 pub async fn summarize_and_score_batch(
     api_key: &str,
-    interest_profile: &str,
+    interest_context: &str,
     articles: &[FeedArticle],
 ) -> Result<Vec<LlmResult>> {
     let trimmed_key = api_key.trim();
@@ -55,8 +58,18 @@ pub async fn summarize_and_score_batch(
         .iter()
         .enumerate()
         .map(|(index, article)| {
+            let module = policy::normalize_module(&article.module);
+            let bucket = policy::normalize_bucket(&module, &article.bucket);
+            let scoring_hint = scoring_focus_for_source(&module, &bucket, &article.source_kind);
             format!(
-                "INDEX: {index}\nTITLE: {}\nCONTENT: {}",
+                "INDEX: {index}\nSOURCE: {}\nMODULE: {}\nBUCKET: {}\nDISCIPLINE: {:?}\nSOURCE_KIND: {:?}\nRESOURCE_TYPE: {:?}\nSCORING_HINT: {}\nTITLE: {}\nCONTENT: {}",
+                article.source_name,
+                module,
+                bucket,
+                article.discipline,
+                article.source_kind,
+                article.resource_type,
+                scoring_hint,
                 article.title,
                 truncate(&article.content, 1600)
             )
@@ -74,9 +87,10 @@ Rules:\n\
 - summary and recommendation_reason must be Simplified Chinese.\n\
 - fit_level must be one of high, medium, low.\n\
 - fit_score must be an integer from 0 to 100.\n\
+- fit_score must prioritize relevance, reliability, and freshness.\n\
 - Do not output markdown, code fences, explanation, or extra keys.\n\
 \n\
-User interest profile:\n{interest_profile}\n\
+Personalization context:\n{interest_context}\n\
 \n\
 Articles:\n{article_payload}"
     );
@@ -117,15 +131,61 @@ Articles:\n{article_payload}"
 
 pub async fn summarize_and_score_single(
     api_key: &str,
-    interest_profile: &str,
+    interest_context: &str,
     article: &FeedArticle,
 ) -> Result<LlmResult> {
-    let mut results = summarize_and_score_batch(api_key, interest_profile, std::slice::from_ref(article))
-        .await
-        .with_context(|| format!("single article scoring failed: {}", article.title))?;
-    results
-        .pop()
-        .ok_or_else(|| anyhow!("single article scoring returned no result: {}", article.title))
+    let mut results =
+        summarize_and_score_batch(api_key, interest_context, std::slice::from_ref(article))
+            .await
+            .with_context(|| format!("single article scoring failed: {}", article.title))?;
+    results.pop().ok_or_else(|| {
+        anyhow!(
+            "single article scoring returned no result: {}",
+            article.title
+        )
+    })
+}
+
+fn scoring_focus_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> &'static str {
+    match (module, bucket) {
+        ("technology", "research") | ("social_science", "academic_frontier") => {
+            "Prefer evidence-backed insights, research novelty, and practical implications."
+        }
+        ("science", "physics") | ("science", "chemistry") | ("science", "biology") => {
+            "Prefer rigorous methodology, reproducibility clues, and true scientific value."
+        }
+        ("medicine", "academic_frontier") => {
+            "Prioritize clinical reliability, patient impact, and evidence hierarchy."
+        }
+        ("news_opinion", "news") => {
+            "Prioritize factual density, timeliness, and low speculation."
+        }
+        ("news_opinion", "community_opinion")
+        | ("news_opinion", "personal_opinion")
+        | ("news_opinion", "streaming_opinion") => {
+            "Reward viewpoint diversity but penalize noise, hype, and low-information opinions."
+        }
+        ("technology", "official") => {
+            "Prioritize official updates with direct product or ecosystem impact."
+        }
+        ("entertainment", "lite_pool") => {
+            "Keep high signal-to-noise and prefer durable quality over clickbait."
+        }
+        _ => match source_kind {
+            SourceKind::AcademicJournal => {
+                "Prefer authoritative sources, clear claims, and high informational density."
+            }
+            SourceKind::OfficialAnnouncement => {
+                "Prefer official first-hand updates with concrete implications."
+            }
+            SourceKind::TechnicalBlog => {
+                "Prefer practical depth, implementation details, and transferable insights."
+            }
+            SourceKind::CommunityHotspot => {
+                "Prefer quality discussions and actionable insights over emotional noise."
+            }
+        },
+    }
 }
 
 fn extract_message_content(payload: &Value) -> Option<String> {
@@ -149,11 +209,19 @@ fn extract_message_content(payload: &Value) -> Option<String> {
     }
 }
 
-async fn score_batch_once(api_key: &str, body: &Value, expected_len: usize) -> Result<Vec<LlmResult>> {
+async fn score_batch_once(
+    api_key: &str,
+    body: &Value,
+    expected_len: usize,
+) -> Result<Vec<LlmResult>> {
     let payload = send_chat_completion_with_retries(api_key, body).await?;
     let raw_content = extract_message_content(&payload).context("missing llm response content")?;
-    let normalized = normalize_json_response(&raw_content)
-        .ok_or_else(|| anyhow!("no parseable JSON found in model response: {}", truncate(&raw_content, 200)))?;
+    let normalized = normalize_json_response(&raw_content).ok_or_else(|| {
+        anyhow!(
+            "no parseable JSON found in model response: {}",
+            truncate(&raw_content, 200)
+        )
+    })?;
     let json_value: Value = serde_json::from_str(&normalized)
         .with_context(|| format!("model JSON parse failed: {}", truncate(&raw_content, 200)))?;
     parse_batch_result(&json_value, expected_len)
@@ -186,7 +254,11 @@ async fn send_chat_completion_with_retries(api_key: &str, body: &Value) -> Resul
     Err(last_error.unwrap_or_else(|| anyhow!("unknown llm request failure")))
 }
 
-async fn send_chat_completion_once(client: &reqwest::Client, api_key: &str, body: &Value) -> Result<Value> {
+async fn send_chat_completion_once(
+    client: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+) -> Result<Value> {
     let response = client
         .post(chat_completions_url())
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
@@ -379,10 +451,10 @@ fn parse_llm_result(value: &Value) -> Result<LlmResult> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("missing recommendation_reason"))?
         .to_string();
-    let fit_level = parse_fit_level(value.get("fit_level"))
-        .ok_or_else(|| anyhow!("unrecognized fit_level"))?;
-    let fit_score = parse_fit_score(value.get("fit_score"))
-        .ok_or_else(|| anyhow!("unrecognized fit_score"))?;
+    let fit_score =
+        parse_fit_score(value.get("fit_score")).ok_or_else(|| anyhow!("unrecognized fit_score"))?;
+    let fit_level =
+        parse_fit_level(value.get("fit_level")).unwrap_or_else(|| fit_level_from_score(fit_score));
 
     Ok(LlmResult {
         summary,
@@ -431,6 +503,16 @@ fn parse_fit_score(value: Option<&Value>) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+fn fit_level_from_score(score: i64) -> FitLevel {
+    if score >= 80 {
+        FitLevel::High
+    } else if score >= 60 {
+        FitLevel::Medium
+    } else {
+        FitLevel::Low
     }
 }
 
