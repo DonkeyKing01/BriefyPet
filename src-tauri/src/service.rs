@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use futures::future::join_all;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     time::Instant,
 };
 use tauri::{AppHandle, Manager};
@@ -11,16 +11,46 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use crate::{
     db, llm,
     models::{
-        AppView, FeedArticle, FitLevel, LlmResult, PetStatus, SettingsPayload, Snapshot, SourceKind,
+        AppView, FeedArticle, LlmResult, PetStatus, SettingsPayload, Snapshot,
     },
     policy,
     rss, AppState,
 };
 
 const SCORE_BATCH_SIZE: usize = 3;
-const MAX_CONCURRENT_SCORE_BATCHES: usize = 2;
+const MAX_CONCURRENT_SCORE_BATCHES: usize = 20;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
-const MAX_REMINDER_ITEMS_PER_BATCH: usize = 12;
+const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 7;
+const PUSH_TOP_PER_BUCKET: usize = 3;
+const PUSH_MAX_AGE_DAYS: i64 = 2;
+
+pub fn requires_configuration(settings: &SettingsPayload, api_key_valid: Option<bool>) -> bool {
+    !is_settings_complete(settings)
+        || settings.api_key.trim().is_empty()
+        || api_key_valid == Some(false)
+}
+
+pub fn resolve_requested_view(app: &AppHandle, requested: AppView) -> Result<AppView> {
+    if requested == AppView::Settings {
+        return Ok(AppView::Settings);
+    }
+
+    let conn = db::connect(app)?;
+    let settings = db::read_settings(&conn)?;
+    let api_key_valid = app
+        .state::<AppState>()
+        .api_key_valid
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .or(Some(db::read_api_key_valid(&conn)?));
+
+    if requires_configuration(&settings, api_key_valid) {
+        Ok(AppView::Settings)
+    } else {
+        Ok(AppView::Reading)
+    }
+}
 
 pub fn derive_pet_status(
     settings: &SettingsPayload,
@@ -31,10 +61,7 @@ pub fn derive_pet_status(
 ) -> PetStatus {
     if is_loading {
         PetStatus::Loading
-    } else if !is_settings_complete(settings)
-        || settings.api_key.trim().is_empty()
-        || api_key_valid == Some(false)
-    {
+    } else if requires_configuration(settings, api_key_valid) {
         PetStatus::NeedsConfig
     } else if is_scanning || api_key_valid.is_none() {
         PetStatus::Scanning
@@ -118,30 +145,43 @@ pub fn ensure_scheduler(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             sleep(TokioDuration::from_secs(SCHEDULER_TICK_MINUTES * 60)).await;
-            log_fetch_result(run_fetch_cycle(app_handle.clone()).await, &app_handle);
+            log_fetch_result(run_fetch_cycle(app_handle.clone(), false).await, &app_handle);
         }
     });
 }
 
-pub fn trigger_fetch_now(app: &AppHandle, delay: Option<std::time::Duration>) {
+pub fn trigger_fetch_now(
+    app: &AppHandle,
+    delay: Option<std::time::Duration>,
+    force_incremental: bool,
+) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Some(delay) = delay {
-            sleep(TokioDuration::from_secs(delay.as_secs())).await;
+            sleep(TokioDuration::from_millis(delay.as_millis() as u64)).await;
         }
-        log_fetch_result(run_fetch_cycle(app_handle.clone()).await, &app_handle);
+        log_fetch_result(
+            run_fetch_cycle(app_handle.clone(), force_incremental).await,
+            &app_handle,
+        );
     });
 }
 
-pub async fn validate_api_key_for_settings(app: &AppHandle, api_key: &str) -> Result<()> {
-    if api_key.trim().is_empty() {
+pub async fn validate_api_key_for_settings(app: &AppHandle, settings: &SettingsPayload) -> Result<()> {
+    if settings.api_key.trim().is_empty() {
         set_api_key_valid(app, Some(false));
         let conn = db::connect(app)?;
         db::write_api_key_valid(&conn, false)?;
         return Err(anyhow!("API Key validation failed: missing API Key"));
     }
 
-    if let Err(err) = llm::validate_api_key(api_key).await {
+    if let Err(err) = llm::validate_api_key(
+        &settings.llm_provider,
+        Some(&settings.llm_model),
+        &settings.api_key,
+    )
+    .await
+    {
         if llm::is_auth_failure(&err) {
             set_api_key_valid(app, Some(false));
             let conn = db::connect(app)?;
@@ -157,33 +197,52 @@ pub async fn validate_api_key_for_settings(app: &AppHandle, api_key: &str) -> Re
     Ok(())
 }
 
-pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
+pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<()> {
     set_scanning(&app, true);
     clear_loading_until(&app);
+    let cycle_started_at = Utc::now();
     let started_at = Instant::now();
 
     let conn = db::connect(&app)?;
     let settings = db::read_settings(&conn)?;
-    if settings.api_key.trim().is_empty() {
-        set_api_key_valid(&app, Some(false));
-        db::write_api_key_valid(&conn, false)?;
+    let api_key_valid = app
+        .state::<AppState>()
+        .api_key_valid
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .or(Some(db::read_api_key_valid(&conn)?));
+    if requires_configuration(&settings, api_key_valid) {
+        if settings.api_key.trim().is_empty() || api_key_valid == Some(false) {
+            set_api_key_valid(&app, Some(false));
+            db::write_api_key_valid(&conn, false)?;
+        }
+        let cycle_ended_at = Utc::now();
+        let _ = db::log_crawl_cycle(
+            &conn,
+            cycle_started_at,
+            cycle_ended_at,
+            "skipped-needs-config",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            started_at.elapsed().as_millis(),
+            None,
+            None,
+        );
         clear_last_error(&app);
         set_scanning(&app, false);
         sync_windows(&app, false)?;
         return Ok(());
     }
 
-    if !is_settings_complete(&settings) {
-        clear_last_error(&app);
-        set_scanning(&app, false);
-        sync_windows(&app, false)?;
-        return Ok(());
-    }
-
-    ensure_api_key_ready(&app, &settings.api_key).await?;
+    ensure_api_key_ready(&app, &settings).await?;
 
     let now = Utc::now();
-    let due_sources = db::list_due_sources(&conn, now)?;
+    let due_sources = db::list_due_sources(&conn, now, force_incremental)?;
     if due_sources.is_empty() {
         let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
         if memory.is_some() {
@@ -193,17 +252,53 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
         set_last_scan_at(&app, Some(now));
         db::write_last_scan_at(&conn, Some(now))?;
         sync_windows(&app, false)?;
+        let cycle_ended_at = Utc::now();
+        let _ = db::log_crawl_cycle(
+            &conn,
+            cycle_started_at,
+            cycle_ended_at,
+            "idle-no-due-sources",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            started_at.elapsed().as_millis(),
+            None,
+            None,
+        );
         return Ok(());
     }
 
     let fetch_started_at = Instant::now();
-    let fetch_outcome = rss::fetch_sources(&due_sources)
-        .await
-        .context("RSS fetch/parse failed")?;
+    let fetch_outcome = match rss::fetch_sources(&due_sources).await {
+        Ok(value) => value,
+        Err(err) => {
+            let cycle_ended_at = Utc::now();
+            let _ = db::log_crawl_cycle(
+                &conn,
+                cycle_started_at,
+                cycle_ended_at,
+                "failed-fetch",
+                due_sources.len(),
+                0,
+                0,
+                0,
+                fetch_started_at.elapsed().as_millis(),
+                0,
+                started_at.elapsed().as_millis(),
+                None,
+                Some(&format_compact_error(&err, 300)),
+            );
+            return Err(err).context("RSS fetch/parse failed");
+        }
+    };
     let fetch_elapsed = fetch_started_at.elapsed();
 
-    let mut pending_articles = Vec::new();
+    let mut pending_articles = Vec::<PendingArticle>::new();
     let mut fetch_errors = Vec::new();
+    let mut successful_source_ids = Vec::new();
     for result in fetch_outcome.results {
         if let Some(error) = result.error {
             db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
@@ -211,80 +306,102 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
             continue;
         }
 
-        db::update_fetch_state(&conn, &result.source.id, now, Some(now), None)?;
-        let filtered = collect_pending_articles(&conn, result.articles)?;
-        pending_articles.extend(filtered);
+        let is_initial_fetch = !db::source_has_successful_fetch(&conn, &result.source.id)?;
+        let incremental_cutoff = if force_incremental && !is_initial_fetch {
+            db::source_last_fetched_at(&conn, &result.source.id)?
+        } else {
+            None
+        };
+        let filtered = collect_pending_articles(
+            &conn,
+            result.articles,
+            is_initial_fetch,
+            now,
+            incremental_cutoff,
+        )?;
+        for article in filtered {
+            let article_key = build_article_key(&article);
+            let article_id = db::insert_pending_article(
+                &conn,
+                &article.source_id,
+                &article.guid,
+                &article_key,
+                &article.normalized_link,
+                &article.title,
+                &article.link,
+                &article.source_name,
+                &article.discipline,
+                &article.source_kind,
+                &article.resource_type,
+                article.published_at,
+                now,
+                &article.content,
+            )?;
+            pending_articles.push(PendingArticle { article_id, article });
+        }
+        successful_source_ids.push(result.source.id);
     }
 
     let interest_context = build_interest_context(&settings);
     let score_started_at = Instant::now();
-    let score_outcome =
-        score_articles_in_batches(&settings.api_key, &interest_context, &pending_articles).await?;
+    let score_outcome = score_articles_in_batches(
+        &settings.llm_provider,
+        Some(&settings.llm_model),
+        &settings.api_key,
+        &interest_context,
+        &pending_articles,
+    )
+    .await?;
     let score_elapsed = score_started_at.elapsed();
 
     let mut inserted_count = 0usize;
-    let fetched_at = Utc::now();
-    let mut new_high_candidates = Vec::new();
-
-    let mut ranked_articles = score_outcome.scored_articles;
-    ranked_articles.sort_by(|left, right| {
-        right
-            .1
-            .fit_score
-            .cmp(&left.1.fit_score)
-            .then_with(|| right.0.published_at.cmp(&left.0.published_at))
-            .then_with(|| left.0.title.cmp(&right.0.title))
-    });
-
-    for (article, analysis) in ranked_articles {
-        let calibrated_fit_level = policy::fit_level_for_score(
-            &article.module,
-            &article.bucket,
-            &article.source_kind,
-            analysis.fit_score,
-        );
-        let article_key = build_article_key(&article);
-        let article_id = db::insert_article(
-            &conn,
-            &article.source_id,
-            &article.guid,
-            &article_key,
-            &article.normalized_link,
-            &article.title,
-            &article.link,
-            &article.source_name,
-            &article.discipline,
-            &article.source_kind,
-            &article.resource_type,
-            article.published_at,
-            fetched_at,
-            &article.content,
-            &analysis.summary,
-            &calibrated_fit_level,
-            analysis.fit_score,
-            &analysis.recommendation_reason,
-        )?;
-        db::upsert_content_pool_entry(
-            &conn,
-            article_id,
-            &article.source_kind,
-            analysis.fit_score,
-            article.published_at,
-        )?;
-        inserted_count += 1;
-        if calibrated_fit_level == FitLevel::High {
-            new_high_candidates.push((
-                article_id,
-            article.module,
-            article.bucket,
-                article.source_kind,
+    let mut failed_scoring_count = 0usize;
+    let mut updated_buckets = std::collections::BTreeSet::<(String, String)>::new();
+    for result in score_outcome.results {
+        if let Some(analysis) = result.analysis {
+            let module = policy::normalize_module(&result.article.module);
+            let bucket = policy::normalize_bucket(&module, &result.article.bucket);
+            let calibrated_fit_level = policy::fit_level_for_score(
+                &module,
+                &bucket,
+                &result.article.source_kind,
                 analysis.fit_score,
-                article.published_at,
-            ));
+            );
+            db::mark_article_scored_success(
+                &conn,
+                result.article_id,
+                &analysis.summary,
+                &calibrated_fit_level,
+                analysis.fit_score,
+                &analysis.recommendation_reason,
+            )?;
+            db::upsert_content_pool_entry(
+                &conn,
+                result.article_id,
+                &module,
+                &bucket,
+                &result.article.source_kind,
+                analysis.fit_score,
+                result.article.published_at,
+            )?;
+            updated_buckets.insert((module, bucket));
+            inserted_count += 1;
+        } else {
+            failed_scoring_count += 1;
+            db::mark_article_scored_failed(
+                &conn,
+                result.article_id,
+                result.error.as_deref().unwrap_or("llm scoring failed"),
+            )?;
         }
     }
 
-    let reminder_candidates = select_partition_top_candidates(new_high_candidates);
+    let reminder_candidates = db::list_top_bucket_candidates(
+        &conn,
+        &updated_buckets,
+        PUSH_TOP_PER_BUCKET,
+        PUSH_MAX_AGE_DAYS,
+    )?;
     if !reminder_candidates.is_empty() {
         let batch_id = match db::current_active_batch_for_updates(&conn)? {
             Some(batch_id) => batch_id,
@@ -295,30 +412,52 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
         }
     }
 
-    let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
+    for source_id in successful_source_ids {
+        db::update_fetch_state(&conn, &source_id, now, Some(now), None)?;
+    }
+
+    let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
     set_scanning(&app, false);
-    set_last_scan_at(&app, Some(fetched_at));
-    db::write_last_scan_at(&conn, Some(fetched_at))?;
+    set_last_scan_at(&app, Some(now));
+    db::write_last_scan_at(&conn, Some(now))?;
 
     let warnings = collect_cycle_warnings(fetch_errors, score_outcome.errors);
-    if warnings.is_empty() {
-        clear_last_error(&app);
-    } else {
-        set_last_error(&app, format!("Warning: {}", warnings.join(" | ")));
-    }
-    if memory.is_none() && settings.memory_mode_enabled {
-        set_last_error(
-            &app,
-            "Warning: interest memory has not been generated yet".to_string(),
-        );
-    }
+    clear_last_error(&app);
     sync_windows(&app, false)?;
 
-    eprintln!(
-        "briefy-pet fetch cycle ok: due_sources={} pending={} inserted={} rss_ms={} llm_ms={} total_ms={}",
+    let cycle_ended_at = Utc::now();
+    let warning_summary = if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join(" | "))
+    };
+    let cycle_status = if warning_summary.is_some() || failed_scoring_count > 0 {
+        "completed-with-warnings"
+    } else {
+        "completed"
+    };
+    let _ = db::log_crawl_cycle(
+        &conn,
+        cycle_started_at,
+        cycle_ended_at,
+        cycle_status,
         due_sources.len(),
         pending_articles.len(),
         inserted_count,
+        failed_scoring_count,
+        fetch_elapsed.as_millis(),
+        score_elapsed.as_millis(),
+        started_at.elapsed().as_millis(),
+        warning_summary.as_deref(),
+        None,
+    );
+
+    eprintln!(
+        "briefy-pet fetch cycle ok: due_sources={} pending={} inserted={} failed_scoring={} rss_ms={} llm_ms={} total_ms={}",
+        due_sources.len(),
+        pending_articles.len(),
+        inserted_count,
+        failed_scoring_count,
         fetch_elapsed.as_millis(),
         score_elapsed.as_millis(),
         started_at.elapsed().as_millis(),
@@ -327,7 +466,7 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_api_key_ready(app: &AppHandle, api_key: &str) -> Result<()> {
+async fn ensure_api_key_ready(app: &AppHandle, settings: &SettingsPayload) -> Result<()> {
     let cached = app
         .state::<AppState>()
         .api_key_valid
@@ -339,7 +478,13 @@ async fn ensure_api_key_ready(app: &AppHandle, api_key: &str) -> Result<()> {
         return Ok(());
     }
 
-    if let Err(err) = llm::validate_api_key(api_key).await {
+    if let Err(err) = llm::validate_api_key(
+        &settings.llm_provider,
+        Some(&settings.llm_model),
+        &settings.api_key,
+    )
+    .await
+    {
         if llm::is_auth_failure(&err) {
             set_api_key_valid(app, Some(false));
             let conn = db::connect(app)?;
@@ -363,10 +508,35 @@ async fn ensure_api_key_ready(app: &AppHandle, api_key: &str) -> Result<()> {
 fn collect_pending_articles(
     conn: &rusqlite::Connection,
     articles: Vec<FeedArticle>,
+    is_initial_fetch: bool,
+    fetched_at: DateTime<Utc>,
+    incremental_cutoff: Option<DateTime<Utc>>,
 ) -> Result<Vec<FeedArticle>> {
     let mut pending = Vec::new();
     let mut seen_keys = HashSet::new();
+    let initial_cutoff = if is_initial_fetch {
+        Some(fetched_at - Duration::days(INITIAL_FETCH_LOOKBACK_DAYS))
+    } else {
+        None
+    };
+
     for article in articles {
+        if let Some(cutoff) = initial_cutoff {
+            if let Some(published_at) = article.published_at.as_ref() {
+                if *published_at < cutoff {
+                    continue;
+                }
+            }
+        }
+
+        if let Some(cutoff) = incremental_cutoff {
+            if let Some(published_at) = article.published_at.as_ref() {
+                if *published_at <= cutoff {
+                    continue;
+                }
+            }
+        }
+
         let article_key = build_article_key(&article);
         if !seen_keys.insert(article_key.clone()) {
             continue;
@@ -386,19 +556,24 @@ fn collect_pending_articles(
 }
 
 async fn score_articles_in_batches(
+    provider: &str,
+    model_override: Option<&str>,
     api_key: &str,
     interest_context: &str,
-    articles: &[FeedArticle],
+    articles: &[PendingArticle],
 ) -> Result<ScoreOutcome> {
     if articles.is_empty() {
         return Ok(ScoreOutcome {
-            scored_articles: Vec::new(),
+            results: Vec::new(),
             errors: Vec::new(),
         });
     }
 
-    let mut scored = Vec::new();
+    let mut results_collected = Vec::new();
     let mut errors = Vec::new();
+    let provider = provider.to_string();
+    let model_override = model_override.map(|value| value.to_string());
+    let api_key = api_key.to_string();
 
     for group in articles
         .chunks(SCORE_BATCH_SIZE * MAX_CONCURRENT_SCORE_BATCHES)
@@ -412,33 +587,135 @@ async fn score_articles_in_batches(
         let results = join_all(group.iter().map(|batch| {
             let batch = batch.clone();
             let interest_context = interest_context.to_string();
+            let provider = provider.clone();
+            let model_override = model_override.clone();
+            let api_key = api_key.clone();
             async move {
-                match llm::summarize_and_score_batch(api_key, &interest_context, &batch).await {
-                    Ok(analyses) => Ok::<BatchScoreOutcome, anyhow::Error>(BatchScoreOutcome {
-                        scored_articles: batch.into_iter().zip(analyses.into_iter()).collect(),
-                        errors: Vec::new(),
-                    }),
+                let batch_articles = batch
+                    .iter()
+                    .map(|item| item.article.clone())
+                    .collect::<Vec<_>>();
+
+                match llm::summarize_and_score_batch(
+                    &provider,
+                    model_override.as_deref(),
+                    &api_key,
+                    &interest_context,
+                    &batch_articles,
+                )
+                .await
+                {
+                    Ok(analyses) if analyses.len() == batch.len() => {
+                        let batch_results = batch
+                            .into_iter()
+                            .zip(analyses.into_iter())
+                            .map(|(item, analysis)| ArticleScoreResult {
+                                article_id: item.article_id,
+                                article: item.article,
+                                analysis: Some(analysis),
+                                error: None,
+                            })
+                            .collect::<Vec<_>>();
+
+                        Ok::<BatchScoreOutcome, anyhow::Error>(BatchScoreOutcome {
+                            results: batch_results,
+                            errors: Vec::new(),
+                        })
+                    }
+                    Ok(analyses) => {
+                        let mismatch_err = anyhow!(
+                            "batch result length mismatch: expected {}, got {}",
+                            batch.len(),
+                            analyses.len()
+                        );
+                        eprintln!(
+                            "briefy-pet batch scoring failed, falling back to per-article scoring: {}",
+                            mismatch_err
+                        );
+
+                        let mut fallback_results = Vec::new();
+                        let mut fallback_errors = Vec::new();
+                        for item in batch {
+                            match llm::summarize_and_score_single(
+                                &provider,
+                                model_override.as_deref(),
+                                &api_key,
+                                &interest_context,
+                                &item.article,
+                            )
+                            .await
+                            {
+                                Ok(analysis) => fallback_results.push(ArticleScoreResult {
+                                    article_id: item.article_id,
+                                    article: item.article,
+                                    analysis: Some(analysis),
+                                    error: None,
+                                }),
+                                Err(err) => {
+                                    let message = format!(
+                                        "{} => {}",
+                                        truncate_text(item.article.title.trim(), 72),
+                                        format_compact_error(&err, 240)
+                                    );
+                                    fallback_errors.push(message.clone());
+                                    fallback_results.push(ArticleScoreResult {
+                                        article_id: item.article_id,
+                                        article: item.article,
+                                        analysis: None,
+                                        error: Some(message),
+                                    });
+                                }
+                            }
+                        }
+
+                        Ok(BatchScoreOutcome {
+                            results: fallback_results,
+                            errors: fallback_errors,
+                        })
+                    }
                     Err(batch_err) => {
                         eprintln!(
                             "briefy-pet batch scoring failed, falling back to per-article scoring: {}",
                             batch_err
                         );
 
-                        let mut recovered = Vec::new();
+                        let mut fallback_results = Vec::new();
                         let mut fallback_errors = Vec::new();
-                        for article in batch {
-                            match llm::summarize_and_score_single(api_key, &interest_context, &article).await {
-                                Ok(analysis) => recovered.push((article, analysis)),
+                        for item in batch {
+                            match llm::summarize_and_score_single(
+                                &provider,
+                                model_override.as_deref(),
+                                &api_key,
+                                &interest_context,
+                                &item.article,
+                            )
+                            .await
+                            {
+                                Ok(analysis) => fallback_results.push(ArticleScoreResult {
+                                    article_id: item.article_id,
+                                    article: item.article,
+                                    analysis: Some(analysis),
+                                    error: None,
+                                }),
                                 Err(err) => {
-                                    let message = format!("LLM scoring failed: {} ({})", article.title, err);
-                                    eprintln!("briefy-pet article scoring failed: {message}");
-                                    fallback_errors.push(message);
+                                    let message = format!(
+                                        "{} => {}",
+                                        truncate_text(item.article.title.trim(), 72),
+                                        format_compact_error(&err, 240)
+                                    );
+                                    fallback_errors.push(message.clone());
+                                    fallback_results.push(ArticleScoreResult {
+                                        article_id: item.article_id,
+                                        article: item.article,
+                                        analysis: None,
+                                        error: Some(message),
+                                    });
                                 }
                             }
                         }
 
                         Ok(BatchScoreOutcome {
-                            scored_articles: recovered,
+                            results: fallback_results,
                             errors: fallback_errors,
                         })
                     }
@@ -450,16 +727,19 @@ async fn score_articles_in_batches(
         for result in results {
             match result {
                 Ok(mut batch_result) => {
-                    scored.append(&mut batch_result.scored_articles);
+                    results_collected.append(&mut batch_result.results);
                     errors.append(&mut batch_result.errors);
                 }
-                Err(err) => errors.push(err.to_string()),
+                Err(err) => errors.push(format!(
+                    "batch execution failure: {}",
+                    format_compact_error(&err, 240)
+                )),
             }
         }
     }
 
     Ok(ScoreOutcome {
-        scored_articles: scored,
+        results: results_collected,
         errors,
     })
 }
@@ -477,46 +757,6 @@ fn build_interest_context(settings: &SettingsPayload) -> String {
         sections.push(format!("每日兴趣记忆: {}", settings.memory_summary.trim()));
     }
     sections.join("\n")
-}
-
-fn select_partition_top_candidates(
-    candidates: Vec<(i64, String, String, SourceKind, i64, Option<DateTime<Utc>>)>,
-) -> Vec<i64> {
-    let mut partitions =
-        BTreeMap::<(String, String, SourceKind), Vec<(i64, i64, Option<DateTime<Utc>>)>>::new();
-    for (article_id, module, bucket, source_kind, fit_score, published_at) in candidates {
-        partitions
-            .entry((module, bucket, source_kind))
-            .or_default()
-            .push((article_id, fit_score, published_at));
-    }
-
-    let mut selected = Vec::new();
-    for ((module, bucket, source_kind), mut items) in partitions {
-        items.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| right.2.cmp(&left.2))
-                .then_with(|| right.0.cmp(&left.0))
-        });
-
-        let take_n = policy::reminder_take_for_source(&module, &bucket, &source_kind).max(1);
-        selected.extend(items.into_iter().take(take_n));
-    }
-
-    selected.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| right.2.cmp(&left.2))
-            .then_with(|| right.0.cmp(&left.0))
-    });
-    selected
-        .into_iter()
-        .take(MAX_REMINDER_ITEMS_PER_BATCH)
-        .map(|item| item.0)
-        .collect()
 }
 
 fn build_article_key(article: &FeedArticle) -> String {
@@ -550,20 +790,53 @@ fn collect_cycle_warnings(fetch_errors: Vec<String>, score_errors: Vec<String>) 
         .filter(|item| !is_soft_feed_error(item))
         .collect::<Vec<_>>();
 
-    if !hard_fetch_errors.is_empty() {
-        warnings.push(format!("some feeds failed: {}", hard_fetch_errors.join(" ; ")));
+    if let Some(message) = summarize_error_list("some feeds failed", hard_fetch_errors, 3) {
+        warnings.push(message);
     }
-    if !score_errors.is_empty() {
-        warnings.push(format!(
-            "some articles failed scoring: {}",
-            score_errors.join(" ; ")
-        ));
+    if let Some(message) = summarize_error_list(
+        "some articles failed LLM scoring and were marked failed",
+        score_errors,
+        5,
+    ) {
+        warnings.push(message);
     }
     warnings
 }
 
 fn is_soft_feed_error(value: &str) -> bool {
     value.contains("HTTP 403") || value.contains("HTTP 404")
+}
+
+fn summarize_error_list(prefix: &str, errors: Vec<String>, sample_size: usize) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+
+    let total = errors.len();
+    let samples = errors
+        .into_iter()
+        .take(sample_size)
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if samples.is_empty() {
+        Some(format!("{prefix}: {total}"))
+    } else {
+        Some(format!("{prefix}: {total} (examples: {samples})"))
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut result = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
+}
+
+fn format_compact_error(err: &anyhow::Error, max_chars: usize) -> String {
+    let chain = format!("{:#}", err).replace('\n', " | ");
+    truncate_text(chain.trim(), max_chars)
 }
 
 fn log_fetch_result(result: Result<()>, app: &AppHandle) {
@@ -575,8 +848,30 @@ fn log_fetch_result(result: Result<()>, app: &AppHandle) {
             if let Ok(conn) = db::connect(app) {
                 let _ = db::write_api_key_valid(&conn, false);
             }
+            set_last_error(app, "API Key validation failed, please update settings.".to_string());
+        } else {
+            clear_last_error(app);
         }
-        set_last_error(app, message.clone());
+
+        if let Ok(conn) = db::connect(app) {
+            let now = Utc::now();
+            let _ = db::log_crawl_cycle(
+                &conn,
+                now,
+                now,
+                "failed-runtime",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some(&format_compact_error(&err, 400)),
+            );
+        }
+
         let _ = sync_windows(app, false);
         eprintln!("briefy-pet fetch cycle failed: {message}");
     }
@@ -613,11 +908,9 @@ pub fn handle_pet_double_click(app: &AppHandle) -> Result<()> {
         .api_key_valid
         .lock()
         .ok()
-        .and_then(|value| *value);
-    let view = if !is_settings_complete(&settings)
-        || settings.api_key.trim().is_empty()
-        || api_key_valid == Some(false)
-    {
+        .and_then(|value| *value)
+        .or(Some(db::read_api_key_valid(&conn)?));
+    let view = if requires_configuration(&settings, api_key_valid) {
         AppView::Settings
     } else {
         AppView::Reading
@@ -721,19 +1014,33 @@ fn set_scanning(app: &AppHandle, value: bool) {
     }
 }
 
+#[derive(Clone)]
+struct PendingArticle {
+    article_id: i64,
+    article: FeedArticle,
+}
+
+struct ArticleScoreResult {
+    article_id: i64,
+    article: FeedArticle,
+    analysis: Option<LlmResult>,
+    error: Option<String>,
+}
+
 struct ScoreOutcome {
-    scored_articles: Vec<(FeedArticle, LlmResult)>,
+    results: Vec<ArticleScoreResult>,
     errors: Vec<String>,
 }
 
 struct BatchScoreOutcome {
-    scored_articles: Vec<(FeedArticle, LlmResult)>,
+    results: Vec<ArticleScoreResult>,
     errors: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use std::collections::BTreeMap;
 
     use super::{classify_error_for_display, derive_pet_status, is_settings_complete};
     use crate::models::{
@@ -743,6 +1050,9 @@ mod tests {
     fn sample_settings() -> SettingsPayload {
         SettingsPayload {
             api_key: "demo-key".into(),
+            llm_provider: "deepseek".into(),
+            llm_model: String::new(),
+            provider_api_keys: BTreeMap::from([("deepseek".to_string(), "demo-key".to_string())]),
             auto_start: false,
             disciplines: vec![UserDisciplinePreference {
                 discipline: Discipline::Technology,
@@ -764,7 +1074,7 @@ mod tests {
                 enabled: true,
                 enabled_by_default: true,
                 postponed: false,
-                origin_files: vec!["reference/demo.opml".into()],
+                origin_files: vec!["catalog/demo.opml".into()],
             }],
         }
     }

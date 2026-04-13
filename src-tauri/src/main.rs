@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use tauri::{LogicalPosition, LogicalSize, Manager, WindowBuilder, WindowEvent, WindowUrl};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
+use crate::models::AppView;
+
 pub struct AppState {
     is_scanning: Mutex<bool>,
     scheduler_started: Mutex<bool>,
@@ -82,15 +84,26 @@ fn main() {
 
             let conn = db::connect(&app.handle())?;
             let settings = db::read_settings(&conn)?;
+            let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
+            if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
+                *api_key_valid = Some(persisted_api_key_valid);
+            }
+            let should_force_settings =
+                service::requires_configuration(&settings, Some(persisted_api_key_valid));
+            if should_force_settings {
+                db::write_active_view(&conn, &AppView::Settings)?;
+            }
             if settings.auto_start {
                 let _ = app.autolaunch().enable();
             } else {
                 let _ = app.autolaunch().disable();
             }
-            let should_scan = !settings.api_key.trim().is_empty();
+            let should_scan = !should_force_settings;
             if !should_scan {
-                if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
+                if settings.api_key.trim().is_empty() || !persisted_api_key_valid {
+                    if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
                     *api_key_valid = Some(false);
+                    }
                 }
             }
             {
@@ -115,7 +128,11 @@ fn main() {
 
             if should_scan {
                 service::ensure_scheduler(&app.handle());
-                service::trigger_fetch_now(&app.handle(), Some(std::time::Duration::from_secs(3)));
+                service::trigger_fetch_now(
+                    &app.handle(),
+                    Some(std::time::Duration::from_secs(3)),
+                    true,
+                );
             } else {
                 service::sync_windows(&app.handle(), false)?;
             }
@@ -131,7 +148,10 @@ fn main() {
             commands::toggle_favorite,
             commands::pet_double_click,
             commands::bubble_action,
-            commands::set_active_view
+            commands::set_active_view,
+            commands::save_article_note,
+            commands::add_custom_rss_source,
+            commands::reset_runtime_data
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

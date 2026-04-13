@@ -28,3 +28,20 @@ export async function bubbleAction(action: "view" | "snooze" | "ignore"): Promis
 export async function setActiveView(view: AppView): Promise<Snapshot> {
   return invoke("set_active_view", { view });
 }
+
+export async function saveArticleNote(articleId: number, note: string): Promise<Snapshot> {
+  return invoke("save_article_note", { articleId, note });
+}
+
+export async function addCustomRssSource(
+  name: string,
+  url: string,
+  module: string,
+  bucket: string,
+): Promise<Snapshot> {
+  return invoke("add_custom_rss_source", { name, url, module, bucket });
+}
+
+export async function resetRuntimeData(): Promise<void> {
+  return invoke("reset_runtime_data");
+}

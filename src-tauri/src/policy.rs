@@ -5,7 +5,6 @@ use crate::models::{FitLevel, SourceKind};
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRuntimePolicy {
     pub fetch_interval: Duration,
-    pub reminder_take: usize,
     pub high_cutoff: i64,
     pub medium_cutoff: i64,
 }
@@ -44,57 +43,54 @@ pub fn policy_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -
     let module = normalize_module(module);
     let bucket = normalize_bucket(&module, bucket);
 
-    let default_policy = match source_kind {
-        SourceKind::AcademicJournal => policy(72, 2, 78, 60),
-        SourceKind::OfficialAnnouncement => policy(6, 2, 74, 56),
-        SourceKind::TechnicalBlog => policy(3, 2, 72, 54),
-        SourceKind::CommunityHotspot => policy(3, 1, 80, 62),
+    let (high_cutoff, medium_cutoff) = match (module.as_str(), bucket.as_str(), source_kind) {
+        ("news_opinion", _, _) => (82, 64),
+        ("science", _, _) => (76, 58),
+        ("medicine", "academic_frontier", _) => (79, 61),
+        (_, _, SourceKind::AcademicJournal) => (78, 60),
+        (_, _, SourceKind::OfficialAnnouncement) => (74, 56),
+        (_, _, SourceKind::TechnicalBlog) => (72, 54),
+        (_, _, SourceKind::CommunityHotspot) => (80, 62),
     };
 
-    match (module.as_str(), bucket.as_str()) {
-        ("technology", "research") => policy(24, 2, 78, 60),
-        ("technology", "official") => policy(4, 2, 74, 56),
-        ("technology", "blogs") => policy(6, 3, 72, 54),
-        ("technology", "community") => policy(2, 2, 78, 60),
-        ("technology", "streaming") => policy(3, 2, 76, 58),
+    let fetch_hours = match (module.as_str(), bucket.as_str()) {
+        ("technology", "research") => 24,
+        ("technology", _) => 6,
+        ("social_science", "academic_frontier") => 24,
+        ("social_science", _) => 6,
+        ("business", _) => 6,
+        ("news_opinion", _) => 6,
+        ("growth", _) => 24,
+        ("entertainment", _) => 24,
+        ("science", _) => 6,
+        ("medicine", "academic_frontier") => 24,
+        ("medicine", _) => 6,
+        _ => 6,
+    };
 
-        ("social_science", "academic_frontier") => policy(36, 2, 78, 60),
-        ("social_science", "blogs") => policy(12, 2, 73, 55),
-        ("social_science", "community") => policy(8, 1, 79, 61),
-
-        ("business", "blogs") => policy(8, 2, 72, 54),
-        ("business", "community") => policy(6, 1, 78, 60),
-        ("business", "streaming") => policy(6, 1, 77, 59),
-
-        ("growth", "blogs") => policy(12, 2, 72, 54),
-        ("growth", "community") => policy(8, 1, 77, 59),
-        ("growth", "streaming") => policy(8, 1, 76, 58),
-
-        ("news_opinion", "news") => policy(1, 3, 82, 64),
-        ("news_opinion", "media_opinion") => policy(2, 2, 80, 62),
-        ("news_opinion", "personal_opinion") => policy(3, 1, 81, 63),
-        ("news_opinion", "streaming_opinion") => policy(3, 1, 79, 61),
-        ("news_opinion", "community_opinion") => policy(2, 1, 82, 64),
-
-        ("entertainment", "lite_pool") => policy(6, 1, 80, 62),
-
-        ("science", "physics") => policy(72, 1, 76, 58),
-        ("science", "chemistry") => policy(72, 1, 76, 58),
-        ("science", "biology") => policy(72, 1, 76, 58),
-
-        ("medicine", "academic_frontier") => policy(48, 2, 79, 61),
-        ("medicine", "blogs") => policy(12, 1, 74, 56),
-        ("medicine", "community") => policy(8, 1, 80, 62),
-        _ => default_policy,
-    }
+    policy(fetch_hours, high_cutoff, medium_cutoff)
 }
 
 pub fn fetch_interval_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> Duration {
     policy_for_source(module, bucket, source_kind).fetch_interval
 }
 
-pub fn reminder_take_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> usize {
-    policy_for_source(module, bucket, source_kind).reminder_take
+pub fn fetch_retry_interval_for_failed_source(
+    module: &str,
+    bucket: &str,
+    source_kind: &SourceKind,
+) -> Duration {
+    let regular = fetch_interval_for_source(module, bucket, source_kind);
+    let half = regular / 2;
+    let floor = Duration::minutes(30);
+    let cap = Duration::hours(2);
+    if half < floor {
+        floor
+    } else if half > cap {
+        cap
+    } else {
+        half
+    }
 }
 
 pub fn fit_level_for_score(
@@ -114,10 +110,9 @@ pub fn fit_level_for_score(
     }
 }
 
-fn policy(fetch_hours: i64, reminder_take: usize, high_cutoff: i64, medium_cutoff: i64) -> SourceRuntimePolicy {
+fn policy(fetch_hours: i64, high_cutoff: i64, medium_cutoff: i64) -> SourceRuntimePolicy {
     SourceRuntimePolicy {
         fetch_interval: Duration::hours(fetch_hours),
-        reminder_take,
         high_cutoff,
         medium_cutoff,
     }
@@ -144,10 +139,13 @@ mod tests {
     fn exposes_bucket_specific_policy() {
         let tech_research = policy_for_source("technology", "research", &SourceKind::AcademicJournal);
         let news_breaking = policy_for_source("news_opinion", "news", &SourceKind::CommunityHotspot);
+        let growth_blogs = policy_for_source("growth", "blogs", &SourceKind::TechnicalBlog);
+        let medicine_research =
+            policy_for_source("medicine", "academic_frontier", &SourceKind::AcademicJournal);
 
         assert_eq!(tech_research.fetch_interval.num_hours(), 24);
-        assert_eq!(tech_research.reminder_take, 2);
-        assert_eq!(news_breaking.fetch_interval.num_hours(), 1);
-        assert_eq!(news_breaking.reminder_take, 3);
+        assert_eq!(news_breaking.fetch_interval.num_hours(), 6);
+        assert_eq!(growth_blogs.fetch_interval.num_hours(), 24);
+        assert_eq!(medicine_research.fetch_interval.num_hours(), 24);
     }
 }

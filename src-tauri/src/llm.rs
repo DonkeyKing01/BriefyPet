@@ -8,23 +8,72 @@ use crate::{
     policy,
 };
 
-const OPENAI_COMPAT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-chat";
 const LLM_RETRIES: usize = 3;
 const LLM_REQUEST_TIMEOUT_SECS: u64 = 20;
 
-fn chat_completions_url() -> String {
-    format!("{OPENAI_COMPAT_BASE_URL}/chat/completions")
+struct ProviderConfig {
+    base_url: &'static str,
+    default_model: &'static str,
 }
 
-pub async fn validate_api_key(api_key: &str) -> Result<()> {
+pub fn normalize_provider(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "deepseek" => "deepseek".to_string(),
+        "glm" | "zhipu" | "zhipuai" => "glm".to_string(),
+        "kimi" | "moonshot" => "kimi".to_string(),
+        "openai" => "openai".to_string(),
+        "siliconflow" => "siliconflow".to_string(),
+        _ => "deepseek".to_string(),
+    }
+}
+
+fn provider_config(provider: &str) -> ProviderConfig {
+    match normalize_provider(provider).as_str() {
+        "glm" => ProviderConfig {
+            base_url: "https://open.bigmodel.cn/api/paas/v4",
+            default_model: "glm-4-flash",
+        },
+        "kimi" => ProviderConfig {
+            base_url: "https://api.moonshot.cn/v1",
+            default_model: "moonshot-v1-8k",
+        },
+        "openai" => ProviderConfig {
+            base_url: "https://api.openai.com/v1",
+            default_model: "gpt-4o-mini",
+        },
+        "siliconflow" => ProviderConfig {
+            base_url: "https://api.siliconflow.cn/v1",
+            default_model: "Qwen/Qwen2.5-72B-Instruct",
+        },
+        _ => ProviderConfig {
+            base_url: "https://api.deepseek.com",
+            default_model: "deepseek-chat",
+        },
+    }
+}
+
+fn resolve_model(provider: &str, model_override: Option<&str>) -> String {
+    if let Some(model) = model_override.map(str::trim).filter(|value| !value.is_empty()) {
+        return model.to_string();
+    }
+    provider_config(provider).default_model.to_string()
+}
+
+fn chat_completions_url(provider: &str) -> String {
+    let base = provider_config(provider).base_url.trim_end_matches('/');
+    format!("{base}/chat/completions")
+}
+
+pub async fn validate_api_key(provider: &str, model_override: Option<&str>, api_key: &str) -> Result<()> {
     let trimmed_key = api_key.trim();
     if trimmed_key.is_empty() {
         return Err(anyhow!("missing api key"));
     }
 
+    let model = resolve_model(provider, model_override);
+
     let body = json!({
-        "model": DEFAULT_MODEL,
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -36,12 +85,14 @@ pub async fn validate_api_key(api_key: &str) -> Result<()> {
         "stream": false
     });
 
-    let _ = send_chat_completion_with_retries(trimmed_key, &body).await?;
+    let _ = send_chat_completion_with_retries(provider, trimmed_key, &body).await?;
 
     Ok(())
 }
 
 pub async fn summarize_and_score_batch(
+    provider: &str,
+    model_override: Option<&str>,
     api_key: &str,
     interest_context: &str,
     articles: &[FeedArticle],
@@ -53,6 +104,7 @@ pub async fn summarize_and_score_batch(
     if articles.is_empty() {
         return Ok(Vec::new());
     }
+    let model = resolve_model(provider, model_override);
 
     let article_payload = articles
         .iter()
@@ -96,7 +148,7 @@ Articles:\n{article_payload}"
     );
 
     let body = json!({
-        "model": DEFAULT_MODEL,
+        "model": model,
         "messages": [
             {
                 "role": "system",
@@ -107,6 +159,10 @@ Articles:\n{article_payload}"
                 "content": prompt
             }
         ],
+        "response_format": {
+            "type": "json_object"
+        },
+        "max_tokens": 1600,
         "temperature": 0,
         "stream": false
     });
@@ -114,7 +170,7 @@ Articles:\n{article_payload}"
     let mut last_error = None;
 
     for attempt in 1..=LLM_RETRIES {
-        match score_batch_once(trimmed_key, &body, articles.len()).await {
+        match score_batch_once(provider, trimmed_key, &body, articles.len()).await {
             Ok(results) => return Ok(results),
             Err(err) => {
                 last_error = Some(err);
@@ -130,12 +186,20 @@ Articles:\n{article_payload}"
 }
 
 pub async fn summarize_and_score_single(
+    provider: &str,
+    model_override: Option<&str>,
     api_key: &str,
     interest_context: &str,
     article: &FeedArticle,
 ) -> Result<LlmResult> {
     let mut results =
-        summarize_and_score_batch(api_key, interest_context, std::slice::from_ref(article))
+        summarize_and_score_batch(
+            provider,
+            model_override,
+            api_key,
+            interest_context,
+            std::slice::from_ref(article),
+        )
             .await
             .with_context(|| format!("single article scoring failed: {}", article.title))?;
     results.pop().ok_or_else(|| {
@@ -210,11 +274,12 @@ fn extract_message_content(payload: &Value) -> Option<String> {
 }
 
 async fn score_batch_once(
+    provider: &str,
     api_key: &str,
     body: &Value,
     expected_len: usize,
 ) -> Result<Vec<LlmResult>> {
-    let payload = send_chat_completion_with_retries(api_key, body).await?;
+    let payload = send_chat_completion_with_retries(provider, api_key, body).await?;
     let raw_content = extract_message_content(&payload).context("missing llm response content")?;
     let normalized = normalize_json_response(&raw_content).ok_or_else(|| {
         anyhow!(
@@ -228,7 +293,11 @@ async fn score_batch_once(
         .with_context(|| format!("model batch shape invalid: {}", truncate(&normalized, 200)))
 }
 
-async fn send_chat_completion_with_retries(api_key: &str, body: &Value) -> Result<Value> {
+async fn send_chat_completion_with_retries(
+    provider: &str,
+    api_key: &str,
+    body: &Value,
+) -> Result<Value> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(10))
@@ -237,7 +306,7 @@ async fn send_chat_completion_with_retries(api_key: &str, body: &Value) -> Resul
     let mut last_error = None;
 
     for attempt in 1..=LLM_RETRIES {
-        match send_chat_completion_once(&client, api_key, body).await {
+        match send_chat_completion_once(&client, provider, api_key, body).await {
             Ok(payload) => return Ok(payload),
             Err(err) => {
                 let retryable = is_retryable_llm_error(&err);
@@ -256,11 +325,12 @@ async fn send_chat_completion_with_retries(api_key: &str, body: &Value) -> Resul
 
 async fn send_chat_completion_once(
     client: &reqwest::Client,
+    provider: &str,
     api_key: &str,
     body: &Value,
 ) -> Result<Value> {
     let response = client
-        .post(chat_completions_url())
+        .post(chat_completions_url(provider))
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(CONTENT_TYPE, "application/json")
         .json(body)
@@ -404,26 +474,17 @@ fn extract_first_json_block(raw: &str) -> Option<String> {
 }
 
 fn parse_batch_result(value: &Value, expected_len: usize) -> Result<Vec<LlmResult>> {
-    let items = value
-        .get("items")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("missing items array"))?;
-
-    if items.len() != expected_len {
-        return Err(anyhow!(
-            "items length mismatch: expected {expected_len}, got {}",
-            items.len()
-        ));
-    }
+    let items = extract_candidate_items(value, expected_len)?;
 
     let mut ordered = Vec::with_capacity(expected_len);
     ordered.resize_with(expected_len, || None);
 
-    for item in items {
+    for (position, item) in items.iter().enumerate() {
         let index = item
             .get("index")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("missing index"))? as usize;
+            .map(|value| value as usize)
+            .unwrap_or(position);
         if index >= expected_len {
             return Err(anyhow!("index out of range: {index}"));
         }
@@ -442,17 +503,16 @@ fn parse_llm_result(value: &Value) -> Result<LlmResult> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("missing summary"))?
+        .unwrap_or("该内容暂无可用摘要（模型输出缺失）")
         .to_string();
     let recommendation_reason = value
         .get("recommendation_reason")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("missing recommendation_reason"))?
+        .unwrap_or("模型输出不完整，建议直接查看原文后再决定是否关注")
         .to_string();
-    let fit_score =
-        parse_fit_score(value.get("fit_score")).ok_or_else(|| anyhow!("unrecognized fit_score"))?;
+    let fit_score = parse_fit_score(value.get("fit_score")).unwrap_or(40);
     let fit_level =
         parse_fit_level(value.get("fit_level")).unwrap_or_else(|| fit_level_from_score(fit_score));
 
@@ -462,6 +522,42 @@ fn parse_llm_result(value: &Value) -> Result<LlmResult> {
         fit_score: fit_score.clamp(0, 100),
         recommendation_reason,
     })
+}
+
+fn extract_candidate_items<'a>(value: &'a Value, expected_len: usize) -> Result<Vec<&'a Value>> {
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        if items.len() == expected_len {
+            return Ok(items.iter().collect());
+        }
+        if items.len() == 1 && expected_len == 1 {
+            return Ok(items.iter().collect());
+        }
+    }
+
+    if let Some(items) = value.get("results").and_then(Value::as_array) {
+        if items.len() == expected_len {
+            return Ok(items.iter().collect());
+        }
+    }
+
+    if let Some(items) = value.as_array() {
+        if items.len() == expected_len {
+            return Ok(items.iter().collect());
+        }
+    }
+
+    if expected_len == 1 {
+        if value.get("summary").is_some() || value.get("fit_score").is_some() {
+            return Ok(vec![value]);
+        }
+        if let Some(obj) = value.get("item") {
+            return Ok(vec![obj]);
+        }
+    }
+
+    Err(anyhow!(
+        "missing usable items array: expected {expected_len} entries"
+    ))
 }
 
 fn parse_fit_level(value: Option<&Value>) -> Option<FitLevel> {
@@ -526,7 +622,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_json_response, parse_fit_level, parse_fit_score};
+    use super::{
+        normalize_json_response, parse_batch_result, parse_fit_level, parse_fit_score,
+    };
     use crate::models::FitLevel;
     use serde_json::json;
 
@@ -550,5 +648,44 @@ mod tests {
         assert_eq!(parse_fit_level(Some(&json!("高"))), Some(FitLevel::High));
         assert_eq!(parse_fit_score(Some(&json!(0.91))), Some(91));
         assert_eq!(parse_fit_score(Some(&json!("65%"))), Some(65));
+    }
+
+    #[test]
+    fn parses_single_object_without_items_wrapper() {
+        let value = json!({
+            "summary": "ok",
+            "fit_level": "high",
+            "fit_score": 88,
+            "recommendation_reason": "ok"
+        });
+
+        let parsed = parse_batch_result(&value, 1).expect("single object should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].fit_level, FitLevel::High);
+    }
+
+    #[test]
+    fn parses_items_without_index_by_position() {
+        let value = json!({
+            "items": [
+                {
+                    "summary": "first",
+                    "fit_level": "low",
+                    "fit_score": 35,
+                    "recommendation_reason": "r1"
+                },
+                {
+                    "summary": "second",
+                    "fit_level": "medium",
+                    "fit_score": 66,
+                    "recommendation_reason": "r2"
+                }
+            ]
+        });
+
+        let parsed = parse_batch_result(&value, 2).expect("items should parse by position");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].summary, "first");
+        assert_eq!(parsed[1].summary, "second");
     }
 }

@@ -26,9 +26,6 @@
       "targets": ["app", "dmg"],
       "identifier": "com.briefypet.desktop",
       "resources": [
-        "resources/rss-sources.json",
-        "resources/rss-catalog-v2-1.json",
-        "resources/rss-dedup-report-v2-1.md",
         "resources/rss_catalog_v3_unified.opml"
       ],
       "icon": [

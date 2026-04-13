@@ -91,6 +91,16 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 npm run tauri -- build --target universal-apple-darwin
 ```
 
+平台打包脚本：
+
+```bash
+# macOS release DMG
+npm run tauri:build:mac:release-dmg
+
+# Windows release bundle (msi + nsis)
+npm run tauri:build:windows:release
+```
+
 ## 当前打包产物
 
 当前 macOS 安装包目标使用 Tauri 的 `app` 与 `dmg` bundle。
@@ -120,3 +130,5 @@ src-tauri/target/release/bundle/macos/Briefy-pet.app
 - `npm run tauri -- dev`
 - `npm run tauri -- build`
 - `npm run tauri -- build --debug`
+- `npm run tauri:build:mac:release-dmg`
+- `npm run tauri:build:windows:release`

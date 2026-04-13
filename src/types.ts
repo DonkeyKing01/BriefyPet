@@ -20,6 +20,8 @@ export type SourceKind =
   | "technical-blog"
   | "community-hotspot";
 
+export type LlmProvider = "deepseek" | "glm" | "kimi" | "openai" | "siliconflow";
+
 export type SourceModule =
   | "technology"
   | "social_science"
@@ -75,6 +77,9 @@ export type RssSource = {
 
 export type SettingsPayload = {
   apiKey: string;
+  llmProvider: LlmProvider;
+  llmModel: string;
+  providerApiKeys: Record<string, string>;
   autoStart: boolean;
   disciplines: UserDisciplinePreference[];
   memoryModeEnabled: boolean;
@@ -98,6 +103,7 @@ export type Article = {
   fitScore: number;
   recommendationReason: string;
   rawContent: string;
+  note: string;
   isFavorite: boolean;
   isNew: boolean;
 };

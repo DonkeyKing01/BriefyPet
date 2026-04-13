@@ -81,7 +81,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -875,6 +876,18 @@ a {
   line-height: 1.68;
 }
 
+.reader-note-editor {
+  width: 100%;
+  min-height: 110px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  color: var(--text);
+  padding: 10px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
 .reader-empty {
   flex: 1;
   min-height: 0;
@@ -943,6 +956,8 @@ a {
 }
 
 .settings-card input[type="password"],
+.settings-card input[type="text"],
+.settings-card select,
 .settings-card textarea {
   width: 100%;
   border: 1px solid var(--line);
@@ -1017,6 +1032,24 @@ a {
   font-size: 12px;
 }
 
+.source-discipline-head,
+.source-kind-head {
+  cursor: pointer;
+  list-style: none;
+}
+
+.source-discipline-head::-webkit-details-marker,
+.source-kind-head::-webkit-details-marker {
+  display: none;
+}
+
+.settings-hint {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .rss-list {
   display: flex;
   flex-direction: column;
@@ -1065,6 +1098,12 @@ a {
   border-radius: 10px;
   background: linear-gradient(180deg, var(--accent) 0%, var(--accent-strong) 100%);
   color: #f7fbff;
+}
+
+.settings-actions .ghost-danger {
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--line));
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+  color: var(--danger);
 }
 
 .onboarding-hint {

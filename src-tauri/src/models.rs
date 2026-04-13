@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +131,12 @@ pub struct RssSource {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPayload {
     pub api_key: String,
+    #[serde(default = "default_llm_provider")]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub llm_model: String,
+    #[serde(default)]
+    pub provider_api_keys: BTreeMap<String, String>,
     pub auto_start: bool,
     pub disciplines: Vec<UserDisciplinePreference>,
     pub memory_mode_enabled: bool,
@@ -154,6 +162,7 @@ pub struct ArticleRecord {
     pub fit_score: i64,
     pub recommendation_reason: String,
     pub raw_content: String,
+    pub note: String,
     pub is_favorite: bool,
     pub is_new: bool,
 }
@@ -238,6 +247,10 @@ pub struct LlmResult {
     pub fit_level: FitLevel,
     pub fit_score: i64,
     pub recommendation_reason: String,
+}
+
+pub fn default_llm_provider() -> String {
+    "deepseek".to_string()
 }
 
 pub fn all_disciplines() -> Vec<Discipline> {
