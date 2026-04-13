@@ -2,6 +2,7 @@
 
 mod commands;
 mod db;
+mod diagnostics;
 mod llm;
 mod models;
 mod policy;
@@ -82,6 +83,16 @@ fn main() {
 
             let conn = db::connect(&app.handle())?;
             let settings = db::read_settings(&conn)?;
+            diagnostics::log(
+                &app.handle(),
+                "startup",
+                format!(
+                    "app boot: auto_start={} api_key_present={} selected_disciplines={}",
+                    settings.auto_start,
+                    !settings.api_key.trim().is_empty(),
+                    settings.disciplines.iter().filter(|item| item.enabled).count()
+                ),
+            );
             if settings.auto_start {
                 let _ = app.autolaunch().enable();
             } else {
@@ -114,9 +125,19 @@ fn main() {
             build_bubble_window(app)?;
 
             if should_scan {
+                diagnostics::log(
+                    &app.handle(),
+                    "startup",
+                    "scheduler enabled and initial fetch scheduled in 3 seconds",
+                );
                 service::ensure_scheduler(&app.handle());
                 service::trigger_fetch_now(&app.handle(), Some(std::time::Duration::from_secs(3)));
             } else {
+                diagnostics::log(
+                    &app.handle(),
+                    "startup",
+                    "initial fetch skipped because api key is missing",
+                );
                 service::sync_windows(&app.handle(), false)?;
             }
 
@@ -131,7 +152,8 @@ fn main() {
             commands::toggle_favorite,
             commands::pet_double_click,
             commands::bubble_action,
-            commands::set_active_view
+            commands::set_active_view,
+            commands::reset_app_data
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

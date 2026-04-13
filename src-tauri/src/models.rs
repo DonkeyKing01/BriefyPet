@@ -232,6 +232,14 @@ pub struct FeedArticle {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingArticleRecord {
+    pub id: i64,
+    pub article_key: String,
+    pub fetched_at: DateTime<Utc>,
+    pub article: FeedArticle,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LlmResult {
     pub summary: String,

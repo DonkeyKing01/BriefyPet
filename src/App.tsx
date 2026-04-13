@@ -5,6 +5,7 @@ import {
   bubbleAction,
   openArticle,
   petDoubleClick,
+  resetAppData,
   saveSettings,
   setActiveView,
   toggleFavorite
@@ -802,6 +803,7 @@ function SettingsView({
   setSnapshot: React.Dispatch<React.SetStateAction<Snapshot | null>>;
 }) {
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const disciplinePrefs = useMemo(
@@ -853,6 +855,26 @@ function SettingsView({
       setSubmitError(err instanceof Error ? err.message : "保存设置失败");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleReset() {
+    const confirmed = window.confirm(
+      "This will clear your API Key, interests, fetched content, reminders, memory, and local cache. The action cannot be undone. Continue?"
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setResetting(true);
+    setSubmitError(null);
+    try {
+      const next = await resetAppData();
+      setSnapshot(next);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "初始化失败");
+    } finally {
+      setResetting(false);
     }
   }
 
@@ -974,6 +996,26 @@ function SettingsView({
               ))}
             </section>
           ))}
+        </div>
+      </section>
+
+      <section className="settings-card settings-danger-card">
+        <div className="settings-section-head">
+          <h2>重新初始化</h2>
+          <p>清空 API Key、兴趣勾选、抓取结果、提醒批次和本地缓存，让应用回到首次配置状态。</p>
+        </div>
+        <div className="danger-note">
+          此操作不可撤销。建议只在需要重新测试或彻底重置本地数据时使用。
+        </div>
+        <div className="danger-actions">
+          <button
+            type="button"
+            className="danger-button"
+            onClick={() => void handleReset()}
+            disabled={saving || resetting}
+          >
+            {resetting ? "正在重置..." : "清空数据并重新初始化"}
+          </button>
         </div>
       </section>
 
@@ -1457,6 +1499,9 @@ function MainWindow({
       {snapshot.lastError && <div className="error-banner">{snapshot.lastError}</div>}
       {interactionMessage && <div className="interaction-banner">{interactionMessage}</div>}
       {loading && <div className="loading-strip">正在同步最新快照...</div>}
+      {snapshot.petStatus === "scanning" && (
+        <div className="loading-strip">Scanning in progress. Results will appear after this round completes.</div>
+      )}
       {error && <div className="error-banner">{error}</div>}
 
       {snapshot.activeView === "settings" ? (

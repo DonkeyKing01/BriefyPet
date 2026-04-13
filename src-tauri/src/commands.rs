@@ -122,3 +122,25 @@ pub fn set_active_view(app: AppHandle, view: AppView) -> Result<Snapshot, String
     }
     service::snapshot(&app, false).map_err(|err| err.to_string())
 }
+
+#[tauri::command]
+pub fn reset_app_data(app: AppHandle, state: State<'_, AppState>) -> Result<Snapshot, String> {
+    let conn = db::connect(&app).map_err(|err| err.to_string())?;
+    db::reset_app_data(&conn).map_err(|err| err.to_string())?;
+    service::clear_last_error(&app);
+    if let Ok(mut api_key_valid) = state.api_key_valid.lock() {
+        *api_key_valid = Some(false);
+    }
+    if let Ok(mut last_scan_at) = state.last_scan_at.lock() {
+        *last_scan_at = None;
+    }
+    if let Ok(mut loading_until) = state.loading_until.lock() {
+        *loading_until = None;
+    }
+    if let Ok(mut scanning) = state.is_scanning.lock() {
+        *scanning = false;
+    }
+    app.autolaunch().disable().map_err(|err| err.to_string())?;
+    service::sync_windows(&app, false).map_err(|err| err.to_string())?;
+    service::snapshot(&app, false).map_err(|err| err.to_string())
+}

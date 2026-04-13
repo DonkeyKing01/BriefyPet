@@ -9,9 +9,11 @@ use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration as TokioDuration};
 
 use crate::{
+    diagnostics,
     db, llm,
     models::{
-        AppView, FeedArticle, FitLevel, LlmResult, PetStatus, SettingsPayload, Snapshot, SourceKind,
+        AppView, FeedArticle, FitLevel, LlmResult, PendingArticleRecord, PetStatus,
+        SettingsPayload, Snapshot, SourceKind,
     },
     policy,
     rss, AppState,
@@ -21,6 +23,13 @@ const SCORE_BATCH_SIZE: usize = 3;
 const MAX_CONCURRENT_SCORE_BATCHES: usize = 2;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
 const MAX_REMINDER_ITEMS_PER_BATCH: usize = 12;
+
+struct PendingProcessingOutcome {
+    inserted_count: usize,
+    reminder_candidates: Vec<(i64, String, String, SourceKind, i64, Option<DateTime<Utc>>)>,
+    errors: Vec<String>,
+    remaining_pending: usize,
+}
 
 pub fn derive_pet_status(
     settings: &SettingsPayload,
@@ -115,6 +124,7 @@ pub fn ensure_scheduler(app: &AppHandle) {
     }
 
     let app_handle = app.clone();
+    diagnostics::log(&app_handle, "scheduler", "background scheduler started");
     tauri::async_runtime::spawn(async move {
         loop {
             sleep(TokioDuration::from_secs(SCHEDULER_TICK_MINUTES * 60)).await;
@@ -125,6 +135,14 @@ pub fn ensure_scheduler(app: &AppHandle) {
 
 pub fn trigger_fetch_now(app: &AppHandle, delay: Option<std::time::Duration>) {
     let app_handle = app.clone();
+    diagnostics::log(
+        &app_handle,
+        "scheduler",
+        format!(
+            "manual fetch trigger queued with delay_secs={}",
+            delay.map(|value| value.as_secs()).unwrap_or(0)
+        ),
+    );
     tauri::async_runtime::spawn(async move {
         if let Some(delay) = delay {
             sleep(TokioDuration::from_secs(delay.as_secs())).await;
@@ -164,7 +182,18 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
 
     let conn = db::connect(&app)?;
     let settings = db::read_settings(&conn)?;
+    diagnostics::log(
+        &app,
+        "fetch",
+        format!(
+            "cycle start: api_key_present={} selected_disciplines={} memory_mode_enabled={}",
+            !settings.api_key.trim().is_empty(),
+            settings.disciplines.iter().filter(|item| item.enabled).count(),
+            settings.memory_mode_enabled
+        ),
+    );
     if settings.api_key.trim().is_empty() {
+        diagnostics::log(&app, "fetch", "cycle skipped: missing api key");
         set_api_key_valid(&app, Some(false));
         db::write_api_key_valid(&conn, false)?;
         clear_last_error(&app);
@@ -174,6 +203,7 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
     }
 
     if !is_settings_complete(&settings) {
+        diagnostics::log(&app, "fetch", "cycle skipped: settings incomplete");
         clear_last_error(&app);
         set_scanning(&app, false);
         sync_windows(&app, false)?;
@@ -184,7 +214,18 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
 
     let now = Utc::now();
     let due_sources = db::list_due_sources(&conn, now)?;
-    if due_sources.is_empty() {
+    let pending_before = db::pending_articles_count(&conn)?;
+    diagnostics::log(
+        &app,
+        "fetch",
+        format!(
+            "due sources resolved: {} pending_queue_before={}",
+            due_sources.len(),
+            pending_before
+        ),
+    );
+    if due_sources.is_empty() && pending_before == 0 {
+        diagnostics::log(&app, "fetch", "cycle finished early: no due sources");
         let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
         if memory.is_some() {
             clear_last_error(&app);
@@ -196,117 +237,126 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    let fetch_started_at = Instant::now();
-    let fetch_outcome = rss::fetch_sources(&due_sources)
-        .await
-        .context("RSS fetch/parse failed")?;
-    let fetch_elapsed = fetch_started_at.elapsed();
-
-    let mut pending_articles = Vec::new();
+    let mut fetch_elapsed = std::time::Duration::ZERO;
     let mut fetch_errors = Vec::new();
-    for result in fetch_outcome.results {
-        if let Some(error) = result.error {
-            db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
-            fetch_errors.push(format!("{}: {}", result.source.name, error));
-            continue;
+    let mut fetched_source_stage_counts = Vec::<(String, usize)>::new();
+
+    if !due_sources.is_empty() {
+        let fetch_started_at = Instant::now();
+        let fetch_outcome = rss::fetch_sources(&due_sources)
+            .await
+            .context("RSS fetch/parse failed")?;
+        fetch_elapsed = fetch_started_at.elapsed();
+
+        for result in fetch_outcome.results {
+            if let Some(error) = result.error {
+                db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
+                fetch_errors.push(format!("{}: {}", result.source.name, error));
+                continue;
+            }
+
+            let filtered = collect_pending_articles(&conn, result.articles)?;
+            let mut staged_count = 0usize;
+            for article in filtered {
+                let article_key = build_article_key(&article);
+                if db::insert_pending_article(&conn, &article, &article_key, now)? {
+                    staged_count += 1;
+                }
+            }
+            fetched_source_stage_counts.push((result.source.id, staged_count));
+        }
+    }
+
+    let pending_articles = db::list_pending_articles(&conn)?;
+    diagnostics::log(
+        &app,
+        "fetch",
+        format!(
+            "rss phase complete: due_sources={} pending_articles={} feed_errors={}",
+            due_sources.len(),
+            pending_articles.len(),
+            fetch_errors.len()
+        ),
+    );
+
+    if pending_articles.is_empty() {
+        for (source_id, _) in fetched_source_stage_counts {
+            db::update_fetch_state(&conn, &source_id, now, Some(now), None)?;
         }
 
-        db::update_fetch_state(&conn, &result.source.id, now, Some(now), None)?;
-        let filtered = collect_pending_articles(&conn, result.articles)?;
-        pending_articles.extend(filtered);
+        let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
+        set_scanning(&app, false);
+        set_last_scan_at(&app, Some(now));
+        db::write_last_scan_at(&conn, Some(now))?;
+        clear_last_error(&app);
+        if memory.is_none() && settings.memory_mode_enabled {
+            diagnostics::log(&app, "fetch", "warning: interest memory has not been generated yet");
+            set_last_error(
+                &app,
+                "Warning: interest memory has not been generated yet".to_string(),
+            );
+        }
+        sync_windows(&app, false)?;
+        return Ok(());
     }
 
     let interest_context = build_interest_context(&settings);
     let score_started_at = Instant::now();
-    let score_outcome =
-        score_articles_in_batches(&settings.api_key, &interest_context, &pending_articles).await?;
+    let pending_outcome =
+        process_pending_articles(&app, &settings.api_key, &interest_context, &pending_articles)
+            .await?;
     let score_elapsed = score_started_at.elapsed();
-
-    let mut inserted_count = 0usize;
-    let fetched_at = Utc::now();
-    let mut new_high_candidates = Vec::new();
-
-    let mut ranked_articles = score_outcome.scored_articles;
-    ranked_articles.sort_by(|left, right| {
-        right
-            .1
-            .fit_score
-            .cmp(&left.1.fit_score)
-            .then_with(|| right.0.published_at.cmp(&left.0.published_at))
-            .then_with(|| left.0.title.cmp(&right.0.title))
-    });
-
-    for (article, analysis) in ranked_articles {
-        let calibrated_fit_level = policy::fit_level_for_score(
-            &article.module,
-            &article.bucket,
-            &article.source_kind,
-            analysis.fit_score,
-        );
-        let article_key = build_article_key(&article);
-        let article_id = db::insert_article(
-            &conn,
-            &article.source_id,
-            &article.guid,
-            &article_key,
-            &article.normalized_link,
-            &article.title,
-            &article.link,
-            &article.source_name,
-            &article.discipline,
-            &article.source_kind,
-            &article.resource_type,
-            article.published_at,
-            fetched_at,
-            &article.content,
-            &analysis.summary,
-            &calibrated_fit_level,
-            analysis.fit_score,
-            &analysis.recommendation_reason,
-        )?;
-        db::upsert_content_pool_entry(
-            &conn,
-            article_id,
-            &article.source_kind,
-            analysis.fit_score,
-            article.published_at,
-        )?;
-        inserted_count += 1;
-        if calibrated_fit_level == FitLevel::High {
-            new_high_candidates.push((
-                article_id,
-            article.module,
-            article.bucket,
-                article.source_kind,
-                analysis.fit_score,
-                article.published_at,
-            ));
-        }
-    }
-
-    let reminder_candidates = select_partition_top_candidates(new_high_candidates);
+    let reminder_candidates = select_partition_top_candidates(pending_outcome.reminder_candidates);
     if !reminder_candidates.is_empty() {
         let batch_id = match db::current_active_batch_for_updates(&conn)? {
             Some(batch_id) => batch_id,
             None => db::create_reminder_batch(&conn)?,
         };
-        for article_id in reminder_candidates {
-            db::attach_article_to_batch(&conn, &batch_id, article_id)?;
+        for article_id in &reminder_candidates {
+            db::attach_article_to_batch(&conn, &batch_id, *article_id)?;
+        }
+    }
+
+    for (source_id, staged_count) in fetched_source_stage_counts {
+        if staged_count == 0 || db::count_pending_articles_for_source(&conn, &source_id)? == 0 {
+            db::update_fetch_state(&conn, &source_id, now, Some(now), None)?;
         }
     }
 
     let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
     set_scanning(&app, false);
-    set_last_scan_at(&app, Some(fetched_at));
-    db::write_last_scan_at(&conn, Some(fetched_at))?;
+    let finished_at = Utc::now();
+    set_last_scan_at(&app, Some(finished_at));
+    db::write_last_scan_at(&conn, Some(finished_at))?;
 
-    let warnings = collect_cycle_warnings(fetch_errors, score_outcome.errors);
+    let mut warnings = collect_cycle_warnings(fetch_errors, pending_outcome.errors);
+    if pending_outcome.remaining_pending > 0 {
+        warnings.push(format!(
+            "{} pending articles waiting for LLM scoring retry",
+            pending_outcome.remaining_pending
+        ));
+    }
+    diagnostics::log(
+        &app,
+        "fetch",
+        format!(
+            "cycle finished: inserted_articles={} reminder_candidates={} warnings={} rss_ms={} llm_ms={} total_ms={}",
+            pending_outcome.inserted_count,
+            reminder_candidates.len(),
+            warnings.len(),
+            fetch_elapsed.as_millis(),
+            score_elapsed.as_millis(),
+            started_at.elapsed().as_millis()
+        ),
+    );
     if warnings.is_empty() {
         clear_last_error(&app);
     } else {
+        diagnostics::log(&app, "fetch", format!("warnings: {}", warnings.join(" | ")));
         set_last_error(&app, format!("Warning: {}", warnings.join(" | ")));
     }
     if memory.is_none() && settings.memory_mode_enabled {
+        diagnostics::log(&app, "fetch", "warning: interest memory has not been generated yet");
         set_last_error(
             &app,
             "Warning: interest memory has not been generated yet".to_string(),
@@ -318,7 +368,7 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
         "briefy-pet fetch cycle ok: due_sources={} pending={} inserted={} rss_ms={} llm_ms={} total_ms={}",
         due_sources.len(),
         pending_articles.len(),
-        inserted_count,
+        pending_outcome.inserted_count,
         fetch_elapsed.as_millis(),
         score_elapsed.as_millis(),
         started_at.elapsed().as_millis(),
@@ -371,18 +421,138 @@ fn collect_pending_articles(
         if !seen_keys.insert(article_key.clone()) {
             continue;
         }
-        if db::find_article_id_by_identity(
+        if !db::article_or_pending_exists_by_identity(
             conn,
             &article.source_id,
             &article_key,
             &article.normalized_link,
-        )?
-        .is_none()
-        {
+        )? {
             pending.push(article);
         }
     }
     Ok(pending)
+}
+
+async fn process_pending_articles(
+    app: &AppHandle,
+    api_key: &str,
+    interest_context: &str,
+    pending_articles: &[PendingArticleRecord],
+) -> Result<PendingProcessingOutcome> {
+    if pending_articles.is_empty() {
+        return Ok(PendingProcessingOutcome {
+            inserted_count: 0,
+            reminder_candidates: Vec::new(),
+            errors: Vec::new(),
+            remaining_pending: 0,
+        });
+    }
+
+    let mut inserted_count = 0usize;
+    let mut errors = Vec::new();
+    let mut reminder_candidates = Vec::new();
+
+    for group in pending_articles
+        .chunks(SCORE_BATCH_SIZE * MAX_CONCURRENT_SCORE_BATCHES)
+    {
+        let articles = group
+            .iter()
+            .map(|item| item.article.clone())
+            .collect::<Vec<_>>();
+        let score_outcome = score_articles_in_batches(api_key, interest_context, &articles).await?;
+        errors.extend(score_outcome.errors);
+        let conn = db::connect(app)?;
+
+        let mut pending_lookup = BTreeMap::new();
+        for item in group {
+            pending_lookup.insert(
+                pending_identity(&item.article.source_id, &item.article_key),
+                item,
+            );
+        }
+
+        let mut consumed_ids = Vec::new();
+        for (article, analysis) in score_outcome.scored_articles {
+            let article_key = build_article_key(&article);
+            let identity = pending_identity(&article.source_id, &article_key);
+            let Some(pending_item) = pending_lookup.get(&identity) else {
+                errors.push(format!(
+                    "Pending article lookup failed for {} ({})",
+                    article.title, article.source_id
+                ));
+                continue;
+            };
+
+            if db::find_article_id_by_identity(
+                &conn,
+                &article.source_id,
+                &article_key,
+                &article.normalized_link,
+            )?
+            .is_some()
+            {
+                consumed_ids.push(pending_item.id);
+                continue;
+            }
+
+            let calibrated_fit_level = policy::fit_level_for_score(
+                &article.module,
+                &article.bucket,
+                &article.source_kind,
+                analysis.fit_score,
+            );
+            let article_id = db::insert_article(
+                &conn,
+                &article.source_id,
+                &article.guid,
+                &article_key,
+                &article.normalized_link,
+                &article.title,
+                &article.link,
+                &article.source_name,
+                &article.discipline,
+                &article.source_kind,
+                &article.resource_type,
+                article.published_at,
+                pending_item.fetched_at,
+                &article.content,
+                &analysis.summary,
+                &calibrated_fit_level,
+                analysis.fit_score,
+                &analysis.recommendation_reason,
+            )?;
+            db::upsert_content_pool_entry(
+                &conn,
+                article_id,
+                &article.source_kind,
+                analysis.fit_score,
+                article.published_at,
+            )?;
+            inserted_count += 1;
+            consumed_ids.push(pending_item.id);
+
+            if calibrated_fit_level == FitLevel::High {
+                reminder_candidates.push((
+                    article_id,
+                    article.module,
+                    article.bucket,
+                    article.source_kind,
+                    analysis.fit_score,
+                    article.published_at,
+                ));
+            }
+        }
+
+        db::delete_pending_articles(&conn, &consumed_ids)?;
+    }
+
+    let conn = db::connect(app)?;
+    Ok(PendingProcessingOutcome {
+        inserted_count,
+        reminder_candidates,
+        errors,
+        remaining_pending: db::pending_articles_count(&conn)?,
+    })
 }
 
 async fn score_articles_in_batches(
@@ -578,8 +748,13 @@ fn log_fetch_result(result: Result<()>, app: &AppHandle) {
         }
         set_last_error(app, message.clone());
         let _ = sync_windows(app, false);
+        diagnostics::log(app, "fetch", format!("cycle failed: {message}"));
         eprintln!("briefy-pet fetch cycle failed: {message}");
     }
+}
+
+fn pending_identity(source_id: &str, article_key: &str) -> String {
+    format!("{source_id}::{article_key}")
 }
 
 fn classify_error_for_display(err: &anyhow::Error) -> String {

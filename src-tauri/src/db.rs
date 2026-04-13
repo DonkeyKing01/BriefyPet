@@ -14,8 +14,9 @@ use tauri::AppHandle;
 
 use crate::models::{
     all_disciplines, AppView, ArticleRecord, ContentPoolStat, Discipline, FitLevel,
-    InterestMemoryRecord, ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload,
-    Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
+    FeedArticle, InterestMemoryRecord, PendingArticleRecord, ReminderBatchSnapshot, ResourceType,
+    RssSource, SettingsPayload, Snapshot, SourceCatalogSummary, SourceKind,
+    UserDisciplinePreference,
 };
 use crate::policy;
 
@@ -92,6 +93,25 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           is_favorite INTEGER NOT NULL DEFAULT 0,
           is_new INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS pending_articles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT NOT NULL,
+          article_key TEXT NOT NULL,
+          normalized_link TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          link TEXT NOT NULL,
+          source_name TEXT NOT NULL,
+          module TEXT NOT NULL,
+          bucket TEXT NOT NULL,
+          discipline TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          resource_type TEXT NOT NULL,
+          published_at TEXT,
+          fetched_at TEXT NOT NULL,
+          raw_content TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS reminder_batches (
           id TEXT PRIMARY KEY,
           status TEXT NOT NULL,
@@ -163,6 +183,9 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_articles_identity ON articles(source_id, article_key);
         CREATE INDEX IF NOT EXISTS idx_articles_normalized_link ON articles(normalized_link);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_articles_identity ON pending_articles(source_id, article_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_articles_normalized_link ON pending_articles(normalized_link);
+        CREATE INDEX IF NOT EXISTS idx_pending_articles_created_at ON pending_articles(created_at, id);
         "#,
     )?;
 
@@ -200,6 +223,14 @@ fn ensure_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     if read_setting(conn, key)?.is_none() {
         write_setting(conn, key, value)?;
     }
+    Ok(())
+}
+
+fn write_setting_tx(tx: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
     Ok(())
 }
 
@@ -407,6 +438,43 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
     Ok(())
 }
 
+pub fn reset_app_data(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute("DELETE FROM reminder_batch_articles", [])?;
+    tx.execute("DELETE FROM reminder_batches", [])?;
+    tx.execute("DELETE FROM ranked_content_pool", [])?;
+    tx.execute("DELETE FROM pending_articles", [])?;
+    tx.execute("DELETE FROM articles", [])?;
+    tx.execute("DELETE FROM daily_interest_memory", [])?;
+    tx.execute("DELETE FROM user_behavior_events", [])?;
+    tx.execute("DELETE FROM source_fetch_state", [])?;
+
+    tx.execute("UPDATE user_interest_profile_v2 SET enabled = 0, preference = ''", [])?;
+    tx.execute(
+        r#"
+        UPDATE user_source_pool
+        SET enabled = COALESCE(
+            (SELECT enabled_by_default FROM source_catalog sc WHERE sc.source_id = user_source_pool.source_id),
+            1
+        ),
+            updated_at = ?1
+        "#,
+        params![Utc::now().to_rfc3339()],
+    )?;
+
+    write_setting_tx(&tx, "api_key", "")?;
+    write_setting_tx(&tx, "auto_start", "false")?;
+    write_setting_tx(&tx, "active_view", "\"settings\"")?;
+    write_setting_tx(&tx, "selected_article_id", "null")?;
+    write_setting_tx(&tx, "api_key_valid", "false")?;
+    write_setting_tx(&tx, "last_scan_at", "null")?;
+    write_setting_tx(&tx, "memory_mode_enabled", "true")?;
+
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn read_active_view(conn: &Connection) -> Result<AppView> {
     let raw = read_setting(conn, "active_view")?.unwrap_or_else(|| "\"reading\"".into());
     Ok(serde_json::from_str(&raw)?)
@@ -531,6 +599,134 @@ pub fn find_article_id_by_identity(
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub fn article_or_pending_exists_by_identity(
+    conn: &Connection,
+    source_id: &str,
+    article_key: &str,
+    normalized_link: &str,
+) -> Result<bool> {
+    let article_exists = find_article_id_by_identity(conn, source_id, article_key, normalized_link)?
+        .is_some();
+    if article_exists {
+        return Ok(true);
+    }
+
+    let pending_exists = conn
+        .query_row(
+            r#"
+            SELECT 1
+            FROM pending_articles
+            WHERE (source_id = ?1 AND article_key = ?2)
+               OR normalized_link = ?3
+            LIMIT 1
+            "#,
+            params![source_id, article_key, normalized_link],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    Ok(pending_exists)
+}
+
+pub fn insert_pending_article(
+    conn: &Connection,
+    article: &FeedArticle,
+    article_key: &str,
+    fetched_at: DateTime<Utc>,
+) -> Result<bool> {
+    let inserted = conn.execute(
+        r#"
+        INSERT OR IGNORE INTO pending_articles (
+          guid, article_key, normalized_link, source_id, title, link, source_name, module, bucket,
+          discipline, source_kind, resource_type, published_at, fetched_at, raw_content, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "#,
+        params![
+            article.guid,
+            article_key,
+            article.normalized_link,
+            article.source_id,
+            article.title,
+            article.link,
+            article.source_name,
+            article.module,
+            article.bucket,
+            discipline_to_raw(&article.discipline),
+            source_kind_to_raw(&article.source_kind),
+            resource_type_to_raw(&article.resource_type),
+            article.published_at.map(|value| value.to_rfc3339()),
+            fetched_at.to_rfc3339(),
+            article.content,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
+pub fn pending_articles_count(conn: &Connection) -> Result<usize> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM pending_articles", [], |row| {
+        row.get::<_, i64>(0)
+    })? as usize)
+}
+
+pub fn count_pending_articles_for_source(conn: &Connection, source_id: &str) -> Result<usize> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM pending_articles WHERE source_id = ?1",
+        params![source_id],
+        |row| row.get::<_, i64>(0),
+    )? as usize)
+}
+
+pub fn list_pending_articles(conn: &Connection) -> Result<Vec<PendingArticleRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+          id, article_key, fetched_at, source_id, source_name, module, bucket, discipline,
+          source_kind, resource_type, title, link, normalized_link, guid, published_at, raw_content
+        FROM pending_articles
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let fetched_at_raw: String = row.get(2)?;
+        let published_at_raw: Option<String> = row.get(14)?;
+        Ok(PendingArticleRecord {
+            id: row.get(0)?,
+            article_key: row.get(1)?,
+            fetched_at: parse_datetime(&fetched_at_raw).unwrap_or_else(Utc::now),
+            article: FeedArticle {
+                source_id: row.get(3)?,
+                source_name: row.get(4)?,
+                module: row.get(5)?,
+                bucket: row.get(6)?,
+                discipline: parse_discipline(&row.get::<_, String>(7)?),
+                source_kind: parse_source_kind(&row.get::<_, String>(8)?),
+                resource_type: parse_resource_type(&row.get::<_, String>(9)?),
+                title: row.get(10)?,
+                link: row.get(11)?,
+                normalized_link: row.get(12)?,
+                guid: row.get(13)?,
+                published_at: parse_optional_datetime(published_at_raw),
+                content: row.get(15)?,
+            },
+        })
+    })?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
+pub fn delete_pending_articles(conn: &Connection, ids: &[i64]) -> Result<()> {
+    for id in ids {
+        conn.execute("DELETE FROM pending_articles WHERE id = ?1", params![id])?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

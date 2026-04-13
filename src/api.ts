@@ -28,3 +28,7 @@ export async function bubbleAction(action: "view" | "snooze" | "ignore"): Promis
 export async function setActiveView(view: AppView): Promise<Snapshot> {
   return invoke("set_active_view", { view });
 }
+
+export async function resetAppData(): Promise<Snapshot> {
+  return invoke("reset_app_data");
+}

@@ -959,6 +959,35 @@ a {
   line-height: 1.52;
 }
 
+.settings-danger-card {
+  border-color: color-mix(in srgb, #b13a24 26%, var(--line-soft));
+  background: color-mix(in srgb, #fff3ee 74%, var(--surface));
+}
+
+.danger-note {
+  margin-top: 12px;
+  color: #8c2f1d;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.danger-actions {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 14px;
+}
+
+.danger-button {
+  border: 1px solid #b13a24;
+  background: #b13a24;
+  color: #fffaf7;
+}
+
+.danger-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .checkbox-row,
 .discipline-toggle {
   flex-direction: row !important;
