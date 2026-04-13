@@ -188,6 +188,30 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_pending_articles_created_at ON pending_articles(created_at, id);
         "#,
     )?;
+    conn.execute(
+        r#"
+        UPDATE articles
+        SET guid = COALESCE(
+          NULLIF(article_key, ''),
+          NULLIF(source_id || '::' || normalized_link, source_id || '::'),
+          source_id || '::legacy::' || id
+        )
+        WHERE TRIM(guid) = ''
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE pending_articles
+        SET guid = COALESCE(
+          NULLIF(article_key, ''),
+          NULLIF(source_id || '::' || normalized_link, source_id || '::'),
+          source_id || '::legacy-pending::' || id
+        )
+        WHERE TRIM(guid) = ''
+        "#,
+        [],
+    )?;
 
     let catalog = load_catalog(app)?;
     seed_defaults(&conn, &catalog)?;
@@ -585,16 +609,18 @@ pub fn find_article_id_by_identity(
     source_id: &str,
     article_key: &str,
     normalized_link: &str,
+    guid: &str,
 ) -> Result<Option<i64>> {
     conn.query_row(
         r#"
         SELECT id
         FROM articles
-        WHERE (source_id = ?1 AND article_key = ?2)
+        WHERE guid = ?4
+           OR (source_id = ?1 AND article_key = ?2)
            OR normalized_link = ?3
         LIMIT 1
         "#,
-        params![source_id, article_key, normalized_link],
+        params![source_id, article_key, normalized_link, guid],
         |row| row.get(0),
     )
     .optional()
@@ -606,8 +632,9 @@ pub fn article_or_pending_exists_by_identity(
     source_id: &str,
     article_key: &str,
     normalized_link: &str,
+    guid: &str,
 ) -> Result<bool> {
-    let article_exists = find_article_id_by_identity(conn, source_id, article_key, normalized_link)?
+    let article_exists = find_article_id_by_identity(conn, source_id, article_key, normalized_link, guid)?
         .is_some();
     if article_exists {
         return Ok(true);
@@ -618,11 +645,12 @@ pub fn article_or_pending_exists_by_identity(
             r#"
             SELECT 1
             FROM pending_articles
-            WHERE (source_id = ?1 AND article_key = ?2)
+            WHERE guid = ?4
+               OR (source_id = ?1 AND article_key = ?2)
                OR normalized_link = ?3
             LIMIT 1
             "#,
-            params![source_id, article_key, normalized_link],
+            params![source_id, article_key, normalized_link, guid],
             |row| row.get::<_, i64>(0),
         )
         .optional()?

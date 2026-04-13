@@ -418,6 +418,7 @@ fn collect_pending_articles(
     let mut seen_keys = HashSet::new();
     for article in articles {
         let article_key = build_article_key(&article);
+        let guid = effective_guid(&article, &article_key);
         if !seen_keys.insert(article_key.clone()) {
             continue;
         }
@@ -426,6 +427,7 @@ fn collect_pending_articles(
             &article.source_id,
             &article_key,
             &article.normalized_link,
+            &guid,
         )? {
             pending.push(article);
         }
@@ -474,6 +476,7 @@ async fn process_pending_articles(
         let mut consumed_ids = Vec::new();
         for (article, analysis) in score_outcome.scored_articles {
             let article_key = build_article_key(&article);
+            let guid = effective_guid(&article, &article_key);
             let identity = pending_identity(&article.source_id, &article_key);
             let Some(pending_item) = pending_lookup.get(&identity) else {
                 errors.push(format!(
@@ -488,6 +491,7 @@ async fn process_pending_articles(
                 &article.source_id,
                 &article_key,
                 &article.normalized_link,
+                &guid,
             )?
             .is_some()
             {
@@ -504,7 +508,7 @@ async fn process_pending_articles(
             let article_id = db::insert_article(
                 &conn,
                 &article.source_id,
-                &article.guid,
+                &guid,
                 &article_key,
                 &article.normalized_link,
                 &article.title,
@@ -698,6 +702,15 @@ fn build_article_key(article: &FeedArticle) -> String {
             article.source_id,
             article.guid.trim().to_lowercase()
         )
+    }
+}
+
+fn effective_guid(article: &FeedArticle, article_key: &str) -> String {
+    let guid = article.guid.trim();
+    if guid.is_empty() {
+        article_key.to_string()
+    } else {
+        guid.to_string()
     }
 }
 

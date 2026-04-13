@@ -190,7 +190,8 @@ fn parse_rss_items(source: &RssSource, channel: &Channel) -> Vec<FeedArticle> {
 
         let guid = item
             .guid()
-            .map(|guid| guid.value().to_string())
+            .map(|guid| guid.value().trim().to_string())
+            .filter(|guid| !guid.is_empty())
             .unwrap_or_else(|| format!("{}::{link}", source.id));
         let published_at = item
             .pub_date()

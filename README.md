@@ -405,3 +405,22 @@ npm run tauri:build:debug:sandbox-dmg
 - RSS -> pending -> LLM batch -> 入库 -> 提醒 的新链路已落地
 - 设置页支持重新初始化为新用户
 
+## 12. 最近更新
+
+### 2026-04-13
+
+- 收敛项目文档，使用当前 README 作为统一主文档，删除旧的 `AGENTS.md` 与 `Ver*.md`
+- 去掉 `build.rs` 对 `reference/*` 的构建期强依赖，恢复 Windows 编译与打包链路
+- 新增后端抓取诊断日志，日志写入 `C:\Users\Jinqy\AppData\Roaming\com.briefypet.desktop\fetch-diagnostic.log`
+- 把抓取流程改为 `RSS -> pending_articles -> 分批 LLM 打分 -> articles/reminders`
+- 将 `last_fetched_at / last_success_at` 的更新时间后移到源内容处理完成之后
+- 新增设置页“清空数据并重新初始化”功能，支持回到新用户状态
+- 修复 `articles.guid` 唯一约束导致的入库失败：
+  - RSS 空 `guid` 会自动回退为稳定值
+  - 入库前去重补充 `guid` 检查
+  - 启动时会自动修复库中历史空 `guid`
+- 重新验证：
+  - `cargo test --manifest-path src-tauri/Cargo.toml` 通过
+  - `npm run tauri -- build -- --bundles nsis` 通过
+- 最新 Windows 安装包：
+  `src-tauri/target/release/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe`
