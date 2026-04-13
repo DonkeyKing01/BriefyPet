@@ -4,7 +4,10 @@ use anyhow::{anyhow, Context, Result};
 use atom_syndication::Feed;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
-use reqwest::Client;
+use reqwest::{
+    header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL},
+    Client, RequestBuilder, StatusCode,
+};
 use rss::Channel;
 use tokio::time::{sleep, Duration};
 
@@ -12,6 +15,9 @@ use crate::models::{FeedArticle, RssSource};
 
 const MAX_ITEMS_PER_SOURCE: usize = 12;
 const FEED_FETCH_RETRIES: usize = 3;
+const FEED_REQUEST_TIMEOUT_SECS: u64 = 20;
+const FEED_USER_AGENT: &str =
+    "Briefy-pet/0.1 (+https://briefy-pet.local; rss-fetcher; contact: rss@briefy-pet.local)";
 
 #[derive(Debug, Clone)]
 pub struct SourceFetchResult {
@@ -25,7 +31,11 @@ pub struct FeedFetchOutcome {
 }
 
 pub async fn fetch_sources(sources: &[RssSource]) -> Result<FeedFetchOutcome> {
-    let client = Client::new();
+    let client = Client::builder()
+        .user_agent(FEED_USER_AGENT)
+        .timeout(Duration::from_secs(FEED_REQUEST_TIMEOUT_SECS))
+        .build()
+        .context("failed to build rss client")?;
     let results = join_all(
         sources
             .iter()
@@ -69,11 +79,32 @@ async fn fetch_single_source(client: Client, source: RssSource) -> SourceFetchRe
 }
 
 async fn fetch_single_source_once(client: &Client, source: &RssSource) -> Result<Vec<FeedArticle>> {
-    let response = client
-        .get(&source.url)
-        .send()
+    let mut requested_url = source.url.clone();
+    let mut response = send_feed_request(client.get(&requested_url), &requested_url)
         .await
         .with_context(|| format!("request failed for {}", source.url))?;
+
+    if response.status() == StatusCode::FORBIDDEN {
+        if let Some(fallback_url) = reddit_fallback_url(&source.url) {
+            let fallback_response = send_feed_request(client.get(&fallback_url), &fallback_url)
+                .await
+                .with_context(|| format!("request failed for reddit fallback {}", fallback_url))?;
+
+            if fallback_response.status().is_success() {
+                requested_url = fallback_url;
+                response = fallback_response;
+            } else {
+                return Err(anyhow!(
+                    "{} ({}) returned HTTP {}; fallback {} returned HTTP {}",
+                    source.name,
+                    source.url,
+                    StatusCode::FORBIDDEN,
+                    fallback_url,
+                    fallback_response.status()
+                ));
+            }
+        }
+    }
 
     if !response.status().is_success() {
         return Err(anyhow!(
@@ -87,7 +118,7 @@ async fn fetch_single_source_once(client: &Client, source: &RssSource) -> Result
     let content = response
         .bytes()
         .await
-        .with_context(|| format!("failed to read body for {}", source.url))?;
+        .with_context(|| format!("failed to read body for {}", requested_url))?;
 
     match Channel::read_from(&content[..]) {
         Ok(channel) => Ok(parse_rss_items(source, &channel)),
@@ -100,6 +131,38 @@ async fn fetch_single_source_once(client: &Client, source: &RssSource) -> Result
             )),
         },
     }
+}
+
+async fn send_feed_request(
+    builder: RequestBuilder,
+    url: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let mut builder = builder
+        .header(
+            ACCEPT,
+            "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.6",
+        )
+        .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header(CACHE_CONTROL, "no-cache");
+
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let referer = format!("{}://{}/", parsed.scheme(), host);
+            builder = builder.header("Referer", referer);
+        }
+    }
+
+    builder.send().await
+}
+
+fn reddit_fallback_url(url: &str) -> Option<String> {
+    if url.contains("://www.reddit.com/") {
+        return Some(url.replacen("://www.reddit.com/", "://old.reddit.com/", 1));
+    }
+    if url.contains("://reddit.com/") {
+        return Some(url.replacen("://reddit.com/", "://old.reddit.com/", 1));
+    }
+    None
 }
 
 fn is_retryable_feed_error(err: &anyhow::Error) -> bool {
@@ -142,6 +205,8 @@ fn parse_rss_items(source: &RssSource, channel: &Channel) -> Vec<FeedArticle> {
         articles.push(FeedArticle {
             source_id: source.id.clone(),
             source_name: source.name.clone(),
+            module: source.module.clone(),
+            bucket: source.bucket.clone(),
             discipline: source.discipline.clone(),
             source_kind: source.source_kind.clone(),
             resource_type: source.resource_type.clone(),
@@ -192,6 +257,8 @@ fn parse_atom_entries(source: &RssSource, feed: &Feed) -> Vec<FeedArticle> {
         articles.push(FeedArticle {
             source_id: source.id.clone(),
             source_name: source.name.clone(),
+            module: source.module.clone(),
+            bucket: source.bucket.clone(),
             discipline: source.discipline.clone(),
             source_kind: source.source_kind.clone(),
             resource_type: source.resource_type.clone(),

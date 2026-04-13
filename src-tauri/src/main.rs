@@ -4,6 +4,7 @@ mod commands;
 mod db;
 mod llm;
 mod models;
+mod policy;
 mod rss;
 mod service;
 mod tray;
@@ -26,6 +27,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "pet", WindowUrl::App("index.html".into()))
         .title("Briefy Pet")
         .inner_size(188.0, 196.0)
+        .transparent(true)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
@@ -40,6 +42,7 @@ fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "bubble", WindowUrl::App("index.html".into()))
         .title("Briefy Pet Bubble")
         .inner_size(380.0, 260.0)
+        .transparent(true)
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)

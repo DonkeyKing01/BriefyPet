@@ -13,13 +13,14 @@ use crate::{
     models::{
         AppView, FeedArticle, FitLevel, LlmResult, PetStatus, SettingsPayload, Snapshot, SourceKind,
     },
+    policy,
     rss, AppState,
 };
 
 const SCORE_BATCH_SIZE: usize = 3;
 const MAX_CONCURRENT_SCORE_BATCHES: usize = 2;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
-const TOP_N_PER_PARTITION: usize = 3;
+const MAX_REMINDER_ITEMS_PER_BATCH: usize = 12;
 
 pub fn derive_pet_status(
     settings: &SettingsPayload,
@@ -236,6 +237,12 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
     });
 
     for (article, analysis) in ranked_articles {
+        let calibrated_fit_level = policy::fit_level_for_score(
+            &article.module,
+            &article.bucket,
+            &article.source_kind,
+            analysis.fit_score,
+        );
         let article_key = build_article_key(&article);
         let article_id = db::insert_article(
             &conn,
@@ -253,7 +260,7 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
             fetched_at,
             &article.content,
             &analysis.summary,
-            &analysis.fit_level,
+            &calibrated_fit_level,
             analysis.fit_score,
             &analysis.recommendation_reason,
         )?;
@@ -265,9 +272,11 @@ pub async fn run_fetch_cycle(app: AppHandle) -> Result<()> {
             article.published_at,
         )?;
         inserted_count += 1;
-        if analysis.fit_level == FitLevel::High {
+        if calibrated_fit_level == FitLevel::High {
             new_high_candidates.push((
                 article_id,
+            article.module,
+            article.bucket,
                 article.source_kind,
                 analysis.fit_score,
                 article.published_at,
@@ -471,18 +480,19 @@ fn build_interest_context(settings: &SettingsPayload) -> String {
 }
 
 fn select_partition_top_candidates(
-    candidates: Vec<(i64, SourceKind, i64, Option<DateTime<Utc>>)>,
+    candidates: Vec<(i64, String, String, SourceKind, i64, Option<DateTime<Utc>>)>,
 ) -> Vec<i64> {
-    let mut partitions = BTreeMap::<SourceKind, Vec<(i64, i64, Option<DateTime<Utc>>)>>::new();
-    for (article_id, source_kind, fit_score, published_at) in candidates {
+    let mut partitions =
+        BTreeMap::<(String, String, SourceKind), Vec<(i64, i64, Option<DateTime<Utc>>)>>::new();
+    for (article_id, module, bucket, source_kind, fit_score, published_at) in candidates {
         partitions
-            .entry(source_kind)
+            .entry((module, bucket, source_kind))
             .or_default()
             .push((article_id, fit_score, published_at));
     }
 
     let mut selected = Vec::new();
-    for (_source_kind, mut items) in partitions {
+    for ((module, bucket, source_kind), mut items) in partitions {
         items.sort_by(|left, right| {
             right
                 .1
@@ -490,14 +500,23 @@ fn select_partition_top_candidates(
                 .then_with(|| right.2.cmp(&left.2))
                 .then_with(|| right.0.cmp(&left.0))
         });
-        selected.extend(
-            items
-                .into_iter()
-                .take(TOP_N_PER_PARTITION)
-                .map(|item| item.0),
-        );
+
+        let take_n = policy::reminder_take_for_source(&module, &bucket, &source_kind).max(1);
+        selected.extend(items.into_iter().take(take_n));
     }
+
+    selected.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.0.cmp(&left.0))
+    });
     selected
+        .into_iter()
+        .take(MAX_REMINDER_ITEMS_PER_BATCH)
+        .map(|item| item.0)
+        .collect()
 }
 
 fn build_article_key(article: &FeedArticle) -> String {
@@ -526,8 +545,13 @@ fn is_settings_complete(settings: &SettingsPayload) -> bool {
 
 fn collect_cycle_warnings(fetch_errors: Vec<String>, score_errors: Vec<String>) -> Vec<String> {
     let mut warnings = Vec::new();
-    if !fetch_errors.is_empty() {
-        warnings.push(format!("some feeds failed: {}", fetch_errors.join(" ; ")));
+    let hard_fetch_errors = fetch_errors
+        .into_iter()
+        .filter(|item| !is_soft_feed_error(item))
+        .collect::<Vec<_>>();
+
+    if !hard_fetch_errors.is_empty() {
+        warnings.push(format!("some feeds failed: {}", hard_fetch_errors.join(" ; ")));
     }
     if !score_errors.is_empty() {
         warnings.push(format!(
@@ -536,6 +560,10 @@ fn collect_cycle_warnings(fetch_errors: Vec<String>, score_errors: Vec<String>) 
         ));
     }
     warnings
+}
+
+fn is_soft_feed_error(value: &str) -> bool {
+    value.contains("HTTP 403") || value.contains("HTTP 404")
 }
 
 fn log_fetch_result(result: Result<()>, app: &AppHandle) {
@@ -727,6 +755,8 @@ mod tests {
                 id: "demo".into(),
                 name: "Demo".into(),
                 url: "https://example.com/feed.xml".into(),
+                module: "technology".into(),
+                bucket: "blogs".into(),
                 discipline: Discipline::Technology,
                 source_kind: SourceKind::TechnicalBlog,
                 resource_type: crate::models::ResourceType::Article,

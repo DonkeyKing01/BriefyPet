@@ -111,6 +111,10 @@ pub struct RssSource {
     pub id: String,
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub module: String,
+    #[serde(default)]
+    pub bucket: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,
@@ -149,6 +153,7 @@ pub struct ArticleRecord {
     pub fit_level: FitLevel,
     pub fit_score: i64,
     pub recommendation_reason: String,
+    pub raw_content: String,
     pub is_favorite: bool,
     pub is_new: bool,
 }
@@ -214,6 +219,8 @@ pub struct Snapshot {
 pub struct FeedArticle {
     pub source_id: String,
     pub source_name: String,
+    pub module: String,
+    pub bucket: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,

@@ -17,6 +17,7 @@ use crate::models::{
     InterestMemoryRecord, ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload,
     Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
 };
+use crate::policy;
 
 const MAX_POOL_SIZE_PER_KIND: usize = 1000;
 
@@ -43,6 +44,8 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           source_id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
           rss_url TEXT NOT NULL,
+                    module TEXT NOT NULL DEFAULT 'other',
+                    bucket TEXT NOT NULL DEFAULT 'unspecified',
           discipline TEXT NOT NULL,
           source_kind TEXT NOT NULL,
           resource_type TEXT NOT NULL,
@@ -145,6 +148,14 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
     );
     let _ = conn.execute("ALTER TABLE articles ADD COLUMN fetched_at TEXT", []);
     let _ = conn.execute(
+        "ALTER TABLE source_catalog ADD COLUMN module TEXT NOT NULL DEFAULT 'other'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE source_catalog ADD COLUMN bucket TEXT NOT NULL DEFAULT 'unspecified'",
+        [],
+    );
+    let _ = conn.execute(
         "UPDATE articles SET fetched_at = published_at WHERE fetched_at IS NULL AND published_at IS NOT NULL",
         [],
     );
@@ -220,12 +231,14 @@ fn sync_source_catalog(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         conn.execute(
             r#"
             INSERT INTO source_catalog (
-              source_id, name, rss_url, discipline, source_kind, resource_type, language,
-              enabled_by_default, postponed, origin_files
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                            source_id, name, rss_url, module, bucket, discipline, source_kind, resource_type,
+                            language, enabled_by_default, postponed, origin_files
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(source_id) DO UPDATE SET
               name = excluded.name,
               rss_url = excluded.rss_url,
+                            module = excluded.module,
+                            bucket = excluded.bucket,
               discipline = excluded.discipline,
               source_kind = excluded.source_kind,
               resource_type = excluded.resource_type,
@@ -238,6 +251,8 @@ fn sync_source_catalog(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
                 source.id,
                 source.name,
                 source.url,
+                source.module.as_str(),
+                source.bucket.as_str(),
                 discipline_to_raw(&source.discipline),
                 source_kind_to_raw(&source.source_kind),
                 resource_type_to_raw(&source.resource_type),
@@ -420,10 +435,15 @@ pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
-          id, source_id, title, link, source_name, discipline, source_kind, resource_type,
-          published_at, fetched_at, summary, fit_level, fit_score, recommendation_reason,
-          is_favorite, is_new
-        FROM articles
+                    a.id, a.source_id, a.title, a.link, a.source_name, a.discipline, a.source_kind, a.resource_type,
+                    a.published_at, a.fetched_at, a.summary, a.fit_level, a.fit_score, a.recommendation_reason,
+                    a.raw_content, a.is_favorite, a.is_new
+                FROM articles a
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM reminder_batch_articles rba
+                    WHERE rba.article_id = a.id
+                )
         ORDER BY COALESCE(published_at, fetched_at, '1970-01-01T00:00:00Z') DESC, id DESC
         "#,
     )?;
@@ -447,8 +467,9 @@ pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
             fit_level: parse_fit_level(&fit_level_raw),
             fit_score: row.get(12)?,
             recommendation_reason: row.get(13)?,
-            is_favorite: row.get::<_, i64>(14)? == 1,
-            is_new: row.get::<_, i64>(15)? == 1,
+            raw_content: row.get(14)?,
+            is_favorite: row.get::<_, i64>(15)? == 1,
+            is_new: row.get::<_, i64>(16)? == 1,
         })
     })?;
 
@@ -596,9 +617,10 @@ pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSn
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT a.id, a.fit_score, a.source_kind
+                SELECT a.id, a.fit_score, a.source_kind, sc.module, sc.bucket
         FROM reminder_batch_articles rba
         JOIN articles a ON a.id = rba.article_id
+                LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
         WHERE rba.batch_id = ?1
           AND a.is_new = 1
         ORDER BY a.fit_score DESC, COALESCE(a.published_at, a.fetched_at) DESC, a.id DESC
@@ -610,6 +632,8 @@ pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSn
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
 
@@ -617,12 +641,14 @@ pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSn
     let mut top_article_id = None;
     let mut partitions = BTreeSet::new();
     for (index, row) in rows.enumerate() {
-        let (article_id, _fit_score, source_kind) = row?;
+        let (article_id, _fit_score, source_kind, module, bucket) = row?;
         if index == 0 {
             top_article_id = Some(article_id);
         }
         article_ids.push(article_id);
-        partitions.insert(source_kind);
+        let module = module.unwrap_or_else(|| "other".to_string());
+        let bucket = bucket.unwrap_or_else(|| source_kind.clone());
+        partitions.insert(format!("{module}/{bucket}"));
     }
 
     if article_ids.is_empty() {
@@ -706,9 +732,9 @@ pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<Rss
     let mut stmt = conn.prepare(
         r#"
         SELECT
-          sc.source_id, sc.name, sc.rss_url, sc.discipline, sc.source_kind, sc.resource_type,
-          sc.language, sc.enabled_by_default, sc.postponed, sc.origin_files,
-          usp.enabled, sfs.last_fetched_at
+                    sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.discipline,
+                    sc.source_kind, sc.resource_type, sc.language, sc.enabled_by_default,
+                    sc.postponed, sc.origin_files, usp.enabled, sfs.last_fetched_at
         FROM source_catalog sc
         JOIN user_source_pool usp ON usp.source_id = sc.source_id
         LEFT JOIN source_fetch_state sfs ON sfs.source_id = sc.source_id
@@ -717,25 +743,29 @@ pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<Rss
     )?;
 
     let rows = stmt.query_map([], |row| {
-        let discipline = parse_discipline(&row.get::<_, String>(3)?);
-        let source_kind = parse_source_kind(&row.get::<_, String>(4)?);
-        let resource_type = parse_resource_type(&row.get::<_, String>(5)?);
-        let origin_files_json: String = row.get(9)?;
+        let module: String = row.get(3)?;
+        let bucket: String = row.get(4)?;
+        let discipline = parse_discipline(&row.get::<_, String>(5)?);
+        let source_kind = parse_source_kind(&row.get::<_, String>(6)?);
+        let resource_type = parse_resource_type(&row.get::<_, String>(7)?);
+        let origin_files_json: String = row.get(11)?;
         let origin_files =
             serde_json::from_str::<Vec<String>>(&origin_files_json).unwrap_or_default();
-        let last_fetched_raw: Option<String> = row.get(11)?;
+        let last_fetched_raw: Option<String> = row.get(13)?;
         Ok((
             RssSource {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 url: row.get(2)?,
+                module,
+                bucket,
                 discipline: discipline.clone(),
                 source_kind: source_kind.clone(),
                 resource_type,
-                language: row.get(6)?,
-                enabled: row.get::<_, i64>(10)? == 1,
-                enabled_by_default: row.get::<_, i64>(7)? == 1,
-                postponed: row.get::<_, i64>(8)? == 1,
+                language: row.get(8)?,
+                enabled: row.get::<_, i64>(12)? == 1,
+                enabled_by_default: row.get::<_, i64>(9)? == 1,
+                postponed: row.get::<_, i64>(10)? == 1,
                 origin_files,
             },
             last_fetched_raw,
@@ -751,7 +781,14 @@ pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>) -> Result<Vec<Rss
         let due = last_fetched_raw
             .as_deref()
             .and_then(parse_datetime)
-            .map(|last_fetched| now - last_fetched >= fetch_interval_for_kind(&source.source_kind))
+            .map(|last_fetched| {
+                now - last_fetched
+                    >= policy::fetch_interval_for_source(
+                        &source.module,
+                        &source.bucket,
+                        &source.source_kind,
+                    )
+            })
             .unwrap_or(true);
         if due {
             sources.push(source);
@@ -949,6 +986,33 @@ pub fn refresh_daily_memory(
         .optional()?
         .map(|value| parse_source_kind(&value));
 
+    let mut top_bucket_stmt = conn.prepare(
+        r#"
+        SELECT sc.module, sc.bucket, COUNT(*)
+        FROM user_behavior_events ube
+        JOIN articles a ON a.id = ube.article_id
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE ube.created_at LIKE ?1
+          AND ube.event_type IN ('open-article', 'favorite-added')
+        GROUP BY sc.module, sc.bucket
+        ORDER BY COUNT(*) DESC, sc.module ASC, sc.bucket ASC
+        LIMIT 2
+        "#,
+    )?;
+    let top_bucket_rows = top_bucket_stmt.query_map(params![format!("{day_key}%")], |row| {
+        let module = row
+            .get::<_, Option<String>>(0)?
+            .unwrap_or_else(|| "other".to_string());
+        let bucket = row
+            .get::<_, Option<String>>(1)?
+            .unwrap_or_else(|| "unspecified".to_string());
+        Ok((module, bucket))
+    })?;
+    let mut top_buckets = Vec::new();
+    for row in top_bucket_rows {
+        top_buckets.push(row?);
+    }
+
     let discipline_summary = if top_disciplines.is_empty() {
         "你今天的行为还不够多，系统暂时沿用当前已配置的兴趣方向。".to_string()
     } else {
@@ -972,7 +1036,26 @@ pub fn refresh_daily_memory(
             .unwrap_or_default()
     );
 
-    let generated_summary = format!("{discipline_summary} {action_summary}");
+    let bucket_summary = if top_buckets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " 高频子分类集中在 {}。",
+            top_buckets
+                .iter()
+                .map(|(module, bucket)| {
+                    format!(
+                        "{} / {}",
+                        module_label(module),
+                        bucket_label(bucket)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    };
+
+    let generated_summary = format!("{discipline_summary} {action_summary}{bucket_summary}");
     conn.execute(
         r#"
         INSERT INTO daily_interest_memory (day_key, generated_summary, confirmed_summary, memory_enabled, event_count, updated_at)
@@ -1134,29 +1217,32 @@ fn list_user_sources(conn: &Connection) -> Result<Vec<RssSource>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
-          sc.source_id, sc.name, sc.rss_url, sc.discipline, sc.source_kind, sc.resource_type,
-          sc.language, usp.enabled, sc.enabled_by_default, sc.postponed, sc.origin_files
+          sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.discipline,
+          sc.source_kind, sc.resource_type, sc.language, usp.enabled,
+          sc.enabled_by_default, sc.postponed, sc.origin_files
         FROM source_catalog sc
         JOIN user_source_pool usp ON usp.source_id = sc.source_id
-        ORDER BY sc.postponed ASC, sc.discipline ASC, sc.source_kind ASC, sc.name ASC
+        ORDER BY sc.postponed ASC, sc.module ASC, sc.bucket ASC, sc.name ASC
         "#,
     )?;
 
     let rows = stmt.query_map([], |row| {
-        let origin_files_json: String = row.get(10)?;
+        let origin_files_json: String = row.get(12)?;
         let origin_files =
             serde_json::from_str::<Vec<String>>(&origin_files_json).unwrap_or_default();
         Ok(RssSource {
             id: row.get(0)?,
             name: row.get(1)?,
             url: row.get(2)?,
-            discipline: parse_discipline(&row.get::<_, String>(3)?),
-            source_kind: parse_source_kind(&row.get::<_, String>(4)?),
-            resource_type: parse_resource_type(&row.get::<_, String>(5)?),
-            language: row.get(6)?,
-            enabled: row.get::<_, i64>(7)? == 1,
-            enabled_by_default: row.get::<_, i64>(8)? == 1,
-            postponed: row.get::<_, i64>(9)? == 1,
+            module: row.get(3)?,
+            bucket: row.get(4)?,
+            discipline: parse_discipline(&row.get::<_, String>(5)?),
+            source_kind: parse_source_kind(&row.get::<_, String>(6)?),
+            resource_type: parse_resource_type(&row.get::<_, String>(7)?),
+            language: row.get(8)?,
+            enabled: row.get::<_, i64>(9)? == 1,
+            enabled_by_default: row.get::<_, i64>(10)? == 1,
+            postponed: row.get::<_, i64>(11)? == 1,
             origin_files,
         })
     })?;
@@ -1217,6 +1303,10 @@ fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
         id: String,
         name: String,
         url: String,
+        #[serde(default)]
+        module: Option<String>,
+        #[serde(default)]
+        bucket: Option<String>,
         discipline: Discipline,
         source_kind: SourceKind,
         resource_type: ResourceType,
@@ -1249,18 +1339,46 @@ fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
                 .with_context(|| format!("failed to parse rss catalog: {}", candidate.display()))?;
             return Ok(resources
                 .into_iter()
-                .map(|resource| RssSource {
-                    id: resource.id,
-                    name: resource.name,
-                    url: resource.url,
-                    discipline: resource.discipline,
-                    source_kind: resource.source_kind,
-                    resource_type: resource.resource_type,
-                    language: resource.language,
-                    enabled: resource.enabled_by_default,
-                    enabled_by_default: resource.enabled_by_default,
-                    postponed: resource.postponed,
-                    origin_files: resource.origin_files,
+                .map(|resource| {
+                    let CatalogResource {
+                        id,
+                        name,
+                        url,
+                        module,
+                        bucket,
+                        discipline,
+                        source_kind,
+                        resource_type,
+                        language,
+                        enabled_by_default,
+                        postponed,
+                        origin_files,
+                    } = resource;
+
+                    let module = module
+                        .as_deref()
+                        .map(policy::normalize_module)
+                        .unwrap_or_else(|| legacy_module_from_discipline(&discipline));
+                    let bucket = bucket
+                        .as_deref()
+                        .map(|value| policy::normalize_bucket(&module, value))
+                        .unwrap_or_else(|| legacy_bucket_from_source_kind(&source_kind));
+
+                    RssSource {
+                        id,
+                        name,
+                        url,
+                        module,
+                        bucket,
+                        discipline,
+                        source_kind,
+                        resource_type,
+                        language,
+                        enabled: enabled_by_default,
+                        enabled_by_default,
+                        postponed,
+                        origin_files,
+                    }
                 })
                 .collect());
         }
@@ -1346,6 +1464,8 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 let category = attrs.get("category").map(String::as_str);
                 let module = attrs.get("module").map(String::as_str);
                 let bucket = attrs.get("bucket").map(String::as_str);
+                let module_code = normalize_v3_module(module, category);
+                let bucket_code = normalize_v3_bucket(&module_code, bucket, category);
                 let language = attrs
                     .get("language")
                     .map(String::as_str)
@@ -1366,8 +1486,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                         id: build_source_id(&name, &normalized_url),
                         name: name.clone(),
                         url: url.to_string(),
-                        discipline: map_v3_module_to_discipline(module, category),
-                        source_kind: map_v3_bucket_to_source_kind(bucket, category),
+                        module: module_code.clone(),
+                        bucket: bucket_code.clone(),
+                        discipline: map_v3_module_to_discipline(&module_code),
+                        source_kind: map_v3_bucket_to_source_kind(&bucket_code),
                         resource_type,
                         language: language.clone(),
                         enabled: true,
@@ -1385,8 +1507,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 source.postponed = false;
                 source.enabled = true;
                 source.enabled_by_default = true;
-                source.discipline = map_v3_module_to_discipline(module, category);
-                source.source_kind = map_v3_bucket_to_source_kind(bucket, category);
+                source.module = module_code.clone();
+                source.bucket = bucket_code.clone();
+                source.discipline = map_v3_module_to_discipline(&module_code);
+                source.source_kind = map_v3_bucket_to_source_kind(&bucket_code);
                 source.resource_type =
                     map_v3_resource_type(attrs.get("resourceType").map(String::as_str), url);
 
@@ -1408,34 +1532,50 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
 
     let mut catalog = grouped.into_values().collect::<Vec<_>>();
     catalog.sort_by(|left, right| {
-        discipline_to_raw(&left.discipline)
-            .cmp(discipline_to_raw(&right.discipline))
-            .then_with(|| {
-                source_kind_to_raw(&left.source_kind).cmp(source_kind_to_raw(&right.source_kind))
-            })
+        left.module
+            .cmp(&right.module)
+            .then_with(|| left.bucket.cmp(&right.bucket))
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(catalog)
 }
 
-fn map_v3_module_to_discipline(module: Option<&str>, category: Option<&str>) -> Discipline {
-    let module = module
-        .map(|value| value.trim().to_lowercase())
+fn normalize_v3_module(module: Option<&str>, category: Option<&str>) -> String {
+    module
+        .map(policy::normalize_module)
         .or_else(|| {
             category.and_then(|value| {
                 value
                     .split(',')
                     .next()
-                    .map(|part| part.trim().to_lowercase())
+                    .map(|part| policy::normalize_module(part.trim()))
             })
         })
-        .unwrap_or_default();
-    match module.as_str() {
+        .unwrap_or_else(|| "other".to_string())
+}
+
+fn normalize_v3_bucket(module: &str, bucket: Option<&str>, category: Option<&str>) -> String {
+    let module = policy::normalize_module(module);
+    bucket
+        .map(|value| policy::normalize_bucket(&module, value))
+        .or_else(|| {
+            category.and_then(|value| {
+                value
+                    .split(',')
+                    .nth(1)
+                    .map(|part| policy::normalize_bucket(&module, part.trim()))
+            })
+        })
+        .unwrap_or_else(|| "unspecified".to_string())
+}
+
+fn map_v3_module_to_discipline(module: &str) -> Discipline {
+    match module {
         "technology" => Discipline::Technology,
         "social_science" => Discipline::SocialScience,
         "business" => Discipline::Other,
-        "personal_growth" | "growth" => Discipline::Life,
-        "news_and_social_opinion" | "news_opinion" => Discipline::News,
+        "growth" => Discipline::Life,
+        "news_opinion" => Discipline::News,
         "entertainment" => Discipline::Humanities,
         "science" => Discipline::Science,
         "medicine" => Discipline::Medicine,
@@ -1443,20 +1583,8 @@ fn map_v3_module_to_discipline(module: Option<&str>, category: Option<&str>) -> 
     }
 }
 
-fn map_v3_bucket_to_source_kind(bucket: Option<&str>, category: Option<&str>) -> SourceKind {
-    let bucket = bucket
-        .map(|value| value.trim().to_lowercase())
-        .or_else(|| {
-            category.and_then(|value| {
-                value
-                    .split(',')
-                    .nth(1)
-                    .map(|part| part.trim().to_lowercase())
-            })
-        })
-        .unwrap_or_default();
-
-    match bucket.as_str() {
+fn map_v3_bucket_to_source_kind(bucket: &str) -> SourceKind {
+    match bucket {
         "research" | "academic_frontier" | "physics" | "chemistry" | "biology" => {
             SourceKind::AcademicJournal
         }
@@ -1465,6 +1593,28 @@ fn map_v3_bucket_to_source_kind(bucket: Option<&str>, category: Option<&str>) ->
         "community" | "streaming" | "news" | "personal_opinion" | "streaming_opinion"
         | "community_opinion" | "media_opinion" | "lite_pool" => SourceKind::CommunityHotspot,
         _ => SourceKind::CommunityHotspot,
+    }
+}
+
+fn legacy_module_from_discipline(discipline: &Discipline) -> String {
+    match discipline {
+        Discipline::Technology => "technology".to_string(),
+        Discipline::SocialScience => "social_science".to_string(),
+        Discipline::Other => "business".to_string(),
+        Discipline::Life => "growth".to_string(),
+        Discipline::News => "news_opinion".to_string(),
+        Discipline::Humanities => "entertainment".to_string(),
+        Discipline::Science => "science".to_string(),
+        Discipline::Medicine => "medicine".to_string(),
+    }
+}
+
+fn legacy_bucket_from_source_kind(source_kind: &SourceKind) -> String {
+    match source_kind {
+        SourceKind::AcademicJournal => "academic_frontier".to_string(),
+        SourceKind::OfficialAnnouncement => "official".to_string(),
+        SourceKind::TechnicalBlog => "blogs".to_string(),
+        SourceKind::CommunityHotspot => "community".to_string(),
     }
 }
 
@@ -1651,10 +1801,37 @@ fn source_kind_label(value: &SourceKind) -> &'static str {
     }
 }
 
-fn fetch_interval_for_kind(source_kind: &SourceKind) -> chrono::Duration {
-    match source_kind {
-        SourceKind::AcademicJournal => chrono::Duration::hours(72),
-        SourceKind::OfficialAnnouncement => chrono::Duration::hours(6),
-        SourceKind::TechnicalBlog | SourceKind::CommunityHotspot => chrono::Duration::hours(3),
+fn module_label(raw: &str) -> &'static str {
+    match policy::normalize_module(raw).as_str() {
+        "technology" => "科技",
+        "social_science" => "社科",
+        "business" => "商业",
+        "growth" => "成长",
+        "news_opinion" => "新闻观点",
+        "entertainment" => "娱乐",
+        "science" => "科学",
+        "medicine" => "医学",
+        _ => "其他",
+    }
+}
+
+fn bucket_label(raw: &str) -> &'static str {
+    match raw {
+        "research" => "研究",
+        "academic_frontier" => "学术前沿",
+        "official" => "官方",
+        "blogs" => "博客",
+        "community" => "社区",
+        "streaming" => "流媒体",
+        "news" => "新闻",
+        "personal_opinion" => "个人观点",
+        "streaming_opinion" => "流媒体观点",
+        "community_opinion" => "社区观点",
+        "media_opinion" => "媒体观点",
+        "lite_pool" => "轻量池",
+        "physics" => "物理",
+        "chemistry" => "化学",
+        "biology" => "生物",
+        _ => "未分类",
     }
 }

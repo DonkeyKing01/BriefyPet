@@ -20,6 +20,35 @@ export type SourceKind =
   | "technical-blog"
   | "community-hotspot";
 
+export type SourceModule =
+  | "technology"
+  | "social_science"
+  | "business"
+  | "growth"
+  | "news_opinion"
+  | "entertainment"
+  | "science"
+  | "medicine"
+  | "other";
+
+export type SourceBucket =
+  | "research"
+  | "academic_frontier"
+  | "official"
+  | "blogs"
+  | "community"
+  | "streaming"
+  | "news"
+  | "personal_opinion"
+  | "streaming_opinion"
+  | "community_opinion"
+  | "media_opinion"
+  | "lite_pool"
+  | "physics"
+  | "chemistry"
+  | "biology"
+  | "unspecified";
+
 export type ResourceType = "article" | "podcast" | "video" | "twitter" | "other";
 
 export type UserDisciplinePreference = {
@@ -32,6 +61,8 @@ export type RssSource = {
   id: string;
   name: string;
   url: string;
+  module: SourceModule;
+  bucket: SourceBucket;
   discipline: Discipline;
   sourceKind: SourceKind;
   resourceType: ResourceType;
@@ -66,6 +97,7 @@ export type Article = {
   fitLevel: FitLevel;
   fitScore: number;
   recommendationReason: string;
+  rawContent: string;
   isFavorite: boolean;
   isNew: boolean;
 };
