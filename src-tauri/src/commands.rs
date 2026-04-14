@@ -4,7 +4,8 @@ use tauri_plugin_autostart::ManagerExt;
 use crate::{
     db,
     models::{
-        AppView, Discipline, ResourceType, RssSource, SettingsPayload, Snapshot, SourceKind,
+        AppView, Discipline, HistoryItem, OverlaySnapshot, ResourceType, RssSource,
+        SettingsPayload, Snapshot, SourceKind,
     },
     policy,
     service, AppState,
@@ -14,6 +15,12 @@ use crate::{
 pub fn bootstrap(app: AppHandle, state: State<AppState>) -> Result<Snapshot, String> {
     let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
     service::snapshot(&app, is_scanning).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn bootstrap_overlay(app: AppHandle, state: State<AppState>) -> Result<OverlaySnapshot, String> {
+    let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
+    service::snapshot_overlay(&app, is_scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -39,7 +46,8 @@ pub async fn save_settings(
         } else {
             app.autolaunch().disable().map_err(|err| err.to_string())?;
         }
-        return service::snapshot(&app, false).map_err(|err| err.to_string());
+        service::sync_windows(&app, false).map_err(|err| err.to_string())?;
+        return service::publish_snapshot(&app, false).map_err(|err| err.to_string());
     }
 
     service::validate_api_key_for_settings(&app, &settings)
@@ -62,13 +70,15 @@ pub async fn save_settings(
 
     service::ensure_scheduler(&app);
     service::trigger_fetch_now(&app, None, false);
-    service::snapshot(&app, true).map_err(|err| err.to_string())
+    service::sync_windows(&app, true).map_err(|err| err.to_string())?;
+    service::publish_snapshot(&app, true).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub fn open_article(app: AppHandle, article_id: i64) -> Result<Snapshot, String> {
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::mark_article_opened(&conn, article_id).map_err(|err| err.to_string())?;
+    let _ = db::mark_push_article_pushed(&app, article_id).map_err(|err| err.to_string())?;
     let source_id = db::article_source_id(&conn, article_id).map_err(|err| err.to_string())?;
     db::log_user_event(
         &conn,
@@ -81,8 +91,9 @@ pub fn open_article(app: AppHandle, article_id: i64) -> Result<Snapshot, String>
     let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
     let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)
         .map_err(|err| err.to_string())?;
-    service::sync_windows(&app, false).map_err(|err| err.to_string())?;
-    service::snapshot(&app, false).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -105,12 +116,17 @@ pub fn toggle_favorite(app: AppHandle, article_id: i64) -> Result<Snapshot, Stri
     let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
     let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)
         .map_err(|err| err.to_string())?;
-    service::snapshot(&app, false).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub fn pet_double_click(app: AppHandle) -> Result<(), String> {
-    service::handle_pet_double_click(&app).map_err(|err| err.to_string())
+    service::handle_pet_double_click(&app).map_err(|err| err.to_string())?;
+    let scanning = service::current_scanning(&app);
+    service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
+    let _ = service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -127,7 +143,8 @@ pub fn set_active_view(app: AppHandle, view: AppView) -> Result<Snapshot, String
         let _ = window.show();
         let _ = window.set_focus();
     }
-    service::snapshot(&app, false).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -146,7 +163,23 @@ pub fn save_article_note(app: AppHandle, article_id: i64, note: String) -> Resul
     let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
     let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)
         .map_err(|err| err.to_string())?;
-    service::snapshot(&app, false).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_article_raw_content(app: AppHandle, article_id: i64) -> Result<String, String> {
+    let conn = db::connect(&app).map_err(|err| err.to_string())?;
+    db::fetch_article_raw_content(&conn, article_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_history_articles_page(
+    app: AppHandle,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<HistoryItem>, String> {
+    db::list_push_history_articles_page(&app, offset, limit).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -193,16 +226,35 @@ pub fn add_custom_rss_source(
         service::trigger_fetch_now(&app, Some(std::time::Duration::from_millis(250)), false);
     }
 
-    service::snapshot(&app, false).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub fn reset_runtime_data(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let conn = db::connect(&app).map_err(|err| err.to_string())?;
-    db::reset_runtime_data(&conn).map_err(|err| err.to_string())?;
+    db::hard_reset_all(&app).map_err(|err| err.to_string())?;
     service::clear_last_error(&app);
     if let Ok(mut scanning) = state.is_scanning.lock() {
         *scanning = false;
+    }
+    if let Ok(mut started) = state.scheduler_started.lock() {
+        *started = false;
+    }
+    if let Ok(mut last_error) = state.last_error.lock() {
+        *last_error = None;
+    }
+    if let Ok(mut api_key_valid) = state.api_key_valid.lock() {
+        *api_key_valid = None;
+    }
+    if let Ok(mut last_scan_at) = state.last_scan_at.lock() {
+        *last_scan_at = None;
+    }
+    if let Ok(mut loading_until) = state.loading_until.lock() {
+        *loading_until = None;
+    }
+    if let Ok(mut pet_visible_until) = state.pet_visible_until.lock() {
+        *pet_visible_until = None;
     }
     process::restart(&app.env());
     Ok(())

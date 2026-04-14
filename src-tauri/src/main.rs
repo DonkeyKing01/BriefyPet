@@ -23,6 +23,7 @@ pub struct AppState {
     api_key_valid: Mutex<Option<bool>>,
     last_scan_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     loading_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    pet_visible_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
@@ -35,7 +36,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
         .skip_taskbar(true)
         .resizable(false)
         .position(32.0, 720.0)
-        .visible(true)
+        .visible(false)
         .build()?;
     Ok(())
 }
@@ -64,6 +65,7 @@ fn main() {
             api_key_valid: Mutex::new(None),
             last_scan_at: Mutex::new(None),
             loading_until: Mutex::new(None),
+            pet_visible_until: Mutex::new(None),
         })
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -127,6 +129,7 @@ fn main() {
             build_bubble_window(app)?;
 
             if should_scan {
+                service::reveal_pet_for_polling(&app.handle());
                 service::ensure_scheduler(&app.handle());
                 service::trigger_fetch_now(
                     &app.handle(),
@@ -143,6 +146,7 @@ fn main() {
         .on_system_tray_event(tray::handle_tray_event)
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::bootstrap_overlay,
             commands::save_settings,
             commands::open_article,
             commands::toggle_favorite,
@@ -150,6 +154,8 @@ fn main() {
             commands::bubble_action,
             commands::set_active_view,
             commands::save_article_note,
+            commands::get_article_raw_content,
+            commands::list_history_articles_page,
             commands::add_custom_rss_source,
             commands::reset_runtime_data
         ])

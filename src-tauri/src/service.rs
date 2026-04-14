@@ -11,7 +11,7 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use crate::{
     db, llm,
     models::{
-        AppView, FeedArticle, LlmResult, PetStatus, SettingsPayload, Snapshot,
+        AppView, FeedArticle, LlmResult, OverlaySnapshot, PetStatus, SettingsPayload, Snapshot,
     },
     policy,
     rss, AppState,
@@ -20,14 +20,27 @@ use crate::{
 const SCORE_BATCH_SIZE: usize = 3;
 const MAX_CONCURRENT_SCORE_BATCHES: usize = 20;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
+const PET_PEEK_SECONDS: u64 = 120;
 const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 7;
 const PUSH_TOP_PER_BUCKET: usize = 3;
 const PUSH_MAX_AGE_DAYS: i64 = 2;
+pub const EVENT_SNAPSHOT_UPDATED: &str = "briefy://snapshot-updated";
+pub const EVENT_OVERLAY_UPDATED: &str = "briefy://overlay-updated";
 
 pub fn requires_configuration(settings: &SettingsPayload, api_key_valid: Option<bool>) -> bool {
-    !is_settings_complete(settings)
-        || settings.api_key.trim().is_empty()
-        || api_key_valid == Some(false)
+    requires_configuration_flags(
+        is_settings_complete(settings),
+        !settings.api_key.trim().is_empty(),
+        api_key_valid,
+    )
+}
+
+fn requires_configuration_flags(
+    discipline_ready: bool,
+    has_api_key: bool,
+    api_key_valid: Option<bool>,
+) -> bool {
+    !discipline_ready || !has_api_key || api_key_valid == Some(false)
 }
 
 pub fn resolve_requested_view(app: &AppHandle, requested: AppView) -> Result<AppView> {
@@ -75,7 +88,7 @@ pub fn derive_pet_status(
 pub fn snapshot(app: &AppHandle, is_scanning: bool) -> Result<Snapshot> {
     let conn = db::connect(app)?;
     let settings = db::read_settings(&conn)?;
-    let active_reminder = db::active_reminder_batch(&conn)?;
+    let active_reminder = db::push_active_reminder(app)?;
     let last_error = app
         .state::<AppState>()
         .last_error
@@ -111,13 +124,92 @@ pub fn snapshot(app: &AppHandle, is_scanning: bool) -> Result<Snapshot> {
         is_loading,
     );
 
-    db::build_snapshot(
+    let mut snapshot = db::build_snapshot(
         &conn,
         pet_status,
         last_error,
         api_key_valid.unwrap_or(false),
         last_scan_at,
-    )
+    )?;
+
+    snapshot.active_reminder = active_reminder;
+    snapshot.history_articles = db::list_push_history_articles_page(app, 0, 200)?;
+
+    if let Some(reminder) = &snapshot.active_reminder {
+        let existing = snapshot
+            .articles
+            .iter()
+            .map(|article| article.id)
+            .collect::<HashSet<_>>();
+        for article_id in &reminder.article_ids {
+            if existing.contains(article_id) {
+                continue;
+            }
+            if let Some(article) = db::fetch_article_record(&conn, *article_id)? {
+                snapshot.articles.push(article);
+            }
+        }
+    }
+
+    Ok(snapshot)
+}
+
+pub fn snapshot_overlay(app: &AppHandle, is_scanning: bool) -> Result<OverlaySnapshot> {
+    let conn = db::connect(app)?;
+    let active_reminder = db::push_active_reminder(app)?;
+    let (has_api_key, discipline_ready) = db::read_runtime_config_flags(&conn)?;
+
+    let api_key_valid = app
+        .state::<AppState>()
+        .api_key_valid
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .or(Some(db::read_api_key_valid(&conn)?));
+    let is_loading = app
+        .state::<AppState>()
+        .loading_until
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .is_some();
+
+    let pet_status = if is_loading {
+        PetStatus::Loading
+    } else if requires_configuration_flags(discipline_ready, has_api_key, api_key_valid) {
+        PetStatus::NeedsConfig
+    } else if is_scanning || api_key_valid.is_none() {
+        PetStatus::Scanning
+    } else if active_reminder.is_some() {
+        PetStatus::NewInfo
+    } else {
+        PetStatus::Idle
+    };
+
+    Ok(OverlaySnapshot {
+        pet_status,
+        active_reminder,
+    })
+}
+
+pub fn current_scanning(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .is_scanning
+        .lock()
+        .map(|value| *value)
+        .unwrap_or(false)
+}
+
+pub fn publish_snapshot(app: &AppHandle, is_scanning: bool) -> Result<Snapshot> {
+    let payload = snapshot(app, is_scanning)?;
+    let _ = app.emit_all(EVENT_SNAPSHOT_UPDATED, payload.clone());
+    Ok(payload)
+}
+
+pub fn publish_overlay(app: &AppHandle, is_scanning: bool) -> Result<OverlaySnapshot> {
+    let payload = snapshot_overlay(app, is_scanning)?;
+    let _ = app.emit_all(EVENT_OVERLAY_UPDATED, payload.clone());
+    Ok(payload)
 }
 
 pub fn ensure_scheduler(app: &AppHandle) {
@@ -145,8 +237,34 @@ pub fn ensure_scheduler(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             sleep(TokioDuration::from_secs(SCHEDULER_TICK_MINUTES * 60)).await;
+            reveal_pet_for_polling(&app_handle);
             log_fetch_result(run_fetch_cycle(app_handle.clone(), false).await, &app_handle);
         }
+    });
+}
+
+pub fn reveal_pet_for_polling(app: &AppHandle) {
+    let visible_until = Utc::now() + Duration::seconds(PET_PEEK_SECONDS as i64);
+    set_pet_visible_until(app, Some(visible_until));
+
+    let is_scanning = app
+        .state::<AppState>()
+        .is_scanning
+        .lock()
+        .map(|value| *value)
+        .unwrap_or(false);
+    let _ = sync_windows(app, is_scanning);
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(TokioDuration::from_secs(PET_PEEK_SECONDS)).await;
+        let is_scanning = app_handle
+            .state::<AppState>()
+            .is_scanning
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(false);
+        let _ = sync_windows(&app_handle, is_scanning);
     });
 }
 
@@ -200,6 +318,8 @@ pub async fn validate_api_key_for_settings(app: &AppHandle, settings: &SettingsP
 pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<()> {
     set_scanning(&app, true);
     clear_loading_until(&app);
+    let _ = sync_windows(&app, true);
+    let _ = publish_snapshot(&app, true);
     let cycle_started_at = Utc::now();
     let started_at = Instant::now();
 
@@ -236,6 +356,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         clear_last_error(&app);
         set_scanning(&app, false);
         sync_windows(&app, false)?;
+        let _ = publish_snapshot(&app, false);
         return Ok(());
     }
 
@@ -249,9 +370,8 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
             clear_last_error(&app);
         }
         set_scanning(&app, false);
-        set_last_scan_at(&app, Some(now));
-        db::write_last_scan_at(&conn, Some(now))?;
         sync_windows(&app, false)?;
+        let _ = publish_snapshot(&app, false);
         let cycle_ended_at = Utc::now();
         let _ = db::log_crawl_cycle(
             &conn,
@@ -403,13 +523,8 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         PUSH_MAX_AGE_DAYS,
     )?;
     if !reminder_candidates.is_empty() {
-        let batch_id = match db::current_active_batch_for_updates(&conn)? {
-            Some(batch_id) => batch_id,
-            None => db::create_reminder_batch(&conn)?,
-        };
-        for article_id in reminder_candidates {
-            db::attach_article_to_batch(&conn, &batch_id, article_id)?;
-        }
+        let _ = db::queue_push_articles(&conn, &app, &reminder_candidates)?;
+        db::remove_content_pool_entries(&conn, &reminder_candidates)?;
     }
 
     for source_id in successful_source_ids {
@@ -424,6 +539,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     let warnings = collect_cycle_warnings(fetch_errors, score_outcome.errors);
     clear_last_error(&app);
     sync_windows(&app, false)?;
+    let _ = publish_snapshot(&app, false);
 
     let cycle_ended_at = Utc::now();
     let warning_summary = if warnings.is_empty() {
@@ -873,6 +989,7 @@ fn log_fetch_result(result: Result<()>, app: &AppHandle) {
         }
 
         let _ = sync_windows(app, false);
+        let _ = publish_snapshot(app, false);
         eprintln!("briefy-pet fetch cycle failed: {message}");
     }
 }
@@ -920,14 +1037,15 @@ pub fn handle_pet_double_click(app: &AppHandle) -> Result<()> {
 
 pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
     let conn = db::connect(app)?;
-    if let Some(batch) = db::active_reminder_batch(&conn)? {
+    if let Some(batch) = db::push_active_reminder(app)? {
         match action {
             "view" => {
-                db::set_batch_status(&conn, &batch.id, "opened", None)?;
+                db::set_push_snooze_until(app, None)?;
                 db::write_active_view(&conn, &AppView::Reading)?;
                 db::log_user_event(&conn, "bubble-view", batch.top_article_id, None, None)?;
                 if let Some(top_article_id) = batch.top_article_id {
                     db::mark_article_opened(&conn, top_article_id)?;
+                    let _ = db::mark_push_article_pushed(app, top_article_id)?;
                     let source_id = db::article_source_id(&conn, top_article_id)?;
                     db::log_user_event(
                         &conn,
@@ -945,13 +1063,19 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
                 }
             }
             "snooze" => {
-                let remind_at = (Utc::now() + Duration::minutes(30)).to_rfc3339();
-                db::set_batch_status(&conn, &batch.id, "snoozed", Some(remind_at))?;
+                let remind_at = Utc::now() + Duration::minutes(30);
+                db::set_push_snooze_until(app, Some(remind_at))?;
                 db::log_user_event(&conn, "bubble-snooze", None, None, None)?;
             }
             "ignore" => {
-                db::set_batch_status(&conn, &batch.id, "ignored", None)?;
-                db::log_user_event(&conn, "bubble-ignore", None, None, None)?;
+                let ignored_count = db::mark_all_waiting_pushed(app)?;
+                db::log_user_event(
+                    &conn,
+                    "bubble-ignore",
+                    None,
+                    None,
+                    Some(&format!(r#"{{"ignoredCount":{ignored_count}}}"#)),
+                )?;
             }
             _ => {}
         }
@@ -959,12 +1083,13 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
 
     let settings = db::read_settings(&conn)?;
     let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
-    sync_windows(app, false)?;
-    snapshot(app, false)
+    let scanning = current_scanning(app);
+    sync_windows(app, scanning)?;
+    publish_snapshot(app, scanning)
 }
 
 pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
-    let current = snapshot(app, is_scanning)?;
+    let current = publish_overlay(app, is_scanning)?;
     if let Some(window) = app.get_window("bubble") {
         if current.active_reminder.is_some() {
             let _ = window.show();
@@ -973,9 +1098,32 @@ pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
         }
     }
     if let Some(window) = app.get_window("pet") {
-        let _ = window.show();
+        let should_show = should_show_pet_window(app, current.active_reminder.is_some(), is_scanning);
+        if should_show {
+            let _ = window.show();
+        } else {
+            let _ = window.hide();
+        }
     }
     Ok(())
+}
+
+fn should_show_pet_window(app: &AppHandle, has_active_reminder: bool, is_scanning: bool) -> bool {
+    if has_active_reminder || is_scanning {
+        return true;
+    }
+
+    let now = Utc::now();
+    if let Ok(mut visible_until) = app.state::<AppState>().pet_visible_until.lock() {
+        if let Some(until) = *visible_until {
+            if until > now {
+                return true;
+            }
+            *visible_until = None;
+        }
+    }
+
+    false
 }
 
 fn set_last_error(app: &AppHandle, message: String) {
@@ -1005,6 +1153,12 @@ fn set_last_scan_at(app: &AppHandle, value: Option<DateTime<Utc>>) {
 fn clear_loading_until(app: &AppHandle) {
     if let Ok(mut loading_until) = app.state::<AppState>().loading_until.lock() {
         *loading_until = None;
+    }
+}
+
+fn set_pet_visible_until(app: &AppHandle, value: Option<DateTime<Utc>>) {
+    if let Ok(mut pet_visible_until) = app.state::<AppState>().pet_visible_until.lock() {
+        *pet_visible_until = value;
     }
 }
 

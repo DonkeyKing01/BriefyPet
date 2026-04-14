@@ -174,3 +174,8 @@ export type Snapshot = {
   memory: InterestMemoryRecord | null;
   sourceSummary: SourceCatalogSummary;
 };
+
+export type OverlaySnapshot = {
+  petStatus: PetStatus;
+  activeReminder: ReminderBatch | null;
+};

@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import type { AppView, SettingsPayload, Snapshot } from "./types";
+import type { AppView, HistoryItem, OverlaySnapshot, SettingsPayload, Snapshot } from "./types";
 
 export async function bootstrap(): Promise<Snapshot> {
   return invoke("bootstrap");
+}
+
+export async function bootstrapOverlay(): Promise<OverlaySnapshot> {
+  return invoke("bootstrap_overlay");
 }
 
 export async function saveSettings(settings: SettingsPayload): Promise<Snapshot> {
@@ -31,6 +35,17 @@ export async function setActiveView(view: AppView): Promise<Snapshot> {
 
 export async function saveArticleNote(articleId: number, note: string): Promise<Snapshot> {
   return invoke("save_article_note", { articleId, note });
+}
+
+export async function getArticleRawContent(articleId: number): Promise<string> {
+  return invoke("get_article_raw_content", { articleId });
+}
+
+export async function listHistoryArticlesPage(
+  offset: number,
+  limit: number,
+): Promise<HistoryItem[]> {
+  return invoke("list_history_articles_page", { offset, limit });
 }
 
 export async function addCustomRssSource(

@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { appWindow } from "@tauri-apps/api/window";
 import {
   addCustomRssSource,
   bootstrap,
+  bootstrapOverlay,
   bubbleAction,
+  getArticleRawContent,
+  listHistoryArticlesPage,
   openArticle,
   petDoubleClick,
   resetRuntimeData,
@@ -19,6 +23,7 @@ import type {
   FitLevel,
   HistoryItem,
   LlmProvider,
+  OverlaySnapshot,
   RssSource,
   SettingsPayload,
   Snapshot,
@@ -404,37 +409,149 @@ type SymbolName =
   | "timeline"
   | "reader";
 
-function useSnapshotPolling(enabled: boolean, intervalMs: number) {
+const HISTORY_PAGE_SIZE = 200;
+const SNAPSHOT_EVENT = "briefy://snapshot-updated";
+const OVERLAY_EVENT = "briefy://overlay-updated";
+
+function snapshotFingerprint(snapshot: Snapshot) {
+  const reminderKey = snapshot.activeReminder
+    ? `${snapshot.activeReminder.id}:${snapshot.activeReminder.articleCount}:${snapshot.activeReminder.partitionCount}`
+    : "none";
+  const articleEdge = snapshot.articles
+    .slice(0, 24)
+    .map((article) => `${article.id}:${article.isNew ? 1 : 0}:${article.isFavorite ? 1 : 0}:${article.fitScore}`)
+    .join(",");
+  const historyEdge = snapshot.historyArticles
+    .slice(0, 24)
+    .map((item) => `${item.id}:${item.batchId}:${item.fitScore}`)
+    .join(",");
+  const enabledDisciplineCount = snapshot.settings.disciplines.filter((item) => item.enabled).length;
+
+  return [
+    snapshot.petStatus,
+    snapshot.activeView,
+    snapshot.selectedArticleId ?? "",
+    snapshot.lastScanAt ?? "",
+    snapshot.lastError ?? "",
+    snapshot.apiKeyValid ? "1" : "0",
+    snapshot.settings.rssSources.length,
+    enabledDisciplineCount,
+    reminderKey,
+    snapshot.articles.length,
+    snapshot.historyArticles.length,
+    snapshot.memory?.updatedAt ?? "",
+    snapshot.sourceSummary.dueSources,
+    articleEdge,
+    historyEdge
+  ].join("|");
+}
+
+function useSnapshotEvents(enabled: boolean) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  async function refresh() {
-    try {
-      const next = await bootstrap();
-      setSnapshot(next);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
-  }
+  const fingerprintRef = useRef<string>("");
 
   useEffect(() => {
     if (!enabled) {
       return;
     }
 
-    void refresh();
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, intervalMs);
+    let active = true;
+    let unlisten: (() => void) | null = null;
 
-    return () => window.clearInterval(timer);
-  }, [enabled, intervalMs]);
+    const applySnapshot = (next: Snapshot) => {
+      const nextFingerprint = snapshotFingerprint(next);
+      if (nextFingerprint !== fingerprintRef.current) {
+        fingerprintRef.current = nextFingerprint;
+        setSnapshot(next);
+      }
+    };
+
+    const setup = async () => {
+      try {
+        unlisten = await listen<Snapshot>(SNAPSHOT_EVENT, (event) => {
+          if (!active) {
+            return;
+          }
+          applySnapshot(event.payload);
+          setError(null);
+          setLoading(false);
+        });
+
+        const initial = await bootstrap();
+        if (!active) {
+          return;
+        }
+        applySnapshot(initial);
+        setError(null);
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        setError(err instanceof Error ? err.message : "加载失败");
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    setLoading(true);
+    void setup();
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [enabled]);
 
   return { snapshot, setSnapshot, loading, error };
+}
+
+function useOverlayEvents(enabled: boolean) {
+  const [snapshot, setSnapshot] = useState<OverlaySnapshot | null>(null);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    const setup = async () => {
+      try {
+        unlisten = await listen<OverlaySnapshot>(OVERLAY_EVENT, (event) => {
+          if (!active) {
+            return;
+          }
+          setSnapshot(event.payload);
+        });
+
+        const initial = await bootstrapOverlay();
+        if (!active) {
+          return;
+        }
+        setSnapshot(initial);
+      } catch {
+        // Keep previous overlay state when transient event/bootstrap errors happen.
+      }
+    };
+
+    void setup();
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [enabled]);
+
+  return snapshot;
 }
 
 function formatTime(value: string | null) {
@@ -855,7 +972,7 @@ function SymbolIcon({ name, className }: { name: SymbolName; className?: string 
   }
 }
 
-function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
+function PetWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   const status = snapshot?.petStatus ?? "loading";
   const articleCount = snapshot?.activeReminder?.articleCount ?? 0;
   const asset = PET_ASSET_BY_STATUS[status];
@@ -921,7 +1038,7 @@ function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
-function BubbleWindow({ snapshot }: { snapshot: Snapshot | null }) {
+function BubbleWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   const reminder = snapshot?.activeReminder;
 
   if (!reminder) {
@@ -1055,7 +1172,9 @@ function SettingsView({
   }
 
   async function handleResetRuntime() {
-    const confirmed = window.confirm("将清空全部抓取与打分数据并重启应用，确认继续吗？");
+    const confirmed = window.confirm(
+      "将清空全部数据库与配置缓存（包含推送库、设置、抓取状态）并重启应用，确认继续吗？"
+    );
     if (!confirmed) {
       return;
     }
@@ -1266,12 +1385,12 @@ function SettingsView({
 
       <section className="settings-card">
         <div className="settings-section-head">
-          <h2>重置</h2>
-          <p>清空抓取与打分数据并重启应用，重新执行初始化流程。</p>
+          <h2>全量重置</h2>
+          <p>清空全部数据库与配置缓存并重启应用，恢复为首次启动状态。</p>
         </div>
         <div className="settings-actions">
           <button type="button" className="ghost-danger" onClick={() => void handleResetRuntime()}>
-            重置并重启
+            全量重置并重启
           </button>
         </div>
       </section>
@@ -1314,6 +1433,13 @@ function MainWindow({
   const [localSelectedId, setLocalSelectedId] = useState<number | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
+  const [selectedRawContent, setSelectedRawContent] = useState("");
+  const [selectedRawArticleId, setSelectedRawArticleId] = useState<number | null>(null);
+  const [rawContentLoading, setRawContentLoading] = useState(false);
+  const [historyArchive, setHistoryArchive] = useState<HistoryItem[]>([]);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [leftWidth, setLeftWidth] = useState(252);
@@ -1398,10 +1524,7 @@ function MainWindow({
 
   const articleById = useMemo(() => new Map(allArticles.map((article) => [article.id, article])), [allArticles]);
 
-  const historyItems = useMemo(
-    () => dedupeHistoryItems(snapshot?.historyArticles ?? []),
-    [snapshot?.historyArticles]
-  );
+  const historyItems = useMemo(() => dedupeHistoryItems(historyArchive), [historyArchive]);
 
   const historyByArticleId = useMemo(() => {
     const map = new Map<number, HistoryItem>();
@@ -1631,6 +1754,21 @@ function MainWindow({
   }, [selectedArticle, articleMetaById]);
 
   useEffect(() => {
+    const incoming = snapshot?.historyArticles ?? [];
+    if (incoming.length === 0) {
+      setHistoryArchive([]);
+      setHistoryOffset(0);
+      setHistoryHasMore(false);
+      return;
+    }
+
+    const dedupIncoming = dedupeHistoryItems(incoming);
+    setHistoryArchive((prev) => dedupeHistoryItems([...dedupIncoming, ...prev]));
+    setHistoryOffset((prev) => Math.max(prev, dedupIncoming.length));
+    setHistoryHasMore(dedupIncoming.length >= HISTORY_PAGE_SIZE);
+  }, [snapshot?.historyArticles]);
+
+  useEffect(() => {
     if (!snapshot || isConfigurationComplete || snapshot.activeView === "settings") {
       return;
     }
@@ -1646,8 +1784,60 @@ function MainWindow({
   }, [selectedArticle?.id]);
 
   useEffect(() => {
+    const remoteSelectedId = snapshot?.selectedArticleId ?? null;
+    if (!remoteSelectedId) {
+      return;
+    }
+
+    setLocalSelectedId((current) =>
+      current === remoteSelectedId ? current : remoteSelectedId
+    );
+  }, [snapshot?.selectedArticleId]);
+
+  useEffect(() => {
     setNoteDraft(selectedArticle?.note ?? "");
   }, [selectedArticle?.id, selectedArticle?.note]);
+
+  useEffect(() => {
+    if (!selectedArticle || usingDemoData) {
+      setRawContentLoading(false);
+      return;
+    }
+
+    if (selectedRawArticleId === selectedArticle.id) {
+      setRawContentLoading(false);
+      return;
+    }
+
+    const articleId = selectedArticle.id;
+    let cancelled = false;
+    setRawContentLoading(true);
+    setSelectedRawContent("");
+
+    void getArticleRawContent(articleId)
+      .then((content) => {
+        if (cancelled) {
+          return;
+        }
+        setSelectedRawContent(content);
+        setSelectedRawArticleId(articleId);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        setInteractionMessage(err instanceof Error ? err.message : "加载原文失败");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRawContentLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedArticle?.id, selectedRawArticleId, usingDemoData]);
 
   useEffect(() => {
     const updateCompact = () => {
@@ -1734,6 +1924,26 @@ function MainWindow({
     resizeTargetRef.current = target;
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+  }
+
+  async function handleLoadMoreHistory() {
+    if (usingDemoData || historyLoadingMore || !historyHasMore) {
+      return;
+    }
+
+    setHistoryLoadingMore(true);
+    try {
+      const page = await listHistoryArticlesPage(historyOffset, HISTORY_PAGE_SIZE);
+      setHistoryArchive((prev) => dedupeHistoryItems([...prev, ...page]));
+      setHistoryOffset((prev) => prev + page.length);
+      if (page.length < HISTORY_PAGE_SIZE) {
+        setHistoryHasMore(false);
+      }
+    } catch (err) {
+      setInteractionMessage(err instanceof Error ? err.message : "加载历史推送失败");
+    } finally {
+      setHistoryLoadingMore(false);
+    }
   }
 
   async function handleSelectArticle(
@@ -2078,6 +2288,19 @@ function MainWindow({
                             </div>
                           );
                         })}
+                      {!secCollapsed && historyHasMore && (
+                        <button
+                          className="feed-row child"
+                          disabled={historyLoadingMore}
+                          onClick={() => void handleLoadMoreHistory()}
+                        >
+                          <span className="feed-row-left">
+                            <span className="feed-name">
+                              {historyLoadingMore ? "正在加载..." : "加载更多历史推送"}
+                            </span>
+                          </span>
+                        </button>
+                      )}
                     </section>
                   );
                 })()}
@@ -2449,7 +2672,13 @@ function MainWindow({
                       <section className="reader-block">
                         <h3>RSS抓到的原文</h3>
                         <pre className="reader-raw-content">
-                          {rssRawToText(selectedArticle.rawContent || "") || "暂无原文内容"}
+                          {rawContentLoading
+                            ? "正在加载原文..."
+                            : rssRawToText(
+                                usingDemoData
+                                  ? selectedArticle.rawContent || ""
+                                  : selectedRawContent || ""
+                              ) || "暂无原文内容"}
                         </pre>
                         <a href={selectedArticle.link} target="_blank" rel="noreferrer">
                           查看原文链接
@@ -2475,8 +2704,9 @@ function MainWindow({
 
 export default function App() {
   const [windowLabel, setWindowLabel] = useState(() => appWindow.label);
-  const pollIntervalMs = windowLabel === "main" ? 1800 : 400;
-  const { snapshot, setSnapshot, loading, error } = useSnapshotPolling(true, pollIntervalMs);
+  const isMainWindow = windowLabel === "main";
+  const { snapshot, setSnapshot, loading, error } = useSnapshotEvents(isMainWindow);
+  const overlaySnapshot = useOverlayEvents(!isMainWindow);
 
   useEffect(() => {
     const label = appWindow.label;
@@ -2505,11 +2735,11 @@ export default function App() {
   }, [windowLabel]);
 
   if (windowLabel === "pet") {
-    return <PetWindow snapshot={snapshot} />;
+    return <PetWindow snapshot={overlaySnapshot} />;
   }
 
   if (windowLabel === "bubble") {
-    return <BubbleWindow snapshot={snapshot} />;
+    return <BubbleWindow snapshot={overlaySnapshot} />;
   }
 
   return (

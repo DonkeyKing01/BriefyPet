@@ -2,7 +2,7 @@
 
 ## 0. 文档说明
 
-- 文档版本：v2.6（合并版）
+- 文档版本：v2.8（合并版）
 - 更新时间：2026-04-14
 - 适用分支：mac
 - 文档性质：Ver2 全量归档 + 当前实现口径 + 验收基准
@@ -33,6 +33,8 @@
 | v2.4 | 统一策略与前端视觉 | module/bucket 策略化调度与提醒，前端三栏阅读体验升级 |
 | v2.5 | 稳定抓取链路与门禁 | 强制配置、首爬 7 天、重启增量、并发打分与池化推送收敛 |
 | v2.6 | 完成左栏语义与去重修正 | Unread/Today/Favorites/History 语义重构，去重、时间线、CHECK 信息补全 |
+| v2.7 | 推送链路独立化 | 新增独立推送库（waiting/pushed），主快照与气泡动作切换为推送库驱动 |
+| v2.8 | 全量事件驱动 + 全量重置 | 前端去轮询改事件订阅；重置升级为删除全部数据库与配置缓存 |
 
 ---
 
@@ -215,3 +217,102 @@
 1. 后续 Ver2 迭代不再新增 `Ver2-*.md` 分散文件。
 2. 所有新增内容直接更新本文件，按版本新增小节。
 3. 文档更新必须标注日期、目标、改动点、验证项。
+
+---
+
+## 9. v2.7 改造记录（2026-04-14）
+
+### 9.1 改造目标
+
+1. 将“推送状态”从主库提醒批次表中解耦，独立成推送专用数据库。
+2. 让等待推送（Unread）与已推送（Today/History）由统一状态机驱动。
+3. 保持当前前端交互不变的前提下，降低重复推送与状态混乱风险。
+
+### 9.2 后端数据层改动
+
+1. 新增独立推送库文件：`briefy-pet-push.db`（与主库并列存放于 app data 目录）。
+2. 新增 `push_items`：
+   - 主键：`article_id`
+   - 关键字段：`module` / `bucket` / `fit_score` / `push_status(waiting|pushed)` / `queued_at` / `status_updated_at`
+3. 新增 `push_meta`：用于保存推送侧运行时元信息（如 snooze 到期时间）。
+4. 保留桶上限：按 `module/bucket` 维度保留 Top 1000；超限优先淘汰已 pushed 的低分旧数据。
+5. 增加一次性迁移标记：`push_db_migrated_v1`，首次启动自动将旧 `reminder_batches` 数据迁入推送库。
+
+### 9.3 推送链路改动
+
+1. 抓取打分后，候选文章不再写入 `reminder_batches`，改为写入推送库 `waiting`。
+2. 候选入队成功后，立即从沉淀池 `ranked_content_pool` 移除，避免重复推送。
+3. `bubble` 动作改为直接驱动推送状态：
+   - `view`：打开阅读并将顶部文章从 `waiting` 转为 `pushed`
+   - `snooze`：写入推送库 snooze 到期时间（30 分钟）
+   - `ignore`：批量将当前 `waiting` 置为 `pushed`
+4. `open_article` 命令补充状态迁移：打开文章即尝试 `waiting -> pushed`。
+
+### 9.4 快照与前端绑定改动
+
+1. 主快照 `active_reminder` 改为读取推送库 `waiting`。
+2. 主快照 `history_articles` 改为读取推送库 `pushed` 分页结果。
+3. 为避免等待队列文章不在最近 500 条里，快照会按 `article_id` 自动补齐缺失文章。
+4. 历史分页接口 `list_history_articles_page` 改为走推送库。
+
+### 9.5 兼容与运维
+
+1. 运行时重置 `reset_runtime_data` 时同步清空推送库，避免残留状态。
+2. 旧 `reminder_batches` 相关代码暂保留（仅兼容），当前主链路已切换到推送库。
+
+### 9.6 验证项
+
+1. `cd src-tauri && cargo check` 通过。
+2. `npm run build` 通过。
+
+---
+
+## 10. v2.8 改造记录（2026-04-14）
+
+### 10.1 改造目标
+
+1. 第二阶段把前端状态同步从轮询切换为事件驱动。
+2. 重置能力升级为“从头开始”：清空全部数据库与配置缓存。
+
+### 10.2 事件驱动改造
+
+1. 后端新增事件通道：
+   - `briefy://snapshot-updated`
+   - `briefy://overlay-updated`
+2. 后端新增发布函数：
+   - 主快照发布（main window）
+   - 轻量 overlay 发布（pet/bubble）
+3. 关键状态变更点已接入事件发布：
+   - 保存设置
+   - 打开文章 / 收藏 / 笔记 / 视图切换
+   - 气泡动作（view/snooze/ignore）
+   - 抓取周期开始、结束、失败
+4. 前端删除固定间隔轮询，改为：
+   - 启动时 bootstrap 一次
+   - 后续仅监听后端事件更新状态
+
+### 10.3 全量重置语义升级
+
+1. 新增全量重置能力：删除以下数据库文件及 WAL/SHM 侧文件：
+   - `briefy-pet.db`
+   - `briefy-pet-push.db`
+2. 重置时同步清空进程内运行态缓存：
+   - scanning/scheduler/api_key_valid/last_scan_at/loading_until/pet_visible_until
+3. 重置后立即重启应用，按首次启动路径重新初始化。
+
+### 10.3.1 抓取结束时间戳补充
+
+1. `last_scan_at` 作为全局最近一次“真实抓取流程完成”时间。
+2. 定时/开机抓取在存在 due source 且完成处理后会写入当前时间。
+3. 仅 15 分钟空轮询（无 due source）不更新时间。
+4. runtime 失败收尾不更新时间。
+
+### 10.4 前端文案同步
+
+1. 设置页“重置”改为“全量重置”。
+2. 确认提示明确包含“全部数据库与配置缓存”。
+
+### 10.5 验证项
+
+1. `cd src-tauri && cargo check` 通过。
+2. `npm run build` 通过。

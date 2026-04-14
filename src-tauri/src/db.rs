@@ -19,6 +19,11 @@ use crate::models::{
 use crate::policy;
 
 const MAX_POOL_SIZE_PER_BUCKET: usize = 1000;
+#[allow(dead_code)]
+const SNAPSHOT_HISTORY_LIMIT: usize = 200;
+const PUSH_DB_FILE: &str = "briefy-pet-push.db";
+const PUSH_BUCKET_MAX_SIZE: usize = 1000;
+const PUSH_SNOOZE_UNTIL_KEY: &str = "push_snooze_until";
 
 pub fn db_path(app: &AppHandle) -> Result<PathBuf> {
     let app_dir = app
@@ -27,6 +32,15 @@ pub fn db_path(app: &AppHandle) -> Result<PathBuf> {
         .context("failed to resolve app data dir")?;
     fs::create_dir_all(&app_dir)?;
     Ok(app_dir.join("briefy-pet.db"))
+}
+
+pub fn push_db_path(app: &AppHandle) -> Result<PathBuf> {
+    let app_dir = app
+        .path_resolver()
+        .app_data_dir()
+        .context("failed to resolve app data dir")?;
+    fs::create_dir_all(&app_dir)?;
+    Ok(app_dir.join(PUSH_DB_FILE))
 }
 
 pub fn connect(app: &AppHandle) -> Result<Connection> {
@@ -226,7 +240,48 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
 
     let catalog = load_catalog(app)?;
     seed_defaults(&conn, &catalog)?;
+        ensure_push_db_initialized(app, &conn)?;
     Ok(conn)
+}
+
+pub fn push_connect(app: &AppHandle) -> Result<Connection> {
+        let path = push_db_path(app)?;
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE IF NOT EXISTS push_items (
+                    article_id INTEGER PRIMARY KEY,
+                    module TEXT NOT NULL DEFAULT 'other',
+                    bucket TEXT NOT NULL DEFAULT 'unspecified',
+                    fit_score INTEGER NOT NULL DEFAULT 0,
+                    push_status TEXT NOT NULL DEFAULT 'waiting',
+                    queued_at TEXT NOT NULL,
+                    status_updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS push_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_push_items_status_rank
+                    ON push_items(push_status, fit_score DESC, queued_at DESC, article_id DESC);
+                CREATE INDEX IF NOT EXISTS idx_push_items_bucket
+                    ON push_items(module, bucket, push_status, fit_score DESC, queued_at DESC, article_id DESC);
+                "#,
+        )?;
+        Ok(conn)
+}
+
+fn ensure_push_db_initialized(app: &AppHandle, conn: &Connection) -> Result<()> {
+        let push_conn = push_connect(app)?;
+        let migrated = read_setting(conn, "push_db_migrated_v1")?
+                .unwrap_or_else(|| "false".to_string())
+                == "true";
+        if !migrated {
+                migrate_legacy_reminders_to_push_db(conn, &push_conn)?;
+                write_setting(conn, "push_db_migrated_v1", "true")?;
+        }
+        Ok(())
 }
 
 fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
@@ -241,6 +296,8 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         write_setting(conn, "api_key_valid", "false")?;
         write_setting(conn, "last_scan_at", "null")?;
         write_setting(conn, "memory_mode_enabled", "true")?;
+        write_setting(conn, "pool_cleanup_v1_done", "false")?;
+        write_setting(conn, "push_db_migrated_v1", "false")?;
     } else {
         ensure_setting(conn, "llm_provider", &default_llm_provider())?;
         ensure_setting(conn, "llm_model", "")?;
@@ -251,12 +308,22 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         ensure_setting(conn, "api_key_valid", "false")?;
         ensure_setting(conn, "last_scan_at", "null")?;
         ensure_setting(conn, "memory_mode_enabled", "true")?;
+        ensure_setting(conn, "pool_cleanup_v1_done", "false")?;
+        ensure_setting(conn, "push_db_migrated_v1", "false")?;
     }
 
     sync_source_catalog(conn, catalog)?;
     sync_discipline_preferences(conn)?;
     sync_user_source_pool(conn, catalog)?;
     sync_source_fetch_state(conn, catalog)?;
+
+    let cleanup_done = read_setting(conn, "pool_cleanup_v1_done")?
+        .unwrap_or_else(|| "false".to_string())
+        == "true";
+    if !cleanup_done {
+        cleanup_pushed_articles_from_pool(conn)?;
+        write_setting(conn, "pool_cleanup_v1_done", "true")?;
+    }
     Ok(())
 }
 
@@ -690,6 +757,26 @@ pub fn write_selected_article_id(conn: &Connection, article_id: Option<i64>) -> 
     Ok(())
 }
 
+pub fn read_runtime_config_flags(conn: &Connection) -> Result<(bool, bool)> {
+    let has_api_key = read_setting(conn, "api_key")?
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    let (enabled_count, enabled_with_pref_count) = conn.query_row(
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) AS enabled_count,
+          COALESCE(SUM(CASE WHEN enabled = 1 AND TRIM(preference) != '' THEN 1 ELSE 0 END), 0) AS enabled_with_pref_count
+        FROM user_interest_profile_v2
+        "#,
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+
+    let discipline_ready = enabled_count > 0 && enabled_count == enabled_with_pref_count;
+    Ok((has_api_key, discipline_ready))
+}
+
 pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
     let mut stmt = conn.prepare(
         r#"
@@ -748,6 +835,49 @@ pub fn fetch_article_raw_content(conn: &Connection, article_id: i64) -> Result<S
         )
         .optional()?;
     Ok(raw.unwrap_or_default())
+}
+
+pub fn fetch_article_record(conn: &Connection, article_id: i64) -> Result<Option<ArticleRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            a.id, a.source_id, a.title, a.link, a.source_name, a.discipline, a.source_kind, a.resource_type,
+            a.published_at, a.fetched_at, a.summary, a.fit_level, a.fit_score, a.recommendation_reason,
+            a.note, a.is_favorite, a.is_new
+        FROM articles a
+        WHERE a.id = ?1
+          AND a.score_status = 'success'
+        LIMIT 1
+        "#,
+    )?;
+
+    stmt.query_row(params![article_id], |row| {
+        let published_at_raw: Option<String> = row.get(8)?;
+        let fetched_at_raw: Option<String> = row.get(9)?;
+        let fit_level_raw: String = row.get(11)?;
+        Ok(ArticleRecord {
+            id: row.get(0)?,
+            source_id: row.get(1)?,
+            title: row.get(2)?,
+            link: row.get(3)?,
+            source_name: row.get(4)?,
+            discipline: parse_discipline(&row.get::<_, String>(5)?),
+            source_kind: parse_source_kind(&row.get::<_, String>(6)?),
+            resource_type: parse_resource_type(&row.get::<_, String>(7)?),
+            published_at: parse_optional_datetime(published_at_raw),
+            fetched_at: parse_optional_datetime(fetched_at_raw),
+            summary: row.get(10)?,
+            fit_level: parse_fit_level(&fit_level_raw),
+            fit_score: row.get(12)?,
+            recommendation_reason: row.get(13)?,
+            raw_content: String::new(),
+            note: row.get(14)?,
+            is_favorite: row.get::<_, i64>(15)? == 1,
+            is_new: row.get::<_, i64>(16)? == 1,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 pub fn toggle_favorite(conn: &Connection, article_id: i64) -> Result<bool> {
@@ -904,6 +1034,7 @@ pub fn update_article_note(conn: &Connection, article_id: i64, note: &str) -> Re
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn current_active_batch_for_updates(conn: &Connection) -> Result<Option<String>> {
     let now = Utc::now().to_rfc3339();
     let batch = conn
@@ -929,6 +1060,7 @@ pub fn current_active_batch_for_updates(conn: &Connection) -> Result<Option<Stri
     Ok(batch)
 }
 
+#[allow(dead_code)]
 pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSnapshot>> {
     let Some(batch_id) = current_active_batch_for_updates(conn)? else {
         return Ok(None);
@@ -991,6 +1123,7 @@ pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSn
 /// Like `active_reminder_batch` but also includes `opened` batches so the
 /// three-column reading view keeps showing curated articles after the user
 /// clicks "view" from the bubble notification.  Does NOT update batch status.
+#[allow(dead_code)]
 pub fn display_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSnapshot>> {
     let batch_id: Option<String> = conn
         .query_row(
@@ -1061,10 +1194,23 @@ pub fn display_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchS
 }
 
 /// 返回历史推送批次中的高分文章（排除当前正在展示的批次）。
+#[allow(dead_code)]
 pub fn list_history_articles(
     conn: &Connection,
     current_batch_id: Option<&str>,
 ) -> Result<Vec<crate::models::HistoryItem>> {
+    list_history_articles_page(conn, current_batch_id, 0, SNAPSHOT_HISTORY_LIMIT)
+}
+
+#[allow(dead_code)]
+pub fn list_history_articles_page(
+    conn: &Connection,
+    current_batch_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<crate::models::HistoryItem>> {
+    let safe_limit = limit.max(1).min(1000) as i64;
+    let safe_offset = offset as i64;
     let mut stmt = conn.prepare(
         r#"
         SELECT
@@ -1091,10 +1237,10 @@ pub fn list_history_articles(
         WHERE rb.status IN ('opened', 'ignored')
           AND (?1 IS NULL OR rb.id != ?1)
         ORDER BY rb.created_at DESC, a.fit_score DESC
-        LIMIT 500
+        LIMIT ?2 OFFSET ?3
         "#,
     )?;
-    let rows = stmt.query_map(params![current_batch_id], |row| {
+    let rows = stmt.query_map(params![current_batch_id, safe_limit, safe_offset], |row| {
         Ok(crate::models::HistoryItem {
             id: row.get::<_, i64>(0)?,
             title: row.get::<_, String>(1)?,
@@ -1117,6 +1263,415 @@ pub fn list_history_articles(
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
+pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i64]) -> Result<usize> {
+    if article_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let push_conn = push_connect(app)?;
+    let now = Utc::now().to_rfc3339();
+    let mut inserted = 0usize;
+
+    let mut lookup_stmt = conn.prepare(
+        r#"
+        SELECT
+            a.id,
+            COALESCE(sc.module, 'other') AS module,
+            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            a.fit_score
+        FROM articles a
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE a.id = ?1
+        LIMIT 1
+        "#,
+    )?;
+
+    let mut upsert_stmt = push_conn.prepare(
+        r#"
+        INSERT INTO push_items (
+            article_id,
+            module,
+            bucket,
+            fit_score,
+            push_status,
+            queued_at,
+            status_updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'waiting', ?5, ?5)
+        ON CONFLICT(article_id) DO UPDATE SET
+            module = excluded.module,
+            bucket = excluded.bucket,
+            fit_score = MAX(push_items.fit_score, excluded.fit_score),
+            push_status = push_items.push_status,
+            queued_at = push_items.queued_at,
+            status_updated_at = push_items.status_updated_at
+        "#,
+    )?;
+
+    for article_id in article_ids {
+        let Some((id, module, bucket, fit_score)) = lookup_stmt
+            .query_row(params![article_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()?
+        else {
+            continue;
+        };
+
+        let existing_status: Option<String> = push_conn
+            .query_row(
+                "SELECT push_status FROM push_items WHERE article_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        upsert_stmt.execute(params![id, module.clone(), bucket.clone(), fit_score, now.clone()])?;
+
+        if existing_status.is_none() {
+            inserted += 1;
+        }
+
+        trim_push_bucket(&push_conn, &module, &bucket)?;
+    }
+
+    if inserted > 0 {
+        write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
+    }
+
+    Ok(inserted)
+}
+
+pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
+    let push_conn = push_connect(app)?;
+    if let Some(raw_until) = read_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY)? {
+        if let Some(until) = parse_datetime(&raw_until) {
+            if until > Utc::now() {
+                return Ok(None);
+            }
+        }
+        write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
+    }
+
+    let mut stmt = push_conn.prepare(
+        r#"
+        SELECT article_id, module, bucket
+        FROM push_items
+        WHERE push_status = 'waiting'
+        ORDER BY fit_score DESC, queued_at DESC, article_id DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut article_ids = Vec::new();
+    let mut top_article_id = None;
+    let mut partitions = BTreeSet::new();
+    for (index, row) in rows.enumerate() {
+        let (article_id, module, bucket) = row?;
+        if index == 0 {
+            top_article_id = Some(article_id);
+        }
+        article_ids.push(article_id);
+        partitions.insert(format!("{module}/{bucket}"));
+    }
+
+    if article_ids.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ReminderBatchSnapshot {
+        id: "push-waiting".to_string(),
+        article_ids: article_ids.clone(),
+        article_count: article_ids.len(),
+        top_article_id,
+        partition_count: partitions.len(),
+    }))
+}
+
+pub fn list_push_history_articles_page(
+    app: &AppHandle,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<crate::models::HistoryItem>> {
+    let push_conn = push_connect(app)?;
+    let main_conn = connect(app)?;
+    let safe_limit = limit.max(1).min(1000) as i64;
+    let safe_offset = offset as i64;
+
+    let mut push_stmt = push_conn.prepare(
+        r#"
+        SELECT article_id, module, bucket, status_updated_at
+        FROM push_items
+        WHERE push_status = 'pushed'
+        ORDER BY status_updated_at DESC, fit_score DESC, article_id DESC
+        LIMIT ?1 OFFSET ?2
+        "#,
+    )?;
+    let push_rows = push_stmt.query_map(params![safe_limit, safe_offset], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut article_stmt = main_conn.prepare(
+        r#"
+        SELECT
+            id,
+            title,
+            COALESCE(link, '') AS link,
+            source_id,
+            COALESCE(source_name, '') AS source_name,
+            published_at,
+            COALESCE(summary, '') AS summary,
+            fit_score,
+            COALESCE(fit_level, 'low') AS fit_level,
+            COALESCE(recommendation_reason, '') AS recommendation_reason,
+            COALESCE(note, '') AS note,
+            is_favorite
+        FROM articles
+        WHERE id = ?1
+        LIMIT 1
+        "#,
+    )?;
+
+    let mut output = Vec::new();
+    for row in push_rows {
+        let (article_id, module, bucket, batch_created_at) = row?;
+        let Some(history_item) = article_stmt
+            .query_row(params![article_id], |article_row| {
+                Ok(crate::models::HistoryItem {
+                    id: article_row.get::<_, i64>(0)?,
+                    title: article_row.get::<_, String>(1)?,
+                    link: article_row.get::<_, String>(2)?,
+                    source_id: article_row.get::<_, String>(3)?,
+                    source_name: article_row.get::<_, String>(4)?,
+                    module: module.clone(),
+                    bucket: bucket.clone(),
+                    published_at: article_row.get::<_, Option<String>>(5)?,
+                    summary: article_row.get::<_, String>(6)?,
+                    fit_score: article_row.get::<_, i64>(7)?,
+                    fit_level: article_row.get::<_, String>(8)?,
+                    recommendation_reason: article_row.get::<_, String>(9)?,
+                    note: article_row.get::<_, String>(10)?,
+                    is_favorite: article_row.get::<_, bool>(11)?,
+                    batch_id: format!("push-{article_id}"),
+                    batch_created_at: batch_created_at.clone(),
+                })
+            })
+            .optional()?
+        else {
+            continue;
+        };
+        output.push(history_item);
+    }
+
+    Ok(output)
+}
+
+pub fn mark_push_article_pushed(app: &AppHandle, article_id: i64) -> Result<bool> {
+    let push_conn = push_connect(app)?;
+    let changed = push_conn.execute(
+        r#"
+        UPDATE push_items
+        SET push_status = 'pushed',
+            status_updated_at = ?2
+        WHERE article_id = ?1
+          AND push_status = 'waiting'
+        "#,
+        params![article_id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn mark_all_waiting_pushed(app: &AppHandle) -> Result<usize> {
+    let push_conn = push_connect(app)?;
+    let now = Utc::now().to_rfc3339();
+    let changed = push_conn.execute(
+        r#"
+        UPDATE push_items
+        SET push_status = 'pushed',
+            status_updated_at = ?1
+        WHERE push_status = 'waiting'
+        "#,
+        params![now],
+    )?;
+    write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
+    Ok(changed)
+}
+
+pub fn set_push_snooze_until(app: &AppHandle, until: Option<DateTime<Utc>>) -> Result<()> {
+    let push_conn = push_connect(app)?;
+    let value = until.map(|value| value.to_rfc3339());
+    write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, value.as_deref())
+}
+
+#[allow(dead_code)]
+pub fn push_db_stats(app: &AppHandle) -> Result<(i64, i64)> {
+    let push_conn = push_connect(app)?;
+    let waiting = push_conn.query_row(
+        "SELECT COUNT(*) FROM push_items WHERE push_status = 'waiting'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let pushed = push_conn.query_row(
+        "SELECT COUNT(*) FROM push_items WHERE push_status = 'pushed'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok((waiting, pushed))
+}
+
+#[allow(dead_code)]
+pub fn reset_push_runtime_data(app: &AppHandle) -> Result<()> {
+    let push_conn = push_connect(app)?;
+    push_conn.execute("DELETE FROM push_items", [])?;
+    push_conn.execute("DELETE FROM push_meta", [])?;
+    Ok(())
+}
+
+fn trim_push_bucket(conn: &Connection, module: &str, bucket: &str) -> Result<()> {
+    let total = conn.query_row(
+        "SELECT COUNT(*) FROM push_items WHERE module = ?1 AND bucket = ?2",
+        params![module, bucket],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let overflow = total.saturating_sub(PUSH_BUCKET_MAX_SIZE as i64);
+    if overflow <= 0 {
+        return Ok(());
+    }
+
+    conn.execute(
+        r#"
+        DELETE FROM push_items
+        WHERE article_id IN (
+            SELECT article_id
+            FROM push_items
+            WHERE module = ?1 AND bucket = ?2
+            ORDER BY
+                CASE WHEN push_status = 'waiting' THEN 1 ELSE 0 END ASC,
+                fit_score ASC,
+                queued_at ASC,
+                article_id ASC
+            LIMIT ?3
+        )
+        "#,
+        params![module, bucket, overflow],
+    )?;
+    Ok(())
+}
+
+fn read_push_meta_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM push_meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn write_push_meta_value(conn: &Connection, key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO push_meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM push_meta WHERE key = ?1", params![key])?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_reminders_to_push_db(main_conn: &Connection, push_conn: &Connection) -> Result<()> {
+    let has_legacy_rows: i64 = main_conn.query_row(
+        "SELECT COUNT(*) FROM reminder_batch_articles",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if has_legacy_rows == 0 {
+        return Ok(());
+    }
+
+    let mut stmt = main_conn.prepare(
+        r#"
+        SELECT
+            a.id,
+            COALESCE(sc.module, 'other') AS module,
+            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            a.fit_score,
+            CASE
+                WHEN rb.status = 'active' THEN 'waiting'
+                ELSE 'pushed'
+            END AS push_status,
+            COALESCE(rb.created_at, COALESCE(a.fetched_at, a.published_at, ?1)) AS migrated_at
+        FROM reminder_batch_articles rba
+        JOIN reminder_batches rb ON rb.id = rba.batch_id
+        JOIN articles a ON a.id = rba.article_id
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        ORDER BY migrated_at ASC, a.id ASC
+        "#,
+    )?;
+
+    let now = Utc::now().to_rfc3339();
+    let rows = stmt.query_map(params![now.clone()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (article_id, module, bucket, fit_score, push_status, migrated_at) = row?;
+        push_conn.execute(
+            r#"
+            INSERT INTO push_items (
+                article_id,
+                module,
+                bucket,
+                fit_score,
+                push_status,
+                queued_at,
+                status_updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(article_id) DO UPDATE SET
+                module = excluded.module,
+                bucket = excluded.bucket,
+                fit_score = excluded.fit_score,
+                push_status = excluded.push_status,
+                queued_at = excluded.queued_at,
+                status_updated_at = excluded.status_updated_at
+            "#,
+            params![article_id, module.clone(), bucket.clone(), fit_score, push_status, migrated_at],
+        )?;
+        trim_push_bucket(push_conn, &module, &bucket)?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn create_reminder_batch(conn: &Connection) -> Result<String> {
     let batch_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
@@ -1126,6 +1681,7 @@ pub fn create_reminder_batch(conn: &Connection) -> Result<String> {
     Ok(batch_id)
 }
 
+#[allow(dead_code)]
 pub fn attach_article_to_batch(conn: &Connection, batch_id: &str, article_id: i64) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO reminder_batch_articles (batch_id, article_id) VALUES (?1, ?2)",
@@ -1134,6 +1690,7 @@ pub fn attach_article_to_batch(conn: &Connection, batch_id: &str, article_id: i6
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn set_batch_status(
     conn: &Connection,
     batch_id: &str,
@@ -1204,6 +1761,7 @@ pub fn purge_source_history(conn: &Connection, source_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM reminder_batch_articles", [])?;
     conn.execute("DELETE FROM reminder_batches", [])?;
@@ -1227,6 +1785,33 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
 
     write_setting(conn, "selected_article_id", "null")?;
     write_setting(conn, "last_scan_at", "null")?;
+    Ok(())
+}
+
+pub fn hard_reset_all(app: &AppHandle) -> Result<()> {
+    let main_db = db_path(app)?;
+    let push_db = push_db_path(app)?;
+
+    remove_sqlite_database_files(&main_db)?;
+    remove_sqlite_database_files(&push_db)?;
+
+    Ok(())
+}
+
+fn remove_sqlite_database_files(path: &Path) -> Result<()> {
+    remove_file_if_exists(path)?;
+    let base = path.to_string_lossy().to_string();
+    remove_file_if_exists(Path::new(&format!("{base}-wal")))?;
+    remove_file_if_exists(Path::new(&format!("{base}-shm")))?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    if let Err(err) = fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err.into());
+        }
+    }
     Ok(())
 }
 
@@ -1442,6 +2027,29 @@ fn trim_content_pool(conn: &Connection, module: &str, bucket: &str) -> Result<()
         )
         "#,
         params![module, bucket],
+    )?;
+    Ok(())
+}
+
+pub fn remove_content_pool_entries(conn: &Connection, article_ids: &[i64]) -> Result<()> {
+    if article_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare_cached("DELETE FROM ranked_content_pool WHERE article_id = ?1")?;
+    for article_id in article_ids {
+        stmt.execute(params![article_id])?;
+    }
+    Ok(())
+}
+
+fn cleanup_pushed_articles_from_pool(conn: &Connection) -> Result<()> {
+    conn.execute(
+        r#"
+        DELETE FROM ranked_content_pool
+        WHERE article_id IN (SELECT DISTINCT article_id FROM reminder_batch_articles)
+        "#,
+        [],
     )?;
     Ok(())
 }
@@ -1838,7 +2446,6 @@ pub fn build_snapshot(
     last_scan_at: Option<DateTime<Utc>>,
 ) -> Result<Snapshot> {
     let settings = read_settings(conn)?;
-    let active_reminder = display_reminder_batch(conn)?;
     let due_sources = list_due_sources(conn, Utc::now(), false)?.len();
     let selected_disciplines = settings
         .disciplines
@@ -1856,21 +2463,14 @@ pub fn build_snapshot(
     let enabled_sources = list_dueable_enabled_sources_count(conn)? as usize;
 
     let selected_article_id = read_selected_article_id(conn)?;
-    let mut articles = list_articles(conn)?;
-    if let Some(sel_id) = selected_article_id {
-        if let Some(article) = articles.iter_mut().find(|a| a.id == sel_id) {
-            article.raw_content = fetch_article_raw_content(conn, sel_id)?;
-        }
-    }
-    let current_batch_id = active_reminder.as_ref().map(|b| b.id.as_str());
-    let history_articles = list_history_articles(conn, current_batch_id)?;
+    let articles = list_articles(conn)?;
 
     Ok(Snapshot {
         settings,
         pet_status,
         articles,
-        active_reminder,
-        history_articles,
+        active_reminder: None,
+        history_articles: Vec::new(),
         selected_article_id,
         active_view: read_active_view(conn)?,
         last_error,

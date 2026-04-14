@@ -246,6 +246,13 @@ pub struct Snapshot {
     pub source_summary: SourceCatalogSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySnapshot {
+    pub pet_status: PetStatus,
+    pub active_reminder: Option<ReminderBatchSnapshot>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FeedArticle {
     pub source_id: String,
