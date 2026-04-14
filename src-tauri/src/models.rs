@@ -179,6 +179,27 @@ pub struct ReminderBatchSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HistoryItem {
+    pub id: i64,
+    pub title: String,
+    pub link: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub module: String,
+    pub bucket: String,
+    pub published_at: Option<String>,
+    pub summary: String,
+    pub fit_score: i64,
+    pub fit_level: String,
+    pub recommendation_reason: String,
+    pub note: String,
+    pub is_favorite: bool,
+    pub batch_id: String,
+    pub batch_created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContentPoolStat {
     pub source_kind: SourceKind,
     pub total_articles: usize,
@@ -214,6 +235,7 @@ pub struct Snapshot {
     pub pet_status: PetStatus,
     pub articles: Vec<ArticleRecord>,
     pub active_reminder: Option<ReminderBatchSnapshot>,
+    pub history_articles: Vec<HistoryItem>,
     pub selected_article_id: Option<i64>,
     pub active_view: AppView,
     pub last_error: Option<String>,

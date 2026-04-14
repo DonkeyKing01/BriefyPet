@@ -1,221 +1,217 @@
-# Briefy-pet Ver2 PRD（规范版，V3信源结构）
+# Briefy-pet Ver2（mac 分支统一文档）
 
-## 0. 文档信息
+## 0. 文档说明
 
-- 文档版本：v2.0-rev-v3
-- 文档日期：2026-04-12
-- 文档性质：产品需求文档（PRD）
-- 适用平台：macOS（交付形态沿用 Ver1-1）
-- 关联文档：`AGENTS.md`、`Ver1-1.md`、`README.md`、`Ver2-1.md`
+- 文档版本：v2.6（合并版）
+- 更新时间：2026-04-14
+- 适用分支：mac
+- 文档性质：Ver2 全量归档 + 当前实现口径 + 验收基准
 
----
+本文件已合并并取代以下历史拆分文档：
 
-## 1. 文档定位
-
-本文档定义 Briefy-pet Ver2 的正式信源架构与数据链路，核心是：
-
-1. 以 V3 合并信源替换“分散目录认知”。
-2. 建立固定的“模块 + 子池”结构，驱动抓取、排序、提醒。
-3. 在不推翻现有技术栈（Tauri + React + Rust + SQLite）的前提下，完成可落地改造。
+1. `Ver2_original.md`
+2. `Ver2-1.md`
+3. `Ver2-4.md`
+4. `Ver2-5.md`
+5. `Ver2-check.md`
+6. `Ver2-v3-data-dependencies.md`
 
 冲突优先级：
 
-1. 交付形态/打包：以 `Ver1-1.md` 为准。
-2. 产品基础规则/状态机：以 `AGENTS.md` 为准。
-3. V3 信源结构/依赖关系：以本文档为准。
+1. 产品边界与状态机：`AGENTS.md`
+2. Ver2 结构与实施口径：本文件
+3. README（运行与打包）：`README.md`
 
 ---
 
-## 2. 背景与目标
+## 1. Ver2 演进总览
 
-当前版本已具备“抓取-评分-提醒-阅读”闭环，但信源组织仍存在问题：
-
-1. 学科结构不稳定，运营与调度口径不一致。
-2. science/medicine 在历史版本中存在“暂缓”逻辑，和当前规划不一致。
-3. 文档结构、资源文件、运行时字段之间缺少明确映射。
-
-Ver2 目标：
-
-1. 统一为 V3 信源架构（8个模块）。
-2. science/medicine 正式纳入有效体系。
-3. 明确从 OPML 到运行时字段的依赖关系。
+| 版本 | 目标 | 核心结果 |
+|---|---|---|
+| v2.0 | 建立 V3 信源结构 | 固定 8 个 module + 对应 bucket，明确 V3 为主目录 |
+| v2.1 | 完成集中对齐落地 | 取消 science/medicine 暂缓，形成可执行映射口径 |
+| v2.4 | 统一策略与前端视觉 | module/bucket 策略化调度与提醒，前端三栏阅读体验升级 |
+| v2.5 | 稳定抓取链路与门禁 | 强制配置、首爬 7 天、重启增量、并发打分与池化推送收敛 |
+| v2.6 | 完成左栏语义与去重修正 | Unread/Today/Favorites/History 语义重构，去重、时间线、CHECK 信息补全 |
 
 ---
 
-## 3. V3 信源架构（正式口径）
+## 2. V3 结构基线（固定口径）
 
-### 3.1 一级模块（Module）
+### 2.1 Module
 
-1. 科技
-2. 社科
-3. 商业
-4. 成长
-5. 新闻观点
-6. 娱乐
-7. 科学
-8. 医学
+1. `technology`
+2. `social_science`
+3. `business`
+4. `growth`
+5. `news_opinion`
+6. `entertainment`
+7. `science`
+8. `medicine`
 
-### 3.2 二级子池（Bucket）
+### 2.2 Bucket
 
-1. 科技：研究 / 官方 / 博客 / 社区 / 流媒体
-2. 社科：学术前沿 / 博客 / 社区
-3. 商业：博客 / 社区 / 流媒体
-4. 成长：博客 / 社区 / 流媒体
-5. 新闻观点：新闻 / 个人观点 / 流媒体观点 / 社区观点 / 媒体观点
-6. 娱乐：轻量高质量单层池
-7. 科学：物理 / 化学 / 生物
-8. 医学：学术前沿 / 博客 / 社区
+1. `technology`: `research` / `official` / `blogs` / `community` / `streaming`
+2. `social_science`: `academic_frontier` / `blogs` / `community`
+3. `business`: `blogs` / `community` / `streaming`
+4. `growth`: `blogs` / `community` / `streaming`
+5. `news_opinion`: `news` / `personal_opinion` / `streaming_opinion` / `community_opinion` / `media_opinion`
+6. `entertainment`: `lite_pool`
+7. `science`: `physics` / `chemistry` / `biology`
+8. `medicine`: `academic_frontier` / `blogs` / `community`
 
-### 3.3 关键约束
+### 2.3 资源文件基线
 
-1. science 按学科分池（物理/化学/生物），不按博客/学术/社区拆分。
-2. medicine 按学术前沿/博客/社区拆分。
-3. 所有信源必须归属一个 module 与一个 bucket，不允许空值。
-
----
-
-## 4. 范围定义
-
-### 4.1 本期纳入
-
-1. 合并 `rss_catalog_v2_1_unified.opml` 与 `verified_science_medicine_rss.opml`，产出 V3 主信源。
-2. 根据 V3 架构调整 Ver2 / Ver2-1 文档口径。
-3. 明确 PRD、资源、运行时模型的字段依赖关系。
-4. 保持提醒交互语义不变（立即查看 / 稍后30分钟 / 忽略本次）。
-
-### 4.2 本期不纳入
-
-1. App Store 上架流程（签名、公证、沙盒）。
-2. 云端账号与多端同步。
-3. 用户自定义新增 RSS 源入口。
+1. 主目录：`src-tauri/resources/rss_catalog_v3_unified.opml`
+2. 历史输入：`src-tauri/resources/rss_catalog_v2_1_unified.opml`
+3. science/medicine 输入：`src-tauri/resources/verified_science_medicine_rss.opml`
 
 ---
 
-## 5. 详细需求（FRD）
+## 3. 数据依赖与运行时映射
 
-### FR-01 信源整合与去重
-
-1. 输入：
-   - `src-tauri/resources/rss_catalog_v2_1_unified.opml`
-   - `src-tauri/resources/verified_science_medicine_rss.opml`
-2. 输出：
-   - `src-tauri/resources/rss_catalog_v3_unified.opml`
-3. 去重键：`normalized_url`（小写、去协议、去 fragment、去末尾斜杠、保留 query）。
-4. 去重后保留来源追踪（origin）。
-
-### FR-02 分类结构执行
-
-1. V3 OPML 必须完整体现 8 个模块与对应子池。
-2. 娱乐必须是单层池（不再使用“精选信源”二级组）。
-3. science/medicine 必须作为有效模块纳入目录。
-
-### FR-03 运行时兼容映射
-
-在不重构现有 `SourceKind`（四类）前提下，V3 子池映射到运行时调度分区：
-
-1. 学术相关：`research` / `academic_frontier` / `physics` / `chemistry` / `biology` -> `academic-journal`
-2. 官方相关：`official` -> `official-announcement`
-3. 博客相关：`blogs` -> `technical-blog`
-4. 社区与流媒体相关：`community` / `streaming` / `*_opinion` / `lite_pool` -> `community-hotspot`
-
-### FR-04 调度与分区
-
-1. 调度频率保持：
-   - `academic-journal`: 72h
-   - `official-announcement`: 6h
-   - `technical-blog`: 3h
-   - `community-hotspot`: 3h
-2. 每分区池上限 1000 条，超限淘汰低分尾部。
-3. 默认每分区 Top3 汇总提醒。
-
-### FR-05 个性化与记忆
-
-1. 用户首次配置需完成 API Key + 至少1个模块偏好。
-2. 每日记忆维持：生成、可编辑、可关闭。
-3. 评分输入包含：模块偏好 + 子池上下文 + 最新确认记忆。
-
----
-
-## 6. 数据模型与依赖关系
-
-### 6.1 标准字段（目录层）
+### 3.1 目录层标准字段
 
 1. `source_id`
 2. `name`
 3. `rss_url`
-4. `module`（V3一级模块）
-5. `bucket`（V3二级子池）
-6. `source_kind`（运行时调度兼容字段）
+4. `module`
+5. `bucket`
+6. `source_kind`
 7. `resource_type`
 8. `language`
 9. `enabled_by_default`
 10. `origin_files`
 
-### 6.2 数据依赖链
+### 3.2 `bucket -> source_kind` 映射（兼容当前调度器）
 
-1. `reference/*` + v2.1 OPML + science/medicine OPML
-2. -> `rss_catalog_v3_unified.opml`（人工可读/运营主目录）
-3. -> 运行时标准化目录（JSON，可由构建脚本生成）
-4. -> `source_catalog` / `user_source_pool` / `source_fetch_state` / `ranked_content_pool`
+1. 学术类：`research` / `academic_frontier` / `physics` / `chemistry` / `biology` -> `academic-journal`
+2. 官方类：`official` -> `official-announcement`
+3. 博客类：`blogs` -> `technical-blog`
+4. 社区与观点类：`community` / `streaming` / `*_opinion` / `lite_pool` -> `community-hotspot`
 
-### 6.3 与当前代码结构的对齐点
+### 3.3 关键代码锚点
 
-1. 调度维度仍依赖 `SourceKind` 四分区（`src-tauri/src/models.rs` + `src-tauri/src/db.rs`）。
-2. V3 的 `module/bucket` 是运营结构，`source_kind` 是调度结构，二者并存。
-3. `service.rs` 的 TopN 逻辑无需因 V3 结构重写。
-
----
-
-## 7. 资源文件规范
-
-### 7.1 本期主文件
-
-1. `src-tauri/resources/rss_catalog_v3_unified.opml`（V3 主信源）
-2. `src-tauri/resources/rss_catalog_v2_1_unified.opml`（历史基线，保留）
-3. `src-tauri/resources/verified_science_medicine_rss.opml`（science/medicine 输入）
-
-### 7.2 建议配套产物
-
-1. `src-tauri/resources/rss-catalog-v3.json`（运行时目录）
-2. `src-tauri/resources/rss-dedup-report-v3.md`（去重报告）
+1. 模型与快照：`src-tauri/src/models.rs`
+2. 目录/状态/池化：`src-tauri/src/db.rs`
+3. 调度与推送：`src-tauri/src/service.rs`
+4. 抓取策略：`src-tauri/src/rss.rs`
+5. 前端主窗口：`src/App.tsx`
 
 ---
 
-## 8. 验收标准
+## 4. 抓取、打分、推送（当前实现口径）
 
-### A. 结构验收
+### 4.1 抓取
 
-1. V3 OPML 包含 8 个模块。
-2. 各模块子池结构与本 PRD 完全一致。
-3. science = 物理/化学/生物，medicine = 学术前沿/博客/社区。
+1. 调度入口：`service::ensure_scheduler` 周期触发。
+2. 抓取模型：并发抓取 + 失败重试 + 可重试错误二次回补。
+3. 首次配置后：自动触发首爬，按每源最近 7 天纳入存量。
+4. 重启后：触发强制增量，不等待常规间隔门槛。
 
-### B. 数据验收
+### 4.2 打分
 
-1. 总源数量、去重数量可追踪。
-2. 每条源都有 module + bucket + source_kind 映射。
-3. origin 可回溯到输入文件。
+1. 对未打分文章批量并发评分（并发上限 20）。
+2. prompt 引入 module/bucket 上下文。
+3. 服务端按阈值校准 `fit_level`，避免模型直接漂移。
 
-### C. 功能验收
+### 4.3 推送与沉淀池
 
-1. 现有抓取、评分、提醒链路不回退。
-2. 分区调度频率和 TopN 行为不回退。
-3. memory 模式行为不回退。
+1. 推送按 module/bucket 分组配额选取。
+2. 单批提醒总上限 12。
+3. 沉淀池按 module/bucket 各保留 Top 1000，超限淘汰低分尾部。
 
 ---
 
-## 9. 里程碑建议
+## 5. 前端实现（v2.6 完成项）
 
-### M1：结构落地
+本节覆盖 2026-04-14 最新前端结构修正与信息补全。
 
-1. 产出 V3 OPML。
-2. 完成 Ver2 / Ver2-1 文档结构统一。
+### 5.1 左栏结构与语义
 
-### M2：运行时映射
+左栏固定顺序：
 
-1. 产出 V3 JSON（若启用）。
-2. 校验 source_kind 分区映射与调度频率。
+1. `Unread`
+2. `Today`
+3. `Favorites`
+4. `History`
 
-### M3：回归与发布
+语义定义：
 
-1. 验证抓取、评分、提醒、记忆全链路。
-2. 验证 macOS 打包不回退。
+1. `Unread`：当前推送批次中尚未归档内容。
+2. `Today`：Unread 归档后、属于当天推送的聚合内容。
+3. `Favorites`：收藏或有笔记（评论）的内容。
+4. `History`：除 Today 外的历史推送沉淀内容。
+
+### 5.2 交互规则
+
+1. 在 `Unread` 内点击同一条：
+   - 第一次：选中提示。
+   - 第二次：归档到 `Today`。
+2. 可手动“标记未读”回流 `Unread`。
+
+### 5.3 分类与时间线
+
+1. `Today` / `Favorites` / `History` 统一按 `Module/Bucket` 树分类。
+2. 中栏时间线按时间倒序。
+3. 每条展示完整时间信息与缩写字段。
+
+### 5.4 右栏 CHECK 信息
+
+新增 CHECK 信息块：
+
+1. `MOD`
+2. `BKT`
+3. `SRC`
+4. `PUB`
+5. `PUSH`
+6. `FIT`
+7. `FAV`
+8. `NOTE`
+
+### 5.5 去重保障
+
+1. 文章层去重：`id + 指纹`。
+2. 历史层去重：按批次时间优先并去重。
+3. 目标：同帖不在同视图重复出现。
+
+---
+
+## 6. Ver2-check 要求对照（状态）
+
+### 6.1 已落实
+
+1. 保留 `mac` 分支进行持续交付。
+2. 支持一套源码双平台打包脚本：
+   - `scripts/build-macos-debug-sandbox-dmg.sh`
+   - `scripts/build-macos-release-dmg.sh`
+   - `scripts/build-windows-release-bundle.sh`
+3. 抓取链路已收敛为“并发 + 重试 + 打分 + 池化推送”。
+
+### 6.2 持续项
+
+1. 多模型 provider 扩展（DeepSeek/GLM/Kimi/OpenAI/硅基流动）仍按后续迭代推进。
+2. 用户自加 RSS 与完整重置交互继续按后续版本推进。
+
+---
+
+## 7. 验证基准
+
+### 7.1 构建与测试
+
+1. 前端构建：`npm run build`
+2. Rust 测试：`cd src-tauri && cargo test`
+3. mac 调试包：`npm run tauri:build:debug:sandbox-dmg`
+
+### 7.2 交付产物
+
+1. `.app`：`src-tauri/target/debug/bundle/macos/Briefy-pet.app`
+2. `.dmg`：`src-tauri/target/debug/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg`
+
+---
+
+## 8. 文档维护规则
+
+1. 后续 Ver2 迭代不再新增 `Ver2-*.md` 分散文件。
+2. 所有新增内容直接更新本文件，按版本新增小节。
+3. 文档更新必须标注日期、目标、改动点、验证项。

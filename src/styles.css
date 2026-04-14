@@ -706,6 +706,7 @@ a {
 }
 
 .timeline-card.selected .timeline-meta,
+.timeline-card.selected .timeline-submeta,
 .timeline-card.selected .timeline-snippet {
   color: rgba(244, 249, 255, 0.9);
 }
@@ -745,6 +746,13 @@ a {
   margin: 0;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.timeline-submeta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  opacity: 0.9;
 }
 
 .timeline-snippet {
@@ -856,6 +864,30 @@ a {
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-muted);
+}
+
+.reader-check-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.reader-check-grid p {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-soft);
+}
+
+.reader-check-grid strong {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
 }
 
 .reader-block a {
@@ -1225,6 +1257,10 @@ a {
   .reader-content {
     font-size: 17px;
     line-height: 1.65;
+  }
+
+  .reader-check-grid {
+    grid-template-columns: 1fr;
   }
 
   .reader-header h2 {

@@ -116,6 +116,25 @@ export type ReminderBatch = {
   partitionCount: number;
 };
 
+export type HistoryItem = {
+  id: number;
+  title: string;
+  link: string;
+  sourceId: string;
+  sourceName: string;
+  module: string;
+  bucket: string;
+  publishedAt: string | null;
+  summary: string;
+  fitScore: number;
+  fitLevel: FitLevel;
+  recommendationReason: string;
+  note: string;
+  isFavorite: boolean;
+  batchId: string;
+  batchCreatedAt: string;
+};
+
 export type ContentPoolStat = {
   sourceKind: SourceKind;
   totalArticles: number;
@@ -145,6 +164,7 @@ export type Snapshot = {
   petStatus: PetStatus;
   articles: Article[];
   activeReminder: ReminderBatch | null;
+  historyArticles: HistoryItem[];
   selectedArticleId: number | null;
   activeView: AppView;
   lastError: string | null;

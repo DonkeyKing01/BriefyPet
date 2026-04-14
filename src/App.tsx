@@ -17,6 +17,7 @@ import type {
   Article,
   Discipline,
   FitLevel,
+  HistoryItem,
   LlmProvider,
   RssSource,
   SettingsPayload,
@@ -373,12 +374,18 @@ const DEMO_ARTICLES: Article[] = [
   }
 ];
 
-type SmartFeedKey = "today" | "unread";
+type FeedSection = "today" | "favorites" | "history";
 
 type FeedSelection =
-  | { kind: "smart"; key: SmartFeedKey }
-  | { kind: "bucket"; module: SourceModule; bucket: SourceBucket }
-  | { kind: "favorite" };
+  | { kind: "unread" }
+  | { kind: "bucket"; section: FeedSection; module: string; bucket: string };
+
+type ArticleMeta = {
+  module: string;
+  bucket: string;
+  sourceName: string;
+  pushedAt: string | null;
+};
 
 type ResizeTarget = "sidebar" | "timeline";
 
@@ -492,12 +499,170 @@ function fitLabel(level: FitLevel) {
   return "低";
 }
 
-function articleTimestamp(article: Article) {
-  const raw = article.publishedAt ?? article.fetchedAt;
-  if (!raw) {
+function toSafeTimestamp(value: string | null | undefined) {
+  if (!value) {
     return 0;
   }
-  return new Date(raw).getTime();
+
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function isSameCalendarDay(anchor: Date, value: string | null | undefined) {
+  if (!value) {
+    return false;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  return (
+    date.getFullYear() === anchor.getFullYear() &&
+    date.getMonth() === anchor.getMonth() &&
+    date.getDate() === anchor.getDate()
+  );
+}
+
+function compareWithPresetOrder(left: string, right: string, order: readonly string[]) {
+  const leftIndex = order.indexOf(left);
+  const rightIndex = order.indexOf(right);
+  const leftRank = leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex;
+  const rightRank = rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex;
+
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  return left.localeCompare(right);
+}
+
+function orderedTreeEntries(tree: Map<string, Map<string, number>>) {
+  return [...tree.keys()]
+    .sort((left, right) => compareWithPresetOrder(left, right, MODULE_ORDER))
+    .map((module) => {
+      const buckets = [...(tree.get(module)?.entries() ?? [])].sort(([left], [right]) =>
+        compareWithPresetOrder(left, right, BUCKET_ORDER)
+      );
+      return { module, buckets };
+    });
+}
+
+function articleFingerprint(article: Article) {
+  return [
+    article.sourceId,
+    article.link.trim().toLowerCase(),
+    article.title.trim().toLowerCase(),
+    article.publishedAt ?? "",
+    article.fetchedAt ?? ""
+  ].join("|");
+}
+
+function dedupeArticles(items: Article[]) {
+  const seenIds = new Set<number>();
+  const seenFingerprints = new Set<string>();
+  const result: Article[] = [];
+
+  for (const item of items) {
+    const fingerprint = articleFingerprint(item);
+    if (seenIds.has(item.id) || seenFingerprints.has(fingerprint)) {
+      continue;
+    }
+
+    seenIds.add(item.id);
+    seenFingerprints.add(fingerprint);
+    result.push(item);
+  }
+
+  return result;
+}
+
+function dedupeHistoryItems(items: HistoryItem[]) {
+  const sorted = [...items].sort(
+    (left, right) => toSafeTimestamp(right.batchCreatedAt) - toSafeTimestamp(left.batchCreatedAt)
+  );
+  const seenIds = new Set<number>();
+  const seenFingerprints = new Set<string>();
+  const result: HistoryItem[] = [];
+
+  for (const item of sorted) {
+    const fingerprint = [
+      item.sourceId,
+      item.link.trim().toLowerCase(),
+      item.title.trim().toLowerCase(),
+      item.publishedAt ?? ""
+    ].join("|");
+    if (seenIds.has(item.id) || seenFingerprints.has(fingerprint)) {
+      continue;
+    }
+
+    seenIds.add(item.id);
+    seenFingerprints.add(fingerprint);
+    result.push(item);
+  }
+
+  return result;
+}
+
+function articleTimestamp(article: Article, fallbackTime?: string | null) {
+  return toSafeTimestamp(article.publishedAt ?? article.fetchedAt ?? fallbackTime ?? null);
+}
+
+function historyItemToArticle(item: HistoryItem): Article {
+  return {
+    id: item.id,
+    sourceId: item.sourceId,
+    title: item.title,
+    link: item.link,
+    sourceName: item.sourceName,
+    discipline: "other",
+    sourceKind: "technical-blog",
+    resourceType: "article",
+    publishedAt: item.publishedAt,
+    fetchedAt: item.batchCreatedAt,
+    summary: item.summary,
+    fitLevel: item.fitLevel,
+    fitScore: item.fitScore,
+    recommendationReason: item.recommendationReason,
+    rawContent: "",
+    note: item.note,
+    isFavorite: item.isFavorite,
+    isNew: false
+  };
+}
+
+function resolveArticleMeta(
+  article: Article,
+  sourceById: Map<string, RssSource>,
+  historyByArticleId: Map<number, HistoryItem>
+): ArticleMeta {
+  const source = sourceById.get(article.sourceId);
+  if (source) {
+    return {
+      module: source.module,
+      bucket: source.bucket,
+      sourceName: source.name,
+      pushedAt: historyByArticleId.get(article.id)?.batchCreatedAt ?? null
+    };
+  }
+
+  const history = historyByArticleId.get(article.id);
+  if (history) {
+    return {
+      module: history.module || "other",
+      bucket: history.bucket || "unspecified",
+      sourceName: history.sourceName,
+      pushedAt: history.batchCreatedAt ?? null
+    };
+  }
+
+  return {
+    module: "other",
+    bucket: "unspecified",
+    sourceName: article.sourceName,
+    pushedAt: null
+  };
 }
 
 function sortDisciplinePrefs(items: UserDisciplinePreference[]) {
@@ -1000,12 +1165,12 @@ function SettingsView({
         </div>
         <div className="source-groups">
           {sortedModules.map((module) => (
-            <details key={module} className="source-discipline-block" open>
+            <details key={module} className="source-discipline-block">
               <summary className="source-discipline-head">
                 <h3>{MODULE_LABELS[module]}</h3>
               </summary>
               {Array.from(groupedSources.get(module)!.entries()).map(([bucket, sources]) => (
-                <details key={`${module}-${bucket}`} className="source-kind-block" open>
+                <details key={`${module}-${bucket}`} className="source-kind-block">
                   <summary className="source-kind-head">
                     <strong>{BUCKET_LABELS[bucket]}</strong>
                     <span>
@@ -1131,10 +1296,17 @@ function MainWindow({
   loading: boolean;
   error: string | null;
 }) {
-  const [selection, setSelection] = useState<FeedSelection>({ kind: "smart", key: "unread" });
+  const [selection, setSelection] = useState<FeedSelection>({ kind: "unread" });
+  // collapsedFolders: key = "section:module" e.g. "today:technology"
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
-  const [favoritesCollapsed, setFavoritesCollapsed] = useState(false);
+  // section-level collapse: "today" | "favorites" | "history"
+  const [sectionCollapsed, setSectionCollapsed] = useState<Record<FeedSection, boolean>>({
+    today: false,
+    favorites: false,
+    history: true
+  });
   const [manualUnreadIds, setManualUnreadIds] = useState<number[]>([]);
+  const [archivedUnreadAt, setArchivedUnreadAt] = useState<Record<number, string>>({});
   const [unreadClickCounts, setUnreadClickCounts] = useState<Record<number, number>>({});
   const [demoFavoriteIds, setDemoFavoriteIds] = useState<number[]>(
     DEMO_ARTICLES.filter((item) => item.isFavorite).map((item) => item.id)
@@ -1202,185 +1374,261 @@ function MainWindow({
     [activeSources]
   );
 
-  const baseArticles = useMemo(() => {
-    const all = usingDemoData ? DEMO_ARTICLES : snapshot?.articles ?? [];
+  const manualUnreadSet = useMemo(() => new Set(manualUnreadIds), [manualUnreadIds]);
+  const archivedUnreadSet = useMemo(
+    () => new Set(Object.keys(archivedUnreadAt).map((id) => Number(id))),
+    [archivedUnreadAt]
+  );
 
+  const reminderArticleIds = useMemo(
+    () => new Set<number>(snapshot?.activeReminder?.articleIds ?? []),
+    [snapshot?.activeReminder]
+  );
+
+  const allArticles = useMemo(() => {
+    const all = snapshot?.articles ?? [];
     if (!hasInterestedDiscipline) {
       return [];
     }
 
-    return all.filter((article) => {
-      if (activeSourceIds.has(article.sourceId)) {
-        return true;
-      }
-      return interestedDisciplines.has(article.discipline);
-    });
-  }, [snapshot?.articles, usingDemoData, hasInterestedDiscipline, activeSourceIds, interestedDisciplines]);
+    return dedupeArticles(
+      all.filter((a) => activeSourceIds.has(a.sourceId) || interestedDisciplines.has(a.discipline))
+    );
+  }, [snapshot?.articles, hasInterestedDiscipline, activeSourceIds, interestedDisciplines]);
 
-  const articles = useMemo(() => {
-    if (!usingDemoData) {
-      return baseArticles;
-    }
-    const favoriteSet = new Set(demoFavoriteIds);
-    return baseArticles.map((item) => ({
-      ...item,
-      isFavorite: favoriteSet.has(item.id)
-    }));
-  }, [baseArticles, demoFavoriteIds, usingDemoData]);
+  const articleById = useMemo(() => new Map(allArticles.map((article) => [article.id, article])), [allArticles]);
 
-  const manualUnreadSet = useMemo(() => new Set(manualUnreadIds), [manualUnreadIds]);
+  const historyItems = useMemo(
+    () => dedupeHistoryItems(snapshot?.historyArticles ?? []),
+    [snapshot?.historyArticles]
+  );
 
-  const isArticleUnread = (article: Article) => article.isNew || manualUnreadSet.has(article.id);
-
-  const sourceTree = useMemo(() => {
-    const sourceMap = new Map(activeSources.map((source) => [source.id, source]));
-    const grouped = new Map<SourceModule, Map<SourceBucket, { total: number; unread: number }>>();
-
-    for (const source of activeSources) {
-      if (!grouped.has(source.module)) {
-        grouped.set(source.module, new Map());
-      }
-      const bucketGroup = grouped.get(source.module)!;
-      if (!bucketGroup.has(source.bucket)) {
-        bucketGroup.set(source.bucket, { total: 0, unread: 0 });
+  const historyByArticleId = useMemo(() => {
+    const map = new Map<number, HistoryItem>();
+    for (const item of historyItems) {
+      const previous = map.get(item.id);
+      if (!previous || toSafeTimestamp(item.batchCreatedAt) > toSafeTimestamp(previous.batchCreatedAt)) {
+        map.set(item.id, item);
       }
     }
+    return map;
+  }, [historyItems]);
 
-    for (const article of articles) {
-      const source = sourceMap.get(article.sourceId);
-      if (!source) {
-        continue;
-      }
+  const articleMetaById = useMemo(() => {
+    const map = new Map<number, ArticleMeta>();
 
-      if (!grouped.has(source.module)) {
-        grouped.set(source.module, new Map());
-      }
-      const bucketGroup = grouped.get(source.module)!;
-      if (!bucketGroup.has(source.bucket)) {
-        bucketGroup.set(source.bucket, { total: 0, unread: 0 });
-      }
-      const stats = bucketGroup.get(source.bucket)!;
-      stats.total += 1;
-      if (isArticleUnread(article)) {
-        stats.unread += 1;
-      }
+    for (const article of allArticles) {
+      map.set(article.id, resolveArticleMeta(article, sourceById, historyByArticleId));
     }
 
-    const sorted = new Map<SourceModule, Map<SourceBucket, { total: number; unread: number }>>();
-    for (const module of MODULE_ORDER) {
-      const bucketGroup = grouped.get(module);
-      if (!bucketGroup || bucketGroup.size === 0) {
-        continue;
-      }
-      const sortedBuckets = new Map<SourceBucket, { total: number; unread: number }>();
-      for (const bucket of BUCKET_ORDER) {
-        const stats = bucketGroup.get(bucket);
-        if (stats) {
-          sortedBuckets.set(bucket, stats);
-        }
-      }
-      if (sortedBuckets.size > 0) {
-        sorted.set(module, sortedBuckets);
-      }
-    }
-
-    return sorted;
-  }, [activeSources, articles, manualUnreadSet]);
-
-  const favoriteArticles = useMemo(() => {
-    return articles
-      .filter((article) => article.isFavorite)
-      .sort((left, right) => articleTimestamp(right) - articleTimestamp(left));
-  }, [articles]);
-
-  const smartCounts = useMemo(() => {
-    const now = new Date();
-    let today = 0;
-    let unread = 0;
-
-    for (const article of articles) {
-      const date = new Date(article.publishedAt ?? article.fetchedAt ?? 0);
-      if (
-        date.getFullYear() === now.getFullYear() &&
-        date.getMonth() === now.getMonth() &&
-        date.getDate() === now.getDate()
-      ) {
-        today += 1;
-      }
-      if (isArticleUnread(article)) {
-        unread += 1;
-      }
-    }
-
-    return { today, unread };
-  }, [articles, manualUnreadSet]);
-
-  const timelineArticles = useMemo(() => {
-    let result = [...articles];
-
-    if (selection.kind === "smart") {
-      if (selection.key === "today") {
-        const now = new Date();
-        result = result.filter((article) => {
-          const date = new Date(article.publishedAt ?? article.fetchedAt ?? 0);
-          return (
-            date.getFullYear() === now.getFullYear() &&
-            date.getMonth() === now.getMonth() &&
-            date.getDate() === now.getDate()
-          );
-        });
-      }
-      if (selection.key === "unread") {
-        result = result.filter((article) => isArticleUnread(article));
-      }
-    }
-
-    if (selection.kind === "bucket") {
-      result = result.filter((article) => {
-        const source = sourceById.get(article.sourceId);
-        return (
-          source?.module === selection.module && source?.bucket === selection.bucket
-        );
+    for (const item of historyItems) {
+      map.set(item.id, {
+        module: item.module || "other",
+        bucket: item.bucket || "unspecified",
+        sourceName: item.sourceName,
+        pushedAt: item.batchCreatedAt ?? null
       });
     }
 
-    if (selection.kind === "favorite") {
-      result = result.filter((article) => article.isFavorite);
+    return map;
+  }, [allArticles, sourceById, historyByArticleId, historyItems]);
+
+  const reminderArticles = useMemo(
+    () => dedupeArticles(allArticles.filter((article) => reminderArticleIds.has(article.id))),
+    [allArticles, reminderArticleIds]
+  );
+
+  const unreadArticles = useMemo(() => {
+    const unread = reminderArticles.filter(
+      (article) =>
+        !archivedUnreadSet.has(article.id) &&
+        ((reminderArticleIds.has(article.id) && article.isNew) || manualUnreadSet.has(article.id))
+    );
+    return dedupeArticles(unread);
+  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet]);
+
+  const unreadIdSet = useMemo(() => new Set(unreadArticles.map((article) => article.id)), [unreadArticles]);
+
+  const todayFromHistory = useMemo(() => {
+    const now = new Date();
+    return historyItems
+      .filter((item) => isSameCalendarDay(now, item.batchCreatedAt))
+      .map((item) => articleById.get(item.id) ?? historyItemToArticle(item));
+  }, [historyItems, articleById]);
+
+  const todayFromArchivedUnread = useMemo(() => {
+    const now = new Date();
+    const merged: Article[] = [];
+
+    for (const [idText, archivedAt] of Object.entries(archivedUnreadAt)) {
+      if (!isSameCalendarDay(now, archivedAt)) {
+        continue;
+      }
+
+      const article = articleById.get(Number(idText));
+      if (article) {
+        merged.push(article);
+      }
     }
 
-    result.sort((left, right) => {
-      const unreadDiff = Number(isArticleUnread(right)) - Number(isArticleUnread(left));
-      if (unreadDiff !== 0) {
-        return unreadDiff;
-      }
-      return articleTimestamp(right) - articleTimestamp(left);
-    });
+    return merged;
+  }, [archivedUnreadAt, articleById]);
 
-    return result;
-  }, [articles, selection, manualUnreadSet, sourceById]);
+  const todayArticles = useMemo(() => {
+    const merged = dedupeArticles([...todayFromHistory, ...todayFromArchivedUnread]);
+    return merged.filter((article) => !unreadIdSet.has(article.id));
+  }, [todayFromHistory, todayFromArchivedUnread, unreadIdSet]);
+
+  const historyArticles = useMemo(() => {
+    const now = new Date();
+    return dedupeArticles(
+      historyItems
+        .filter((item) => !isSameCalendarDay(now, item.batchCreatedAt))
+        .map((item) => articleById.get(item.id) ?? historyItemToArticle(item))
+    );
+  }, [historyItems, articleById]);
+
+  const favoritePool = useMemo(
+    () =>
+      dedupeArticles([
+        ...allArticles,
+        ...historyItems.map((item) => articleById.get(item.id) ?? historyItemToArticle(item))
+      ]),
+    [allArticles, historyItems, articleById]
+  );
+
+  const favoriteArticles = useMemo(() => {
+    return dedupeArticles(
+      favoritePool.filter((article) => {
+        if (usingDemoData) {
+          return demoFavoriteIds.includes(article.id);
+        }
+
+        const hasNote = (article.note ?? "").trim().length > 0;
+        return article.isFavorite || hasNote;
+      })
+    );
+  }, [favoritePool, usingDemoData, demoFavoriteIds]);
+
+  const buildArticleTree = (arts: Article[]) => {
+    const tree = new Map<string, Map<string, number>>();
+
+    for (const article of arts) {
+      const meta = articleMetaById.get(article.id);
+      if (!meta) {
+        continue;
+      }
+
+      const module = meta.module || "other";
+      const bucket = meta.bucket || "unspecified";
+      if (!tree.has(module)) {
+        tree.set(module, new Map());
+      }
+
+      const buckets = tree.get(module)!;
+      buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+    }
+
+    return tree;
+  };
+
+  const todayTree = useMemo(() => buildArticleTree(todayArticles), [todayArticles, articleMetaById]);
+  const favoritesTree = useMemo(
+    () => buildArticleTree(favoriteArticles),
+    [favoriteArticles, articleMetaById]
+  );
+  const historyTree = useMemo(() => buildArticleTree(historyArticles), [historyArticles, articleMetaById]);
+
+  const todayTreeEntries = useMemo(() => orderedTreeEntries(todayTree), [todayTree]);
+  const favoritesTreeEntries = useMemo(() => orderedTreeEntries(favoritesTree), [favoritesTree]);
+  const historyTreeEntries = useMemo(() => orderedTreeEntries(historyTree), [historyTree]);
+
+  const sectionCounts = useMemo(
+    () => ({
+      unread: unreadArticles.length,
+      today: todayArticles.length,
+      favorites: favoriteArticles.length,
+      history: historyArticles.length
+    }),
+    [unreadArticles, todayArticles, favoriteArticles, historyArticles]
+  );
+
+  const timelineArticles = useMemo((): Article[] => {
+    const matchByBucket = (article: Article, module: string, bucket: string) => {
+      const meta = articleMetaById.get(article.id);
+      return meta?.module === module && meta?.bucket === bucket;
+    };
+
+    if (selection.kind === "unread") {
+      return [...unreadArticles].sort(
+        (left, right) =>
+          articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+          articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+      );
+    }
+
+    const { section, module, bucket } = selection;
+    if (section === "today") {
+      return todayArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
+    }
+
+    if (section === "favorites") {
+      return favoriteArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
+    }
+
+    if (section === "history") {
+      return historyArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
+    }
+
+    return [];
+  }, [selection, unreadArticles, todayArticles, favoriteArticles, historyArticles, articleMetaById]);
+
+  const allKnownArticles = useMemo(
+    () => dedupeArticles([...allArticles, ...todayArticles, ...favoriteArticles, ...historyArticles]),
+    [allArticles, todayArticles, favoriteArticles, historyArticles]
+  );
 
   const selectedArticle = useMemo(() => {
     const preferredId = localSelectedId ?? snapshot?.selectedArticleId ?? null;
     if (preferredId) {
-      const found = timelineArticles.find((item) => item.id === preferredId);
-      if (found) {
-        return found;
+      const inTimeline = timelineArticles.find((item) => item.id === preferredId);
+      if (inTimeline) {
+        return inTimeline;
+      }
+
+      const inAll = allKnownArticles.find((article) => article.id === preferredId);
+      if (inAll) {
+        return inAll;
       }
     }
-    return timelineArticles[0] ?? null;
-  }, [timelineArticles, usingDemoData, localSelectedId, snapshot?.selectedArticleId]);
 
-  useEffect(() => {
-    if (!selection || selection.kind !== "bucket") {
-      return;
+    return timelineArticles[0] ?? null;
+  }, [timelineArticles, allKnownArticles, localSelectedId, snapshot?.selectedArticleId]);
+
+  const selectedArticleMeta = useMemo(() => {
+    if (!selectedArticle) {
+      return null;
     }
-    const exists = activeSources.some(
-      (source) => source.module === selection.module && source.bucket === selection.bucket
-    );
-    if (!exists) {
-      setSelection({ kind: "smart", key: "unread" });
-    }
-  }, [activeSources, selection]);
+    return articleMetaById.get(selectedArticle.id) ?? null;
+  }, [selectedArticle, articleMetaById]);
 
   useEffect(() => {
     if (!snapshot || isConfigurationComplete || snapshot.activeView === "settings") {
@@ -1492,18 +1740,21 @@ function MainWindow({
     articleId: number,
     options?: { fromUnreadSelection?: boolean }
   ) {
-    const unreadSelection =
-      options?.fromUnreadSelection ??
-      (selection.kind === "smart" && selection.key === "unread");
+    const unreadSelection = options?.fromUnreadSelection ?? selection.kind === "unread";
     setLocalSelectedId(articleId);
 
     if (unreadSelection) {
       const clicked = unreadClickCounts[articleId] ?? 0;
       if (clicked < 1) {
         setUnreadClickCounts({ [articleId]: clicked + 1 });
-        setInteractionMessage("再次点击将归档该 Unread 内容");
+        setInteractionMessage("再次点击将归档到 Today");
         return;
       }
+
+      setArchivedUnreadAt((prev) => ({
+        ...prev,
+        [articleId]: new Date().toISOString()
+      }));
     }
 
     setUnreadClickCounts({});
@@ -1572,6 +1823,18 @@ function MainWindow({
     if (!selectedArticle) {
       return;
     }
+
+    setSelection({ kind: "unread" });
+    setArchivedUnreadAt((prev) => {
+      if (!(selectedArticle.id in prev)) {
+        return prev;
+      }
+
+      const next = { ...prev };
+      delete next[selectedArticle.id];
+      return next;
+    });
+
     setManualUnreadIds((prev) => {
       if (prev.includes(selectedArticle.id)) {
         return prev;
@@ -1602,19 +1865,26 @@ function MainWindow({
   }
 
   const selectedFeedLabel = useMemo(() => {
-    if (selection.kind === "smart") {
-      if (selection.key === "today") {
-        return "Today";
-      }
-      return "Unread";
-    }
-
-    if (selection.kind === "favorite") {
-      return "Favorites";
-    }
-
-    return `${MODULE_LABELS[selection.module]} / ${BUCKET_LABELS[selection.bucket]}`;
+    if (selection.kind === "unread") return "Unread";
+    const sectionLabel = { today: "Today", favorites: "Favorites", history: "History" }[selection.section];
+    const modLabel = MODULE_LABELS[selection.module as SourceModule] ?? selection.module;
+    const bktLabel = BUCKET_LABELS[selection.bucket as SourceBucket] ?? selection.bucket;
+    return `${sectionLabel} · ${modLabel} / ${bktLabel}`;
   }, [selection]);
+
+  const selectedModuleLabel = selectedArticleMeta
+    ? MODULE_LABELS[selectedArticleMeta.module as SourceModule] ?? selectedArticleMeta.module
+    : "未分类";
+  const selectedBucketLabel = selectedArticleMeta
+    ? BUCKET_LABELS[selectedArticleMeta.bucket as SourceBucket] ?? selectedArticleMeta.bucket
+    : "未分类";
+  const selectedSourceLabel = selectedArticleMeta?.sourceName ?? selectedArticle?.sourceName ?? "未知来源";
+  const selectedPublishedTime = selectedArticle
+    ? formatArticleTime(selectedArticle.publishedAt ?? selectedArticle.fetchedAt)
+    : "未知";
+  const selectedPushedTime = selectedArticleMeta?.pushedAt
+    ? formatArticleTime(selectedArticleMeta.pushedAt)
+    : "未记录";
 
   const layoutStyle = useMemo(() => {
     const sidebarWidth = sidebarCollapsed ? 0 : leftWidth;
@@ -1716,141 +1986,264 @@ function MainWindow({
               <div className="pane-head">Feeds</div>
 
               <div className="sidebar-scroll">
+
+                {/* ── Unread ─────────────────────────────── */}
                 <section className="smart-section">
-                  <h2>Smart</h2>
-
                   <button
-                    className={`feed-row ${selection.kind === "smart" && selection.key === "today" ? "active" : ""}`}
-                    onClick={() => setSelection({ kind: "smart", key: "today" })}
-                  >
-                    <span className="feed-row-left">
-                      <SymbolIcon name="today" className="row-icon" />
-                      Today
-                    </span>
-                    <span className="count-badge">{smartCounts.today}</span>
-                  </button>
-
-                  <button
-                    className={`feed-row ${selection.kind === "smart" && selection.key === "unread" ? "active" : ""}`}
-                    onClick={() => setSelection({ kind: "smart", key: "unread" })}
+                    className={`feed-row${selection.kind === "unread" ? " active" : ""}`}
+                    onClick={() => setSelection({ kind: "unread" })}
                   >
                     <span className="feed-row-left">
                       <SymbolIcon name="unread" className="row-icon" />
-                      Unread
+                      <strong>Unread</strong>
                     </span>
-                    <span className="count-badge">{smartCounts.unread}</span>
+                    {sectionCounts.unread > 0 && (
+                      <span className="count-badge">{sectionCounts.unread}</span>
+                    )}
                   </button>
                 </section>
 
-                <section className="folder-section">
-                  <h2>Source</h2>
-
-                  {Array.from(sourceTree.entries()).map(([module, buckets]) => {
-                    const folderKey = module;
-                    const collapsed = collapsedFolders[folderKey] ?? false;
-
-                    return (
-                      <div key={folderKey} className="folder-block">
-                        <button
-                          className="folder-row"
-                          onClick={() => {
-                            setCollapsedFolders((prev) => ({
-                              ...prev,
-                              [folderKey]: !collapsed
-                            }));
-                          }}
-                        >
-                          <span className={`folder-chevron ${collapsed ? "collapsed" : ""}`}>
-                            <SymbolIcon name="chevron" className="row-icon" />
-                          </span>
-                          <SymbolIcon name="folder" className="row-icon" />
-                          <span>{MODULE_LABELS[module]}</span>
-                        </button>
-
-                        {!collapsed && (
-                          <div className="feed-list">
-                            {Array.from(buckets.entries()).map(([bucket, stats]) => {
-                              const selected =
-                                selection.kind === "bucket" &&
-                                selection.module === module &&
-                                selection.bucket === bucket;
-
-                              return (
-                                <button
-                                  key={`${module}-${bucket}`}
-                                  className={`feed-row child ${selected ? "active" : ""}`}
-                                  onClick={() => setSelection({ kind: "bucket", module, bucket })}
-                                >
-                                  <span className="feed-row-left">
-                                    <span className="feed-name">{BUCKET_LABELS[bucket]}</span>
-                                  </span>
-                                  {stats.unread > 0 && (
-                                    <span className="count-badge">{stats.unread}</span>
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
+                {/* ── Today ──────────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "today";
+                  const entries = todayTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="today" className="row-icon" />
+                        <span>Today</span>
+                        {sectionCounts.today > 0 && (
+                          <span className="count-badge">{sectionCounts.today}</span>
                         )}
-                      </div>
-                    );
-                  })}
-                </section>
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? false;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })()}
 
-                <section className="folder-section">
-                  <h2>Favorites</h2>
-                  <div className="folder-block">
-                    <button
-                      className={`folder-row ${selection.kind === "favorite" ? "active" : ""}`}
-                      onClick={() => {
-                        setSelection({ kind: "favorite" });
-                        setFavoritesCollapsed((prev) => !prev);
-                      }}
-                    >
-                      <span className={`folder-chevron ${favoritesCollapsed ? "collapsed" : ""}`}>
-                        <SymbolIcon name="chevron" className="row-icon" />
-                      </span>
-                      <SymbolIcon name="star" className="row-icon" />
-                      <span>已收藏</span>
-                      <span className="count-badge">{favoriteArticles.length}</span>
-                    </button>
+                {/* ── Favorites ──────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "favorites";
+                  const entries = favoritesTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="star" className="row-icon" />
+                        <span>Favorites</span>
+                        {sectionCounts.favorites > 0 && (
+                          <span className="count-badge">{sectionCounts.favorites}</span>
+                        )}
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? false;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })()}
 
-                    {!favoritesCollapsed && (
-                      <div className="feed-list">
-                        {favoriteArticles.map((article) => (
-                          <button
-                            key={`favorite-${article.id}`}
-                            className={`feed-row child ${selectedArticle?.id === article.id ? "active" : ""}`}
-                            onClick={() => {
-                              setSelection({ kind: "favorite" });
-                              void handleSelectArticle(article.id, {
-                                fromUnreadSelection: false
-                              });
-                            }}
-                          >
-                            <span className="feed-row-left">
-                              <span className="feed-name">
-                                {article.title}
-                                {article.note.trim()
-                                  ? ` · ${article.note.trim().slice(0, 18)}`
-                                  : ""}
-                              </span>
-                            </span>
-                            {article.note.trim() && <span className="count-badge">注</span>}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </section>
+                {/* ── History ────────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "history";
+                  const entries = historyTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="reader" className="row-icon" />
+                        <span>History</span>
+                        <span className="count-badge">{sectionCounts.history}</span>
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? true;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })()}
+
               </div>
 
               <div className="sidebar-footer">
                 <button
                   className="icon-button"
-                  onClick={() => {
-                    void setActiveView("settings").then(setSnapshot);
-                  }}
+                  onClick={() => void setActiveView("settings").then(setSnapshot)}
                   aria-label="设置"
                 >
                   <SymbolIcon name="settings" className="toolbar-icon" />
@@ -1884,8 +2277,19 @@ function MainWindow({
                 )}
 
                 {timelineArticles.map((article) => {
+                  const meta = articleMetaById.get(article.id);
+                  const moduleLabel = meta
+                    ? MODULE_LABELS[meta.module as SourceModule] ?? meta.module
+                    : "未分类";
+                  const bucketLabel = meta
+                    ? BUCKET_LABELS[meta.bucket as SourceBucket] ?? meta.bucket
+                    : "未分类";
+                  const sourceLabel = meta?.sourceName ?? article.sourceName;
+                  const timelineTime = formatArticleTime(
+                    article.publishedAt ?? article.fetchedAt ?? meta?.pushedAt ?? null
+                  );
                   const selected = selectedArticle?.id === article.id;
-                  const unread = isArticleUnread(article);
+                  const isUnreadItem = unreadIdSet.has(article.id) || manualUnreadSet.has(article.id);
 
                   return (
                     <button
@@ -1893,17 +2297,22 @@ function MainWindow({
                       className={`timeline-card ${selected ? "selected" : ""}`}
                       onClick={() => {
                         void handleSelectArticle(article.id, {
-                          fromUnreadSelection:
-                            selection.kind === "smart" && selection.key === "unread"
+                          fromUnreadSelection: selection.kind === "unread"
                         });
                       }}
                     >
                       <div className="timeline-card-head">
-                        <span className={`unread-dot ${unread ? "visible" : ""}`} />
+                        <span className={`unread-dot ${isUnreadItem ? "visible" : ""}`} />
                         <h3>{article.title}</h3>
                       </div>
                       <p className="timeline-meta">
-                        {article.sourceName} · {formatTimelineTime(article.publishedAt ?? article.fetchedAt)}
+                        MOD {moduleLabel} · BKT {bucketLabel} · PUB {timelineTime}
+                        {article.fitScore > 0 && (
+                          <span className="score-chip"> · {article.fitScore}分</span>
+                        )}
+                      </p>
+                      <p className="timeline-submeta">
+                        SRC {sourceLabel} · FIT {fitLabel(article.fitLevel)}
                       </p>
                       <p className="timeline-snippet">{article.summary}</p>
                     </button>
@@ -1924,22 +2333,26 @@ function MainWindow({
                     <div>
                       <h2>{selectedArticle.title}</h2>
                       <div className="reader-meta">
-                        <span>作者：{selectedArticle.sourceName}</span>
-                        <span>时间：{formatArticleTime(selectedArticle.publishedAt)}</span>
+                        <span>MOD：{selectedModuleLabel}</span>
+                        <span>BKT：{selectedBucketLabel}</span>
+                        <span>PUB：{selectedPublishedTime}</span>
+                        <span>PUSH：{selectedPushedTime}</span>
                         <button
                           className="feed-link"
                           onClick={() => {
-                            const source = sourceById.get(selectedArticle.sourceId);
-                            if (source) {
+                            if (selectedArticleMeta) {
+                              const targetSection: FeedSection =
+                                selection.kind === "bucket" ? selection.section : "today";
                               setSelection({
                                 kind: "bucket",
-                                module: source.module,
-                                bucket: source.bucket
+                                section: targetSection,
+                                module: selectedArticleMeta.module,
+                                bucket: selectedArticleMeta.bucket
                               });
                             }
                           }}
                         >
-                          来源：{selectedArticle.sourceName}
+                          SRC：{selectedSourceLabel}
                         </button>
                       </div>
                     </div>
@@ -1966,6 +2379,46 @@ function MainWindow({
 
                   <div className="reader-scroll">
                     <div className="reader-content-wrap">
+                      <section className="reader-block">
+                        <h3>CHECK 简表</h3>
+                        <div className="reader-check-grid">
+                          <p>
+                            <strong>MOD</strong>
+                            <span>{selectedModuleLabel}</span>
+                          </p>
+                          <p>
+                            <strong>BKT</strong>
+                            <span>{selectedBucketLabel}</span>
+                          </p>
+                          <p>
+                            <strong>SRC</strong>
+                            <span>{selectedSourceLabel}</span>
+                          </p>
+                          <p>
+                            <strong>PUB</strong>
+                            <span>{selectedPublishedTime}</span>
+                          </p>
+                          <p>
+                            <strong>PUSH</strong>
+                            <span>{selectedPushedTime}</span>
+                          </p>
+                          <p>
+                            <strong>FIT</strong>
+                            <span>
+                              {fitLabel(selectedArticle.fitLevel)} / {selectedArticle.fitScore} 分
+                            </span>
+                          </p>
+                          <p>
+                            <strong>FAV</strong>
+                            <span>{selectedArticle.isFavorite ? "是" : "否"}</span>
+                          </p>
+                          <p>
+                            <strong>NOTE</strong>
+                            <span>{(selectedArticle.note ?? "").trim() ? "有" : "无"}</span>
+                          </p>
+                        </div>
+                      </section>
+
                       <section className="reader-block">
                         <h3>LLM摘要</h3>
                         <p>{selectedArticle.summary || "暂无摘要"}</p>

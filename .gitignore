@@ -18,6 +18,11 @@ Thumbs.db
 .idea/
 .vscode/
 *.tmp
+tmp_*.json
+tmp_*.md
+tmp_*.txt
+tmp_*.csv
+tmp_*.tsv
 *.bak
 *.swp
 src-tauri/target/release/bundle/

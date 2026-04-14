@@ -694,12 +694,15 @@ pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
-                    a.id, a.source_id, a.title, a.link, a.source_name, a.discipline, a.source_kind, a.resource_type,
-                    a.published_at, a.fetched_at, a.summary, a.fit_level, a.fit_score, a.recommendation_reason,
-                    a.raw_content, a.note, a.is_favorite, a.is_new
-                FROM articles a
-                WHERE a.score_status = 'success'
-        ORDER BY COALESCE(published_at, fetched_at, '1970-01-01T00:00:00Z') DESC, id DESC
+            a.id, a.source_id, a.title, a.link, a.source_name, a.discipline, a.source_kind, a.resource_type,
+            a.published_at, a.fetched_at, a.summary, a.fit_level, a.fit_score, a.recommendation_reason,
+            a.note, a.is_favorite, a.is_new
+        FROM articles a
+        WHERE a.score_status = 'success'
+        ORDER BY COALESCE(a.published_at, a.fetched_at, '1970-01-01T00:00:00Z') DESC,
+                 a.fit_score DESC,
+                 a.id DESC
+        LIMIT 500
         "#,
     )?;
 
@@ -722,10 +725,10 @@ pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
             fit_level: parse_fit_level(&fit_level_raw),
             fit_score: row.get(12)?,
             recommendation_reason: row.get(13)?,
-            raw_content: row.get(14)?,
-            note: row.get(15)?,
-            is_favorite: row.get::<_, i64>(16)? == 1,
-            is_new: row.get::<_, i64>(17)? == 1,
+            raw_content: String::new(),
+            note: row.get(14)?,
+            is_favorite: row.get::<_, i64>(15)? == 1,
+            is_new: row.get::<_, i64>(16)? == 1,
         })
     })?;
 
@@ -734,6 +737,17 @@ pub fn list_articles(conn: &Connection) -> Result<Vec<ArticleRecord>> {
         articles.push(row?);
     }
     Ok(articles)
+}
+
+pub fn fetch_article_raw_content(conn: &Connection, article_id: i64) -> Result<String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT raw_content FROM articles WHERE id = ?1",
+            params![article_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw.unwrap_or_default())
 }
 
 pub fn toggle_favorite(conn: &Connection, article_id: i64) -> Result<bool> {
@@ -974,6 +988,135 @@ pub fn active_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSn
     }))
 }
 
+/// Like `active_reminder_batch` but also includes `opened` batches so the
+/// three-column reading view keeps showing curated articles after the user
+/// clicks "view" from the bubble notification.  Does NOT update batch status.
+pub fn display_reminder_batch(conn: &Connection) -> Result<Option<ReminderBatchSnapshot>> {
+    let batch_id: Option<String> = conn
+        .query_row(
+            r#"
+            SELECT id
+            FROM reminder_batches
+            WHERE status IN ('active', 'opened')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+
+    let Some(batch_id) = batch_id else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT a.id, a.fit_score, a.source_kind, sc.module, sc.bucket
+        FROM reminder_batch_articles rba
+        JOIN articles a ON a.id = rba.article_id
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE rba.batch_id = ?1
+          AND a.is_new = 1
+        ORDER BY a.fit_score DESC, COALESCE(a.published_at, a.fetched_at) DESC, a.id DESC
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![batch_id.clone()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+
+    let mut article_ids = Vec::new();
+    let mut top_article_id = None;
+    let mut partitions = BTreeSet::new();
+    for (index, row) in rows.enumerate() {
+        let (article_id, _fit_score, source_kind, module, bucket) = row?;
+        if index == 0 {
+            top_article_id = Some(article_id);
+        }
+        article_ids.push(article_id);
+        let module = module.unwrap_or_else(|| "other".to_string());
+        let bucket = bucket.unwrap_or_else(|| source_kind.clone());
+        partitions.insert(format!("{module}/{bucket}"));
+    }
+
+    if article_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let article_count = article_ids.len();
+    Ok(Some(ReminderBatchSnapshot {
+        id: batch_id,
+        article_ids,
+        article_count,
+        top_article_id,
+        partition_count: partitions.len(),
+    }))
+}
+
+/// 返回历史推送批次中的高分文章（排除当前正在展示的批次）。
+pub fn list_history_articles(
+    conn: &Connection,
+    current_batch_id: Option<&str>,
+) -> Result<Vec<crate::models::HistoryItem>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            a.id,
+            a.title,
+            COALESCE(a.link, '') AS link,
+            a.source_id,
+            COALESCE(a.source_name, '') AS source_name,
+            COALESCE(sc.module, 'other') AS module,
+            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            a.published_at,
+            COALESCE(a.summary, '') AS summary,
+            a.fit_score,
+            COALESCE(a.fit_level, 'low') AS fit_level,
+            COALESCE(a.recommendation_reason, '') AS recommendation_reason,
+            COALESCE(a.note, '') AS note,
+            a.is_favorite,
+            rb.id AS batch_id,
+            rb.created_at AS batch_created_at
+        FROM reminder_batch_articles rba
+        JOIN articles a ON a.id = rba.article_id
+        JOIN reminder_batches rb ON rb.id = rba.batch_id
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE rb.status IN ('opened', 'ignored')
+          AND (?1 IS NULL OR rb.id != ?1)
+        ORDER BY rb.created_at DESC, a.fit_score DESC
+        LIMIT 500
+        "#,
+    )?;
+    let rows = stmt.query_map(params![current_batch_id], |row| {
+        Ok(crate::models::HistoryItem {
+            id: row.get::<_, i64>(0)?,
+            title: row.get::<_, String>(1)?,
+            link: row.get::<_, String>(2)?,
+            source_id: row.get::<_, String>(3)?,
+            source_name: row.get::<_, String>(4)?,
+            module: row.get::<_, String>(5)?,
+            bucket: row.get::<_, String>(6)?,
+            published_at: row.get::<_, Option<String>>(7)?,
+            summary: row.get::<_, String>(8)?,
+            fit_score: row.get::<_, i64>(9)?,
+            fit_level: row.get::<_, String>(10)?,
+            recommendation_reason: row.get::<_, String>(11)?,
+            note: row.get::<_, String>(12)?,
+            is_favorite: row.get::<_, bool>(13)?,
+            batch_id: row.get::<_, String>(14)?,
+            batch_created_at: row.get::<_, String>(15)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 pub fn create_reminder_batch(conn: &Connection) -> Result<String> {
     let batch_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
@@ -1088,28 +1231,29 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
 }
 
 pub fn source_has_successful_fetch(conn: &Connection, source_id: &str) -> Result<bool> {
-    let raw: Option<String> = conn
+    let raw: Option<Option<String>> = conn
         .query_row(
             "SELECT last_success_at FROM source_fetch_state WHERE source_id = ?1 LIMIT 1",
             params![source_id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?;
     Ok(raw
+        .flatten()
         .as_deref()
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false))
 }
 
 pub fn source_last_fetched_at(conn: &Connection, source_id: &str) -> Result<Option<DateTime<Utc>>> {
-    let raw: Option<String> = conn
+    let raw: Option<Option<String>> = conn
         .query_row(
             "SELECT last_fetched_at FROM source_fetch_state WHERE source_id = ?1 LIMIT 1",
             params![source_id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?;
-    Ok(raw.as_deref().and_then(parse_datetime))
+    Ok(raw.flatten().as_deref().and_then(parse_datetime))
 }
 
 pub fn reset_source_fetch_state(conn: &Connection, source_id: &str) -> Result<()> {
@@ -1694,7 +1838,7 @@ pub fn build_snapshot(
     last_scan_at: Option<DateTime<Utc>>,
 ) -> Result<Snapshot> {
     let settings = read_settings(conn)?;
-    let active_reminder = active_reminder_batch(conn)?;
+    let active_reminder = display_reminder_batch(conn)?;
     let due_sources = list_due_sources(conn, Utc::now(), false)?.len();
     let selected_disciplines = settings
         .disciplines
@@ -1711,12 +1855,23 @@ pub fn build_snapshot(
     )? as usize;
     let enabled_sources = list_dueable_enabled_sources_count(conn)? as usize;
 
+    let selected_article_id = read_selected_article_id(conn)?;
+    let mut articles = list_articles(conn)?;
+    if let Some(sel_id) = selected_article_id {
+        if let Some(article) = articles.iter_mut().find(|a| a.id == sel_id) {
+            article.raw_content = fetch_article_raw_content(conn, sel_id)?;
+        }
+    }
+    let current_batch_id = active_reminder.as_ref().map(|b| b.id.as_str());
+    let history_articles = list_history_articles(conn, current_batch_id)?;
+
     Ok(Snapshot {
         settings,
         pet_status,
-        articles: list_articles(conn)?,
+        articles,
         active_reminder,
-        selected_article_id: read_selected_article_id(conn)?,
+        history_articles,
+        selected_article_id,
         active_view: read_active_view(conn)?,
         last_error,
         api_key_valid,
