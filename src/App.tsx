@@ -44,7 +44,7 @@ const PET_STATUS_LABELS = {
 const PET_STATUS_HINTS = {
   loading: "",
   "needs-config": "先去完善配置",
-  scanning: "正在按学科与子分类调度抓取",
+  scanning: "按学科与子分类抓取中",
   idle: "当前没有高优提醒",
   "new-info": "双击或点气泡查看"
 } as const;
@@ -1040,18 +1040,64 @@ function PetWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
 
 function BubbleWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   const reminder = snapshot?.activeReminder;
+  const pointerState = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, a, input, textarea, select")) {
+      pointerState.current = null;
+      return;
+    }
+
+    pointerState.current = {
+      x: event.clientX,
+      y: event.clientY,
+      dragging: false
+    };
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const state = pointerState.current;
+    if (!state || state.dragging) {
+      return;
+    }
+
+    const movedX = Math.abs(event.clientX - state.x);
+    const movedY = Math.abs(event.clientY - state.y);
+    if (movedX + movedY < 4) {
+      return;
+    }
+
+    state.dragging = true;
+    void appWindow.startDragging();
+  }
+
+  function handlePointerEnd() {
+    pointerState.current = null;
+  }
 
   if (!reminder) {
     return <div className="bubble-empty" />;
   }
 
   return (
-    <div className="bubble-window">
+    <div
+      className="bubble-window"
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerEnd}
+      onPointerCancel={handlePointerEnd}
+      onPointerLeave={handlePointerEnd}
+    >
       <div className="bubble-card">
         <p className="bubble-kicker">Briefy-pet 提醒</p>
         <h2>你有 {reminder.articleCount} 条新内容</h2>
         <p className="bubble-copy">
-          当前提醒跨 {reminder.partitionCount} 个分区，桌宠已经切到提醒状态。你可以立刻进入主界面，也可以只延后当前这一批。
+          当前提醒跨 {reminder.partitionCount} 个分区。你可以立刻查看，或仅延后这一批。
         </p>
         <div className="bubble-actions">
           <button onClick={() => void bubbleAction("view")}>立即查看</button>

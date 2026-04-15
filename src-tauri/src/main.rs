@@ -44,7 +44,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
 fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "bubble", WindowUrl::App("index.html".into()))
         .title("Briefy Pet Bubble")
-        .inner_size(380.0, 260.0)
+        .inner_size(420.0, 300.0)
         .transparent(true)
         .decorations(false)
         .always_on_top(true)
