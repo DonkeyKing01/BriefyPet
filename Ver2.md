@@ -1,10 +1,10 @@
-# Briefy-pet Ver2（mac 分支统一文档）
+# Briefy-pet Ver2（mac & windows 分支统一文档）
 
 ## 0. 文档说明
 
 - 文档版本：v2.9（合并版）
 - 更新时间：2026-04-15
-- 适用分支：mac
+- 适用分支：mac / windows
 - 文档性质：Ver2 全量归档 + 当前实现口径 + 验收基准
 
 本文件已合并并取代以下历史拆分文档：
@@ -184,11 +184,12 @@
 
 ### 6.1 已落实
 
-1. 保留 `mac` 分支进行持续交付。
+1. 保留 `mac` 与 `windows` 分支进行持续交付。
 2. 支持一套源码双平台打包脚本：
    - `scripts/build-macos-debug-sandbox-dmg.sh`
    - `scripts/build-macos-release-dmg.sh`
-   - `scripts/build-windows-release-bundle.sh`
+   - `scripts/build-windows-debug-bundle.ps1`
+   - `scripts/build-windows-release-bundle.ps1`
 3. 抓取链路已收敛为“并发 + 重试 + 打分 + 池化推送”。
 
 ### 6.2 持续项
@@ -205,11 +206,15 @@
 1. 前端构建：`npm run build`
 2. Rust 测试：`cd src-tauri && cargo test`
 3. mac 调试包：`npm run tauri:build:debug:sandbox-dmg`
+4. windows 调试包：`npm run tauri:build:windows:debug`
+5. windows 正式包：`npm run tauri:build:windows:release`
 
 ### 7.2 交付产物
 
 1. `.app`：`src-tauri/target/debug/bundle/macos/Briefy-pet.app`
 2. `.dmg`：`src-tauri/target/debug/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg`
+3. `.msi`：`src-tauri/target/debug/bundle/msi/Briefy-pet_0.1.0_x64_en-US.msi`
+4. `.exe`：`src-tauri/target/debug/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe`
 
 ---
 
@@ -346,3 +351,20 @@
 1. `npm run build` 通过。
 2. `cd src-tauri && cargo check` 通过。
 3. `npm run tauri:build:debug:sandbox-dmg` 可产出最新调试包。
+
+---
+
+## 11. 当前补充改动（2026-04-15）
+
+1. `windows` 分支已合并当前 `mac` 分支的主要结构与界面实现。
+2. Windows 打包脚本已改为 PowerShell 入口，避免依赖本机 `bash/WSL` 环境。
+3. Windows 现已支持两套命令：
+   - `npm run tauri:build:windows:debug`
+   - `npm run tauri:build:windows:release`
+4. Windows `debug` 与 `release` 均已验证可同时产出：
+   - `msi`
+   - `nsis`
+5. Windows 产物目录已统一到：
+   - `src-tauri/target/debug/bundle/...`
+   - `src-tauri/target/release/bundle/...`
+6. mac 原有 `app/dmg` 配置与构建脚本保持保留，没有移除。

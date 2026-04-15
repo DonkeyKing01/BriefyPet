@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:build:debug:sandbox-dmg": "bash scripts/build-macos-debug-sandbox-dmg.sh",
     "tauri:build:mac:release-dmg": "bash scripts/build-macos-release-dmg.sh",
-    "tauri:build:windows:release": "bash scripts/build-windows-release-bundle.sh"
+    "tauri:build:windows:debug": "powershell -ExecutionPolicy Bypass -File scripts/build-windows-debug-bundle.ps1",
+    "tauri:build:windows:release": "powershell -ExecutionPolicy Bypass -File scripts/build-windows-release-bundle.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^1.5.6",

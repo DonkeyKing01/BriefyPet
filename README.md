@@ -1,4 +1,4 @@
-# BriefyPet (mac branch)
+# BriefyPet
 
 BriefyPet 是一个基于 Tauri + React + Rust + SQLite 的桌宠信息雷达应用。
 
@@ -12,12 +12,17 @@ BriefyPet 是一个基于 Tauri + React + Rust + SQLite 的桌宠信息雷达应
 
 ## 1. 当前分支状态
 
-当前分支：`mac`
+当前维护口径：
+
+1. `mac` 与 `windows` 两个分支共用一套主代码结构。
+2. macOS 与 Windows 的打包能力都需要保留。
+3. 当前这份 README 说明的是仓库现状与双平台构建方式，不再只对应单一分支。
 
 当前主要交付目标：
 
-1. 以 macOS 可安装应用（`.app` / `.dmg`）为主交付形态。
-2. 保持一套源码，支持 mac 与 windows 两套打包脚本。
+1. 保持 macOS 可安装应用（`.app` / `.dmg`）构建能力。
+2. 保持 Windows 可安装应用（`.msi` / `.exe`）构建能力。
+3. 保持一套源码，支持 mac 与 windows 两套打包脚本。
 
 文档入口：
 
@@ -80,6 +85,7 @@ reference/                # 本地参考资料（默认忽略，不进入 Git）
 3. Rust stable
 4. Tauri CLI（项目 devDependencies 已含 `@tauri-apps/cli`）
 5. macOS（进行 mac 打包时）
+6. Windows + WiX/NSIS 环境（进行 Windows 打包时）
 
 ---
 
@@ -129,6 +135,12 @@ npm run tauri:build:mac:release-dmg
 
 ### 7.2 Windows
 
+debug bundle（msi + nsis）：
+
+```bash
+npm run tauri:build:windows:debug
+```
+
 release bundle（msi + nsis）：
 
 ```bash
@@ -144,6 +156,8 @@ debug：
 ```text
 src-tauri/target/debug/bundle/macos/Briefy-pet.app
 src-tauri/target/debug/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg
+src-tauri/target/debug/bundle/msi/Briefy-pet_0.1.0_x64_en-US.msi
+src-tauri/target/debug/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe
 ```
 
 release：
@@ -151,6 +165,8 @@ release：
 ```text
 src-tauri/target/release/bundle/macos/Briefy-pet.app
 src-tauri/target/release/bundle/dmg/Briefy-pet_0.1.0_aarch64.dmg
+src-tauri/target/release/bundle/msi/Briefy-pet_0.1.0_x64_en-US.msi
+src-tauri/target/release/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe
 ```
 
 ---
@@ -177,4 +193,6 @@ cd src-tauri && cargo test
 
 ```bash
 npm run tauri:build:debug:sandbox-dmg
+npm run tauri:build:windows:debug
+npm run tauri:build:windows:release
 ```
