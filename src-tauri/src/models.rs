@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +131,12 @@ pub struct RssSource {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPayload {
     pub api_key: String,
+    #[serde(default = "default_llm_provider")]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub llm_model: String,
+    #[serde(default)]
+    pub provider_api_keys: BTreeMap<String, String>,
     pub auto_start: bool,
     pub disciplines: Vec<UserDisciplinePreference>,
     pub memory_mode_enabled: bool,
@@ -154,6 +162,7 @@ pub struct ArticleRecord {
     pub fit_score: i64,
     pub recommendation_reason: String,
     pub raw_content: String,
+    pub note: String,
     pub is_favorite: bool,
     pub is_new: bool,
 }
@@ -166,6 +175,27 @@ pub struct ReminderBatchSnapshot {
     pub article_count: usize,
     pub top_article_id: Option<i64>,
     pub partition_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItem {
+    pub id: i64,
+    pub title: String,
+    pub link: String,
+    pub source_id: String,
+    pub source_name: String,
+    pub module: String,
+    pub bucket: String,
+    pub published_at: Option<String>,
+    pub summary: String,
+    pub fit_score: i64,
+    pub fit_level: String,
+    pub recommendation_reason: String,
+    pub note: String,
+    pub is_favorite: bool,
+    pub batch_id: String,
+    pub batch_created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +235,7 @@ pub struct Snapshot {
     pub pet_status: PetStatus,
     pub articles: Vec<ArticleRecord>,
     pub active_reminder: Option<ReminderBatchSnapshot>,
+    pub history_articles: Vec<HistoryItem>,
     pub selected_article_id: Option<i64>,
     pub active_view: AppView,
     pub last_error: Option<String>,
@@ -213,6 +244,13 @@ pub struct Snapshot {
     pub content_pool_stats: Vec<ContentPoolStat>,
     pub memory: Option<InterestMemoryRecord>,
     pub source_summary: SourceCatalogSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySnapshot {
+    pub pet_status: PetStatus,
+    pub active_reminder: Option<ReminderBatchSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +284,10 @@ pub struct LlmResult {
     pub fit_level: FitLevel,
     pub fit_score: i64,
     pub recommendation_reason: String,
+}
+
+pub fn default_llm_provider() -> String {
+    "deepseek".to_string()
 }
 
 pub fn all_disciplines() -> Vec<Discipline> {

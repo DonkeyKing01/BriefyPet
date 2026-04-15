@@ -20,6 +20,8 @@ export type SourceKind =
   | "technical-blog"
   | "community-hotspot";
 
+export type LlmProvider = "deepseek" | "glm" | "kimi" | "openai" | "siliconflow";
+
 export type SourceModule =
   | "technology"
   | "social_science"
@@ -75,6 +77,9 @@ export type RssSource = {
 
 export type SettingsPayload = {
   apiKey: string;
+  llmProvider: LlmProvider;
+  llmModel: string;
+  providerApiKeys: Record<string, string>;
   autoStart: boolean;
   disciplines: UserDisciplinePreference[];
   memoryModeEnabled: boolean;
@@ -98,6 +103,7 @@ export type Article = {
   fitScore: number;
   recommendationReason: string;
   rawContent: string;
+  note: string;
   isFavorite: boolean;
   isNew: boolean;
 };
@@ -108,6 +114,25 @@ export type ReminderBatch = {
   articleCount: number;
   topArticleId: number | null;
   partitionCount: number;
+};
+
+export type HistoryItem = {
+  id: number;
+  title: string;
+  link: string;
+  sourceId: string;
+  sourceName: string;
+  module: string;
+  bucket: string;
+  publishedAt: string | null;
+  summary: string;
+  fitScore: number;
+  fitLevel: FitLevel;
+  recommendationReason: string;
+  note: string;
+  isFavorite: boolean;
+  batchId: string;
+  batchCreatedAt: string;
 };
 
 export type ContentPoolStat = {
@@ -139,6 +164,7 @@ export type Snapshot = {
   petStatus: PetStatus;
   articles: Article[];
   activeReminder: ReminderBatch | null;
+  historyArticles: HistoryItem[];
   selectedArticleId: number | null;
   activeView: AppView;
   lastError: string | null;
@@ -147,4 +173,9 @@ export type Snapshot = {
   contentPoolStats: ContentPoolStat[];
   memory: InterestMemoryRecord | null;
   sourceSummary: SourceCatalogSummary;
+};
+
+export type OverlaySnapshot = {
+  petStatus: PetStatus;
+  activeReminder: ReminderBatch | null;
 };

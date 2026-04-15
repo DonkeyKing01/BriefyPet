@@ -3,10 +3,10 @@ use std::io::Cursor;
 use anyhow::{anyhow, Context, Result};
 use atom_syndication::Feed;
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
+use futures::{stream, StreamExt};
 use reqwest::{
     header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL},
-    Client, RequestBuilder, StatusCode,
+    Client, RequestBuilder,
 };
 use rss::Channel;
 use tokio::time::{sleep, Duration};
@@ -16,6 +16,9 @@ use crate::models::{FeedArticle, RssSource};
 const MAX_ITEMS_PER_SOURCE: usize = 12;
 const FEED_FETCH_RETRIES: usize = 3;
 const FEED_REQUEST_TIMEOUT_SECS: u64 = 20;
+const MAX_CONCURRENT_SOURCE_FETCHES: usize = 6;
+const SECOND_PASS_RETRY_DELAY_SECS: u64 = 15;
+const RETRY_BACKOFF_BASE_MS: u64 = 900;
 const FEED_USER_AGENT: &str =
     "Briefy-pet/0.1 (+https://briefy-pet.local; rss-fetcher; contact: rss@briefy-pet.local)";
 
@@ -36,15 +39,64 @@ pub async fn fetch_sources(sources: &[RssSource]) -> Result<FeedFetchOutcome> {
         .timeout(Duration::from_secs(FEED_REQUEST_TIMEOUT_SECS))
         .build()
         .context("failed to build rss client")?;
-    let results = join_all(
-        sources
-            .iter()
-            .cloned()
-            .map(|source| fetch_single_source(client.clone(), source)),
-    )
-    .await;
+
+    let mut results = fetch_sources_with_limit(&client, sources, MAX_CONCURRENT_SOURCE_FETCHES).await;
+    let retry_sources = results
+        .iter()
+        .filter_map(|result| {
+            result
+                .error
+                .as_deref()
+                .filter(|error| is_retryable_feed_error_message(error))
+                .map(|_| result.source.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if !retry_sources.is_empty() {
+        sleep(Duration::from_secs(SECOND_PASS_RETRY_DELAY_SECS)).await;
+        let retry_results = fetch_sources_with_limit(
+            &client,
+            &retry_sources,
+            MAX_CONCURRENT_SOURCE_FETCHES.saturating_sub(2).max(1),
+        )
+        .await;
+
+        let mut retry_map = retry_results
+            .into_iter()
+            .map(|result| (result.source.id.clone(), result))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for result in &mut results {
+            if result.error.is_none() {
+                continue;
+            }
+            if let Some(retried) = retry_map.remove(&result.source.id) {
+                *result = retried;
+            }
+        }
+    }
 
     Ok(FeedFetchOutcome { results })
+}
+
+async fn fetch_sources_with_limit(
+    client: &Client,
+    sources: &[RssSource],
+    limit: usize,
+) -> Vec<SourceFetchResult> {
+    let mut indexed_results = stream::iter(sources.iter().cloned().enumerate().map(|(idx, source)| {
+        let client = client.clone();
+        async move { (idx, fetch_single_source(client, source).await) }
+    }))
+    .buffer_unordered(limit.max(1))
+    .collect::<Vec<_>>()
+    .await;
+
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect()
 }
 
 async fn fetch_single_source(client: Client, source: RssSource) -> SourceFetchResult {
@@ -63,7 +115,7 @@ async fn fetch_single_source(client: Client, source: RssSource) -> SourceFetchRe
                 let retryable = is_retryable_feed_error(&err);
                 last_error = Some(err.to_string());
                 if retryable && attempt < FEED_FETCH_RETRIES {
-                    sleep(Duration::from_millis(700 * attempt as u64)).await;
+                    sleep(retry_backoff_delay(&source.id, attempt)).await;
                     continue;
                 }
                 break;
@@ -79,32 +131,10 @@ async fn fetch_single_source(client: Client, source: RssSource) -> SourceFetchRe
 }
 
 async fn fetch_single_source_once(client: &Client, source: &RssSource) -> Result<Vec<FeedArticle>> {
-    let mut requested_url = source.url.clone();
-    let mut response = send_feed_request(client.get(&requested_url), &requested_url)
+    let requested_url = source.url.clone();
+    let response = send_feed_request(client.get(&requested_url), &requested_url)
         .await
         .with_context(|| format!("request failed for {}", source.url))?;
-
-    if response.status() == StatusCode::FORBIDDEN {
-        if let Some(fallback_url) = reddit_fallback_url(&source.url) {
-            let fallback_response = send_feed_request(client.get(&fallback_url), &fallback_url)
-                .await
-                .with_context(|| format!("request failed for reddit fallback {}", fallback_url))?;
-
-            if fallback_response.status().is_success() {
-                requested_url = fallback_url;
-                response = fallback_response;
-            } else {
-                return Err(anyhow!(
-                    "{} ({}) returned HTTP {}; fallback {} returned HTTP {}",
-                    source.name,
-                    source.url,
-                    StatusCode::FORBIDDEN,
-                    fallback_url,
-                    fallback_response.status()
-                ));
-            }
-        }
-    }
 
     if !response.status().is_success() {
         return Err(anyhow!(
@@ -155,23 +185,32 @@ async fn send_feed_request(
     builder.send().await
 }
 
-fn reddit_fallback_url(url: &str) -> Option<String> {
-    if url.contains("://www.reddit.com/") {
-        return Some(url.replacen("://www.reddit.com/", "://old.reddit.com/", 1));
-    }
-    if url.contains("://reddit.com/") {
-        return Some(url.replacen("://reddit.com/", "://old.reddit.com/", 1));
-    }
-    None
+fn is_retryable_feed_error(err: &anyhow::Error) -> bool {
+    is_retryable_feed_error_message(&err.to_string())
 }
 
-fn is_retryable_feed_error(err: &anyhow::Error) -> bool {
-    let text = err.to_string();
-    text.contains("HTTP 429")
+fn is_retryable_feed_error_message(text: &str) -> bool {
+    text.contains("HTTP 408")
+        || text.contains("HTTP 425")
+        || text.contains("HTTP 429")
+        || text.contains("HTTP 500")
         || text.contains("HTTP 502")
         || text.contains("HTTP 503")
         || text.contains("HTTP 504")
         || text.contains("request failed")
+        || text.contains("timed out")
+        || text.contains("connection reset")
+}
+
+fn retry_backoff_delay(source_id: &str, attempt: usize) -> Duration {
+    let exponent = (attempt.saturating_sub(1) as u32).min(4);
+    let base = RETRY_BACKOFF_BASE_MS.saturating_mul(2u64.pow(exponent));
+    let jitter_seed = source_id
+        .as_bytes()
+        .iter()
+        .fold(0u64, |acc, b| acc.wrapping_add(*b as u64));
+    let jitter = (jitter_seed % 400) + (attempt as u64 * 60);
+    Duration::from_millis(base.saturating_add(jitter))
 }
 
 fn parse_rss_items(source: &RssSource, channel: &Channel) -> Vec<FeedArticle> {

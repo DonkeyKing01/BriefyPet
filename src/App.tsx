@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { appWindow } from "@tauri-apps/api/window";
 import {
+  addCustomRssSource,
   bootstrap,
+  bootstrapOverlay,
   bubbleAction,
+  getArticleRawContent,
+  listHistoryArticlesPage,
   openArticle,
   petDoubleClick,
-  resetAppData,
+  resetRuntimeData,
+  saveArticleNote,
   saveSettings,
   setActiveView,
   toggleFavorite
@@ -15,6 +21,9 @@ import type {
   Article,
   Discipline,
   FitLevel,
+  HistoryItem,
+  LlmProvider,
+  OverlaySnapshot,
   RssSource,
   SettingsPayload,
   Snapshot,
@@ -35,7 +44,7 @@ const PET_STATUS_LABELS = {
 const PET_STATUS_HINTS = {
   loading: "",
   "needs-config": "先去完善配置",
-  scanning: "正在按学科与子分类调度抓取",
+  scanning: "按学科与子分类抓取中",
   idle: "当前没有高优提醒",
   "new-info": "双击或点气泡查看"
 } as const;
@@ -167,6 +176,16 @@ const DISCIPLINE_ORDER: Discipline[] = [
   "medicine"
 ];
 
+const PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
+  { value: "deepseek", label: "DeepSeek" },
+  { value: "glm", label: "GLM" },
+  { value: "kimi", label: "Kimi" },
+  { value: "openai", label: "OpenAI" },
+  { value: "siliconflow", label: "SiliconFlow" }
+];
+
+const MODULE_OPTIONS = MODULE_ORDER.filter((module) => module !== "other");
+
 const DEMO_SOURCES: RssSource[] = [
   {
     id: "demo-social-frontier",
@@ -266,6 +285,7 @@ const DEMO_ARTICLES: Article[] = [
     recommendationReason: "与你的产品迭代节奏高度相关，且具备可执行的工程规划价值。",
     rawContent:
       "Apple 的工具链发布正在进入更高频的小步快跑节奏。对产品团队而言，最重要的是把版本升级从一次性大项目改成可持续维护任务。建议把开发计划拆分为两层：稳定层保障线上体验，实验层吸收新 API 与性能能力。",
+    note: "",
     isFavorite: true,
     isNew: true
   },
@@ -287,6 +307,7 @@ const DEMO_ARTICLES: Article[] = [
     recommendationReason: "对你的信息产品定位和商业化节奏有直接参考意义。",
     rawContent:
       "订阅型信息产品的核心，不是把更多内容塞给用户，而是稳定提升高价值内容命中率。文章提出以有效阅读时长和可复用洞察作为核心指标，替代单纯 DAU 来评估内容产品质量。",
+    note: "",
     isFavorite: false,
     isNew: true
   },
@@ -308,6 +329,7 @@ const DEMO_ARTICLES: Article[] = [
     recommendationReason: "有方法论价值，但实践细节仍需结合你的实际流量进行验证。",
     rawContent:
       "社区讨论显示，纯规则或纯模型都难以长期维持质量。更好的方案是规则层先做召回筛选，模型层做语义排序与解释。对于桌宠类信息雷达，提醒机制应优先强调低打扰和高确定性。",
+    note: "",
     isFavorite: false,
     isNew: false
   },
@@ -329,6 +351,7 @@ const DEMO_ARTICLES: Article[] = [
     recommendationReason: "如果你关注社科，这篇内容能直接指导信息筛选与提醒策略设计。",
     rawContent:
       "社科研究提示，信息传播效率与信息质量并不总是同向增长。平台机制会偏向更高互动内容，但这不代表它们具有更高认知价值。产品若追求稳定认知增益，应同时关注热点追踪与证据优先。",
+    note: "",
     isFavorite: false,
     isNew: true
   },
@@ -350,16 +373,24 @@ const DEMO_ARTICLES: Article[] = [
     recommendationReason: "属于中长期价值内容，适合进入你的科学子分类长期池。",
     rawContent:
       "新的公开数据集在时间维度上更完整，这意味着可以更准确识别长期趋势而非短期噪声。在健康与科学内容推荐中，这种慢变量往往比短期热门更有价值。",
+    note: "",
     isFavorite: false,
     isNew: true
   }
 ];
 
-type SmartFeedKey = "today" | "unread" | "starred";
+type FeedSection = "today" | "favorites" | "history";
 
 type FeedSelection =
-  | { kind: "smart"; key: SmartFeedKey }
-  | { kind: "source"; sourceId: string };
+  | { kind: "unread" }
+  | { kind: "bucket"; section: FeedSection; module: string; bucket: string };
+
+type ArticleMeta = {
+  module: string;
+  bucket: string;
+  sourceName: string;
+  pushedAt: string | null;
+};
 
 type ResizeTarget = "sidebar" | "timeline";
 
@@ -378,37 +409,149 @@ type SymbolName =
   | "timeline"
   | "reader";
 
-function useSnapshotPolling(enabled: boolean, intervalMs: number) {
+const HISTORY_PAGE_SIZE = 200;
+const SNAPSHOT_EVENT = "briefy://snapshot-updated";
+const OVERLAY_EVENT = "briefy://overlay-updated";
+
+function snapshotFingerprint(snapshot: Snapshot) {
+  const reminderKey = snapshot.activeReminder
+    ? `${snapshot.activeReminder.id}:${snapshot.activeReminder.articleCount}:${snapshot.activeReminder.partitionCount}`
+    : "none";
+  const articleEdge = snapshot.articles
+    .slice(0, 24)
+    .map((article) => `${article.id}:${article.isNew ? 1 : 0}:${article.isFavorite ? 1 : 0}:${article.fitScore}`)
+    .join(",");
+  const historyEdge = snapshot.historyArticles
+    .slice(0, 24)
+    .map((item) => `${item.id}:${item.batchId}:${item.fitScore}`)
+    .join(",");
+  const enabledDisciplineCount = snapshot.settings.disciplines.filter((item) => item.enabled).length;
+
+  return [
+    snapshot.petStatus,
+    snapshot.activeView,
+    snapshot.selectedArticleId ?? "",
+    snapshot.lastScanAt ?? "",
+    snapshot.lastError ?? "",
+    snapshot.apiKeyValid ? "1" : "0",
+    snapshot.settings.rssSources.length,
+    enabledDisciplineCount,
+    reminderKey,
+    snapshot.articles.length,
+    snapshot.historyArticles.length,
+    snapshot.memory?.updatedAt ?? "",
+    snapshot.sourceSummary.dueSources,
+    articleEdge,
+    historyEdge
+  ].join("|");
+}
+
+function useSnapshotEvents(enabled: boolean) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  async function refresh() {
-    try {
-      const next = await bootstrap();
-      setSnapshot(next);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
-    } finally {
-      setLoading(false);
-    }
-  }
+  const fingerprintRef = useRef<string>("");
 
   useEffect(() => {
     if (!enabled) {
       return;
     }
 
-    void refresh();
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, intervalMs);
+    let active = true;
+    let unlisten: (() => void) | null = null;
 
-    return () => window.clearInterval(timer);
-  }, [enabled, intervalMs]);
+    const applySnapshot = (next: Snapshot) => {
+      const nextFingerprint = snapshotFingerprint(next);
+      if (nextFingerprint !== fingerprintRef.current) {
+        fingerprintRef.current = nextFingerprint;
+        setSnapshot(next);
+      }
+    };
+
+    const setup = async () => {
+      try {
+        unlisten = await listen<Snapshot>(SNAPSHOT_EVENT, (event) => {
+          if (!active) {
+            return;
+          }
+          applySnapshot(event.payload);
+          setError(null);
+          setLoading(false);
+        });
+
+        const initial = await bootstrap();
+        if (!active) {
+          return;
+        }
+        applySnapshot(initial);
+        setError(null);
+      } catch (err) {
+        if (!active) {
+          return;
+        }
+        setError(err instanceof Error ? err.message : "加载失败");
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    setLoading(true);
+    void setup();
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [enabled]);
 
   return { snapshot, setSnapshot, loading, error };
+}
+
+function useOverlayEvents(enabled: boolean) {
+  const [snapshot, setSnapshot] = useState<OverlaySnapshot | null>(null);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    const setup = async () => {
+      try {
+        unlisten = await listen<OverlaySnapshot>(OVERLAY_EVENT, (event) => {
+          if (!active) {
+            return;
+          }
+          setSnapshot(event.payload);
+        });
+
+        const initial = await bootstrapOverlay();
+        if (!active) {
+          return;
+        }
+        setSnapshot(initial);
+      } catch {
+        // Keep previous overlay state when transient event/bootstrap errors happen.
+      }
+    };
+
+    void setup();
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [enabled]);
+
+  return snapshot;
 }
 
 function formatTime(value: string | null) {
@@ -473,12 +616,170 @@ function fitLabel(level: FitLevel) {
   return "低";
 }
 
-function articleTimestamp(article: Article) {
-  const raw = article.publishedAt ?? article.fetchedAt;
-  if (!raw) {
+function toSafeTimestamp(value: string | null | undefined) {
+  if (!value) {
     return 0;
   }
-  return new Date(raw).getTime();
+
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function isSameCalendarDay(anchor: Date, value: string | null | undefined) {
+  if (!value) {
+    return false;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  return (
+    date.getFullYear() === anchor.getFullYear() &&
+    date.getMonth() === anchor.getMonth() &&
+    date.getDate() === anchor.getDate()
+  );
+}
+
+function compareWithPresetOrder(left: string, right: string, order: readonly string[]) {
+  const leftIndex = order.indexOf(left);
+  const rightIndex = order.indexOf(right);
+  const leftRank = leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex;
+  const rightRank = rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex;
+
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  return left.localeCompare(right);
+}
+
+function orderedTreeEntries(tree: Map<string, Map<string, number>>) {
+  return [...tree.keys()]
+    .sort((left, right) => compareWithPresetOrder(left, right, MODULE_ORDER))
+    .map((module) => {
+      const buckets = [...(tree.get(module)?.entries() ?? [])].sort(([left], [right]) =>
+        compareWithPresetOrder(left, right, BUCKET_ORDER)
+      );
+      return { module, buckets };
+    });
+}
+
+function articleFingerprint(article: Article) {
+  return [
+    article.sourceId,
+    article.link.trim().toLowerCase(),
+    article.title.trim().toLowerCase(),
+    article.publishedAt ?? "",
+    article.fetchedAt ?? ""
+  ].join("|");
+}
+
+function dedupeArticles(items: Article[]) {
+  const seenIds = new Set<number>();
+  const seenFingerprints = new Set<string>();
+  const result: Article[] = [];
+
+  for (const item of items) {
+    const fingerprint = articleFingerprint(item);
+    if (seenIds.has(item.id) || seenFingerprints.has(fingerprint)) {
+      continue;
+    }
+
+    seenIds.add(item.id);
+    seenFingerprints.add(fingerprint);
+    result.push(item);
+  }
+
+  return result;
+}
+
+function dedupeHistoryItems(items: HistoryItem[]) {
+  const sorted = [...items].sort(
+    (left, right) => toSafeTimestamp(right.batchCreatedAt) - toSafeTimestamp(left.batchCreatedAt)
+  );
+  const seenIds = new Set<number>();
+  const seenFingerprints = new Set<string>();
+  const result: HistoryItem[] = [];
+
+  for (const item of sorted) {
+    const fingerprint = [
+      item.sourceId,
+      item.link.trim().toLowerCase(),
+      item.title.trim().toLowerCase(),
+      item.publishedAt ?? ""
+    ].join("|");
+    if (seenIds.has(item.id) || seenFingerprints.has(fingerprint)) {
+      continue;
+    }
+
+    seenIds.add(item.id);
+    seenFingerprints.add(fingerprint);
+    result.push(item);
+  }
+
+  return result;
+}
+
+function articleTimestamp(article: Article, fallbackTime?: string | null) {
+  return toSafeTimestamp(article.publishedAt ?? article.fetchedAt ?? fallbackTime ?? null);
+}
+
+function historyItemToArticle(item: HistoryItem): Article {
+  return {
+    id: item.id,
+    sourceId: item.sourceId,
+    title: item.title,
+    link: item.link,
+    sourceName: item.sourceName,
+    discipline: "other",
+    sourceKind: "technical-blog",
+    resourceType: "article",
+    publishedAt: item.publishedAt,
+    fetchedAt: item.batchCreatedAt,
+    summary: item.summary,
+    fitLevel: item.fitLevel,
+    fitScore: item.fitScore,
+    recommendationReason: item.recommendationReason,
+    rawContent: "",
+    note: item.note,
+    isFavorite: item.isFavorite,
+    isNew: false
+  };
+}
+
+function resolveArticleMeta(
+  article: Article,
+  sourceById: Map<string, RssSource>,
+  historyByArticleId: Map<number, HistoryItem>
+): ArticleMeta {
+  const source = sourceById.get(article.sourceId);
+  if (source) {
+    return {
+      module: source.module,
+      bucket: source.bucket,
+      sourceName: source.name,
+      pushedAt: historyByArticleId.get(article.id)?.batchCreatedAt ?? null
+    };
+  }
+
+  const history = historyByArticleId.get(article.id);
+  if (history) {
+    return {
+      module: history.module || "other",
+      bucket: history.bucket || "unspecified",
+      sourceName: history.sourceName,
+      pushedAt: history.batchCreatedAt ?? null
+    };
+  }
+
+  return {
+    module: "other",
+    bucket: "unspecified",
+    sourceName: article.sourceName,
+    pushedAt: null
+  };
 }
 
 function sortDisciplinePrefs(items: UserDisciplinePreference[]) {
@@ -671,34 +972,7 @@ function SymbolIcon({ name, className }: { name: SymbolName; className?: string 
   }
 }
 
-function Favicon({ url, name }: { url: string; name: string }) {
-  const [broken, setBroken] = useState(false);
-
-  let host = "";
-  try {
-    host = new URL(url).hostname;
-  } catch {
-    host = "";
-  }
-
-  const fallbackText = (name.trim().charAt(0) || "•").toUpperCase();
-
-  if (broken || !host) {
-    return <span className="feed-favicon feed-favicon-fallback">{fallbackText}</span>;
-  }
-
-  return (
-    <img
-      className="feed-favicon"
-      src={`https://www.google.com/s2/favicons?domain=${host}&sz=16`}
-      alt=""
-      loading="lazy"
-      onError={() => setBroken(true)}
-    />
-  );
-}
-
-function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
+function PetWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   const status = snapshot?.petStatus ?? "loading";
   const articleCount = snapshot?.activeReminder?.articleCount ?? 0;
   const asset = PET_ASSET_BY_STATUS[status];
@@ -764,20 +1038,66 @@ function PetWindow({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
-function BubbleWindow({ snapshot }: { snapshot: Snapshot | null }) {
+function BubbleWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   const reminder = snapshot?.activeReminder;
+  const pointerState = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, a, input, textarea, select")) {
+      pointerState.current = null;
+      return;
+    }
+
+    pointerState.current = {
+      x: event.clientX,
+      y: event.clientY,
+      dragging: false
+    };
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const state = pointerState.current;
+    if (!state || state.dragging) {
+      return;
+    }
+
+    const movedX = Math.abs(event.clientX - state.x);
+    const movedY = Math.abs(event.clientY - state.y);
+    if (movedX + movedY < 4) {
+      return;
+    }
+
+    state.dragging = true;
+    void appWindow.startDragging();
+  }
+
+  function handlePointerEnd() {
+    pointerState.current = null;
+  }
 
   if (!reminder) {
     return <div className="bubble-empty" />;
   }
 
   return (
-    <div className="bubble-window">
+    <div
+      className="bubble-window"
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerEnd}
+      onPointerCancel={handlePointerEnd}
+      onPointerLeave={handlePointerEnd}
+    >
       <div className="bubble-card">
         <p className="bubble-kicker">Briefy-pet 提醒</p>
         <h2>你有 {reminder.articleCount} 条新内容</h2>
         <p className="bubble-copy">
-          当前提醒跨 {reminder.partitionCount} 个分区，桌宠已经切到提醒状态。你可以立刻进入主界面，也可以只延后当前这一批。
+          当前提醒跨 {reminder.partitionCount} 个分区。你可以立刻查看，或仅延后这一批。
         </p>
         <div className="bubble-actions">
           <button onClick={() => void bubbleAction("view")}>立即查看</button>
@@ -803,8 +1123,13 @@ function SettingsView({
   setSnapshot: React.Dispatch<React.SetStateAction<Snapshot | null>>;
 }) {
   const [saving, setSaving] = useState(false);
-  const [resetting, setResetting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [addingSource, setAddingSource] = useState(false);
+  const [addSourceError, setAddSourceError] = useState<string | null>(null);
+  const [customName, setCustomName] = useState("");
+  const [customUrl, setCustomUrl] = useState("");
+  const [customModule, setCustomModule] = useState<SourceModule>("technology");
+  const [customBucket, setCustomBucket] = useState<SourceBucket>("blogs");
 
   const disciplinePrefs = useMemo(
     () => sortDisciplinePrefs(snapshot.settings.disciplines),
@@ -816,10 +1141,20 @@ function SettingsView({
     [snapshot.settings.rssSources]
   );
 
+  const sortedModules = MODULE_ORDER.filter((module) => groupedSources.has(module));
+
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const formData = new FormData(event.currentTarget);
+    const llmProvider = String(formData.get("llmProvider") ?? "deepseek") as LlmProvider;
+    const providerApiKeys = Object.fromEntries(
+      PROVIDER_OPTIONS.map((provider) => [
+        provider.value,
+        String(formData.get(`apiKey-${provider.value}`) ?? "").trim()
+      ])
+    );
+
     const disciplines = disciplinePrefs.map((item) => ({
       discipline: item.discipline,
       enabled: formData.get(`discipline-enabled-${item.discipline}`) === "on",
@@ -837,11 +1172,14 @@ function SettingsView({
     }));
 
     const payload: SettingsPayload = {
-      apiKey: String(formData.get("apiKey") ?? ""),
+      apiKey: providerApiKeys[llmProvider] ?? "",
+      llmProvider,
+      llmModel: String(formData.get("llmModel") ?? "").trim(),
+      providerApiKeys,
       autoStart: formData.get("autoStart") === "on",
       disciplines,
       memoryModeEnabled: formData.get("memoryModeEnabled") === "on",
-      memorySummary: String(formData.get("memorySummary") ?? ""),
+      memorySummary: snapshot.settings.memorySummary,
       rssSources
     };
 
@@ -858,24 +1196,35 @@ function SettingsView({
     }
   }
 
-  async function handleReset() {
+  async function handleAddCustomSource() {
+    if (!customName.trim() || !customUrl.trim()) {
+      setAddSourceError("请先填写自定义 RSS 的名称和 URL。");
+      return;
+    }
+
+    setAddingSource(true);
+    setAddSourceError(null);
+    try {
+      const next = await addCustomRssSource(customName, customUrl, customModule, customBucket);
+      setSnapshot(next);
+      setCustomName("");
+      setCustomUrl("");
+      setCustomBucket("blogs");
+    } catch (err) {
+      setAddSourceError(err instanceof Error ? err.message : "新增 RSS 失败");
+    } finally {
+      setAddingSource(false);
+    }
+  }
+
+  async function handleResetRuntime() {
     const confirmed = window.confirm(
-      "This will clear your API Key, interests, fetched content, reminders, memory, and local cache. The action cannot be undone. Continue?"
+      "将清空全部数据库与配置缓存（包含推送库、设置、抓取状态）并重启应用，确认继续吗？"
     );
     if (!confirmed) {
       return;
     }
-
-    setResetting(true);
-    setSubmitError(null);
-    try {
-      const next = await resetAppData();
-      setSnapshot(next);
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "初始化失败");
-    } finally {
-      setResetting(false);
-    }
+    await resetRuntimeData();
   }
 
   return (
@@ -890,17 +1239,43 @@ function SettingsView({
       <section className="settings-card">
         <div className="settings-section-head">
           <h2>启动门槛</h2>
-          <p>设置有效 API Key 后系统才会进入抓取和评分流程。</p>
+          <p>选择模型服务商并填写对应 Key；只有当前服务商 Key 生效。</p>
         </div>
         <label>
-          <span>API Key</span>
+          <span>模型服务商</span>
+          <select name="llmProvider" defaultValue={snapshot.settings.llmProvider}>
+            {PROVIDER_OPTIONS.map((provider) => (
+              <option key={provider.value} value={provider.value}>
+                {provider.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>模型覆盖（可选）</span>
           <input
-            name="apiKey"
-            type="password"
-            defaultValue={snapshot.settings.apiKey}
-            placeholder="输入你的 API Key"
+            name="llmModel"
+            type="text"
+            defaultValue={snapshot.settings.llmModel}
+            placeholder="留空则使用服务商默认模型"
           />
         </label>
+        {PROVIDER_OPTIONS.map((provider) => (
+          <label key={provider.value}>
+            <span>{provider.label} API Key</span>
+            <input
+              name={`apiKey-${provider.value}`}
+              type="password"
+              defaultValue={snapshot.settings.providerApiKeys?.[provider.value] ?? ""}
+              placeholder={`输入 ${provider.label} 的 API Key`}
+            />
+          </label>
+        ))}
+        <div className="settings-hint">当前激活服务商：{snapshot.settings.llmProvider}</div>
+        <div className="settings-hint">当前激活 Key：{snapshot.settings.apiKey ? "已设置" : "未设置"}</div>
+        <div className="settings-hint">
+          保存后会自动校验并开始抓取。评分并发固定为 20，失败项会标记失败且不重复打分。
+        </div>
         <label className="checkbox-row">
           <input name="autoStart" type="checkbox" defaultChecked={snapshot.settings.autoStart} />
           <span>开机启动</span>
@@ -936,7 +1311,7 @@ function SettingsView({
       <section className="settings-card">
         <div className="settings-section-head">
           <h2>每日兴趣记忆</h2>
-          <p>你可以启用自动记忆，也可以手动编辑记忆摘要。</p>
+          <p>系统会基于你的阅读、收藏与笔记行为自动更新，不在前台手动编辑。</p>
         </div>
         <label className="checkbox-row">
           <input
@@ -946,35 +1321,27 @@ function SettingsView({
           />
           <span>启用每日兴趣记忆</span>
         </label>
-        <label>
-          <span>记忆摘要</span>
-          <textarea
-            name="memorySummary"
-            defaultValue={snapshot.settings.memorySummary}
-            placeholder="系统会在这里生成当天记忆"
-          />
-        </label>
       </section>
 
       <section className="settings-card">
         <div className="settings-section-head">
           <h2>源池开关</h2>
-          <p>按 module 与 bucket 分组管理信源开关。</p>
+          <p>按 module / bucket 折叠管理信源；取消勾选将清除该源历史。</p>
         </div>
         <div className="source-groups">
-          {MODULE_ORDER.filter((module) => groupedSources.has(module)).map((module) => (
-            <section key={module} className="source-discipline-block">
-              <div className="source-discipline-head">
+          {sortedModules.map((module) => (
+            <details key={module} className="source-discipline-block">
+              <summary className="source-discipline-head">
                 <h3>{MODULE_LABELS[module]}</h3>
-              </div>
+              </summary>
               {Array.from(groupedSources.get(module)!.entries()).map(([bucket, sources]) => (
-                <div key={`${module}-${bucket}`} className="source-kind-block">
-                  <div className="source-kind-head">
+                <details key={`${module}-${bucket}`} className="source-kind-block">
+                  <summary className="source-kind-head">
                     <strong>{BUCKET_LABELS[bucket]}</strong>
                     <span>
                       {SOURCE_KIND_LABELS[sources[0].sourceKind]} · {sources.length} 个
                     </span>
-                  </div>
+                  </summary>
                   <div className="rss-list">
                     {sources.map((source) => (
                       <label key={source.id} className="rss-item">
@@ -992,29 +1359,84 @@ function SettingsView({
                       </label>
                     ))}
                   </div>
-                </div>
+                </details>
               ))}
-            </section>
+            </details>
           ))}
         </div>
       </section>
 
-      <section className="settings-card settings-danger-card">
+      <section className="settings-card">
         <div className="settings-section-head">
-          <h2>重新初始化</h2>
-          <p>清空 API Key、兴趣勾选、抓取结果、提醒批次和本地缓存，让应用回到首次配置状态。</p>
+          <h2>自定义 RSS</h2>
+          <p>新增自己的 RSS 源并指定 module / bucket。</p>
         </div>
-        <div className="danger-note">
-          此操作不可撤销。建议只在需要重新测试或彻底重置本地数据时使用。
+        {addSourceError && <div className="error-banner">{addSourceError}</div>}
+        <label>
+          <span>名称</span>
+          <input
+            type="text"
+            value={customName}
+            onChange={(event) => setCustomName(event.target.value)}
+            placeholder="例如：My Research Feed"
+          />
+        </label>
+        <label>
+          <span>RSS URL</span>
+          <input
+            type="text"
+            value={customUrl}
+            onChange={(event) => setCustomUrl(event.target.value)}
+            placeholder="https://example.com/feed.xml"
+          />
+        </label>
+        <div className="discipline-grid">
+          <label>
+            <span>Module</span>
+            <select
+              value={customModule}
+              onChange={(event) => setCustomModule(event.target.value as SourceModule)}
+            >
+              {MODULE_OPTIONS.map((module) => (
+                <option key={module} value={module}>
+                  {MODULE_LABELS[module]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>Bucket</span>
+            <select
+              value={customBucket}
+              onChange={(event) => setCustomBucket(event.target.value as SourceBucket)}
+            >
+              {BUCKET_ORDER.map((bucket) => (
+                <option key={bucket} value={bucket}>
+                  {BUCKET_LABELS[bucket]}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
-        <div className="danger-actions">
+        <div className="settings-actions">
           <button
             type="button"
-            className="danger-button"
-            onClick={() => void handleReset()}
-            disabled={saving || resetting}
+            disabled={addingSource}
+            onClick={() => void handleAddCustomSource()}
           >
-            {resetting ? "正在重置..." : "清空数据并重新初始化"}
+            {addingSource ? "添加中..." : "添加自定义 RSS"}
+          </button>
+        </div>
+      </section>
+
+      <section className="settings-card">
+        <div className="settings-section-head">
+          <h2>全量重置</h2>
+          <p>清空全部数据库与配置缓存并重启应用，恢复为首次启动状态。</p>
+        </div>
+        <div className="settings-actions">
+          <button type="button" className="ghost-danger" onClick={() => void handleResetRuntime()}>
+            全量重置并重启
           </button>
         </div>
       </section>
@@ -1039,13 +1461,31 @@ function MainWindow({
   loading: boolean;
   error: string | null;
 }) {
-  const [selection, setSelection] = useState<FeedSelection>({ kind: "smart", key: "unread" });
+  const [selection, setSelection] = useState<FeedSelection>({ kind: "unread" });
+  // collapsedFolders: key = "section:module" e.g. "today:technology"
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
+  // section-level collapse: "today" | "favorites" | "history"
+  const [sectionCollapsed, setSectionCollapsed] = useState<Record<FeedSection, boolean>>({
+    today: false,
+    favorites: false,
+    history: true
+  });
   const [manualUnreadIds, setManualUnreadIds] = useState<number[]>([]);
+  const [archivedUnreadAt, setArchivedUnreadAt] = useState<Record<number, string>>({});
+  const [unreadClickCounts, setUnreadClickCounts] = useState<Record<number, number>>({});
   const [demoFavoriteIds, setDemoFavoriteIds] = useState<number[]>(
     DEMO_ARTICLES.filter((item) => item.isFavorite).map((item) => item.id)
   );
   const [localSelectedId, setLocalSelectedId] = useState<number | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [selectedRawContent, setSelectedRawContent] = useState("");
+  const [selectedRawArticleId, setSelectedRawArticleId] = useState<number | null>(null);
+  const [rawContentLoading, setRawContentLoading] = useState(false);
+  const [historyArchive, setHistoryArchive] = useState<HistoryItem[]>([]);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [leftWidth, setLeftWidth] = useState(252);
@@ -1068,6 +1508,24 @@ function MainWindow({
 
   const hasInterestedDiscipline = interestedDisciplines.size > 0;
 
+  const isConfigurationComplete = useMemo(() => {
+    if (!snapshot) {
+      return false;
+    }
+
+    const hasApiKey = snapshot.settings.apiKey.trim().length > 0;
+    if (!hasApiKey || !snapshot.apiKeyValid) {
+      return false;
+    }
+
+    const enabled = snapshot.settings.disciplines.filter((item) => item.enabled);
+    if (enabled.length === 0) {
+      return false;
+    }
+
+    return enabled.every((item) => item.preference.trim().length > 0);
+  }, [snapshot]);
+
   const usingDemoData = false;
 
   const activeSources = useMemo(() => {
@@ -1083,170 +1541,286 @@ function MainWindow({
   }, [snapshot?.settings.rssSources, usingDemoData, hasInterestedDiscipline, interestedDisciplines]);
 
   const activeSourceIds = useMemo(() => new Set(activeSources.map((source) => source.id)), [activeSources]);
+  const sourceById = useMemo(
+    () => new Map(activeSources.map((source) => [source.id, source])),
+    [activeSources]
+  );
 
-  const baseArticles = useMemo(() => {
-    const all = usingDemoData ? DEMO_ARTICLES : snapshot?.articles ?? [];
+  const manualUnreadSet = useMemo(() => new Set(manualUnreadIds), [manualUnreadIds]);
+  const archivedUnreadSet = useMemo(
+    () => new Set(Object.keys(archivedUnreadAt).map((id) => Number(id))),
+    [archivedUnreadAt]
+  );
 
+  const reminderArticleIds = useMemo(
+    () => new Set<number>(snapshot?.activeReminder?.articleIds ?? []),
+    [snapshot?.activeReminder]
+  );
+
+  const allArticles = useMemo(() => {
+    const all = snapshot?.articles ?? [];
     if (!hasInterestedDiscipline) {
       return [];
     }
 
-    return all.filter((article) => {
-      if (activeSourceIds.has(article.sourceId)) {
-        return true;
-      }
-      return interestedDisciplines.has(article.discipline);
-    });
-  }, [snapshot?.articles, usingDemoData, hasInterestedDiscipline, activeSourceIds, interestedDisciplines]);
+    return dedupeArticles(
+      all.filter((a) => activeSourceIds.has(a.sourceId) || interestedDisciplines.has(a.discipline))
+    );
+  }, [snapshot?.articles, hasInterestedDiscipline, activeSourceIds, interestedDisciplines]);
 
-  const articles = useMemo(() => {
-    if (!usingDemoData) {
-      return baseArticles;
+  const articleById = useMemo(() => new Map(allArticles.map((article) => [article.id, article])), [allArticles]);
+
+  const historyItems = useMemo(() => dedupeHistoryItems(historyArchive), [historyArchive]);
+
+  const historyByArticleId = useMemo(() => {
+    const map = new Map<number, HistoryItem>();
+    for (const item of historyItems) {
+      const previous = map.get(item.id);
+      if (!previous || toSafeTimestamp(item.batchCreatedAt) > toSafeTimestamp(previous.batchCreatedAt)) {
+        map.set(item.id, item);
+      }
     }
-    const favoriteSet = new Set(demoFavoriteIds);
-    return baseArticles.map((item) => ({
-      ...item,
-      isFavorite: favoriteSet.has(item.id)
-    }));
-  }, [baseArticles, demoFavoriteIds, usingDemoData]);
+    return map;
+  }, [historyItems]);
 
-  const manualUnreadSet = useMemo(() => new Set(manualUnreadIds), [manualUnreadIds]);
+  const articleMetaById = useMemo(() => {
+    const map = new Map<number, ArticleMeta>();
 
-  const isArticleUnread = (article: Article) => article.isNew || manualUnreadSet.has(article.id);
-
-  const folders = useMemo(() => {
-    const grouped = new Map<SourceModule, RssSource[]>();
-    for (const source of activeSources) {
-      if (!grouped.has(source.module)) {
-        grouped.set(source.module, []);
-      }
-      grouped.get(source.module)!.push(source);
+    for (const article of allArticles) {
+      map.set(article.id, resolveArticleMeta(article, sourceById, historyByArticleId));
     }
 
-    const sorted = new Map<SourceModule, RssSource[]>();
-    for (const module of MODULE_ORDER) {
-      const items = grouped.get(module);
-      if (!items || items.length === 0) {
+    for (const item of historyItems) {
+      map.set(item.id, {
+        module: item.module || "other",
+        bucket: item.bucket || "unspecified",
+        sourceName: item.sourceName,
+        pushedAt: item.batchCreatedAt ?? null
+      });
+    }
+
+    return map;
+  }, [allArticles, sourceById, historyByArticleId, historyItems]);
+
+  const reminderArticles = useMemo(
+    () => dedupeArticles(allArticles.filter((article) => reminderArticleIds.has(article.id))),
+    [allArticles, reminderArticleIds]
+  );
+
+  const unreadArticles = useMemo(() => {
+    const unread = reminderArticles.filter(
+      (article) =>
+        !archivedUnreadSet.has(article.id) &&
+        ((reminderArticleIds.has(article.id) && article.isNew) || manualUnreadSet.has(article.id))
+    );
+    return dedupeArticles(unread);
+  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet]);
+
+  const unreadIdSet = useMemo(() => new Set(unreadArticles.map((article) => article.id)), [unreadArticles]);
+
+  const todayFromHistory = useMemo(() => {
+    const now = new Date();
+    return historyItems
+      .filter((item) => isSameCalendarDay(now, item.batchCreatedAt))
+      .map((item) => articleById.get(item.id) ?? historyItemToArticle(item));
+  }, [historyItems, articleById]);
+
+  const todayFromArchivedUnread = useMemo(() => {
+    const now = new Date();
+    const merged: Article[] = [];
+
+    for (const [idText, archivedAt] of Object.entries(archivedUnreadAt)) {
+      if (!isSameCalendarDay(now, archivedAt)) {
         continue;
       }
-      sorted.set(
-        module,
-        [...items].sort((a, b) => {
-          const bucketDiff = BUCKET_ORDER.indexOf(a.bucket) - BUCKET_ORDER.indexOf(b.bucket);
-          if (bucketDiff !== 0) {
-            return bucketDiff;
-          }
-          return a.name.localeCompare(b.name);
-        })
+
+      const article = articleById.get(Number(idText));
+      if (article) {
+        merged.push(article);
+      }
+    }
+
+    return merged;
+  }, [archivedUnreadAt, articleById]);
+
+  const todayArticles = useMemo(() => {
+    const merged = dedupeArticles([...todayFromHistory, ...todayFromArchivedUnread]);
+    return merged.filter((article) => !unreadIdSet.has(article.id));
+  }, [todayFromHistory, todayFromArchivedUnread, unreadIdSet]);
+
+  const historyArticles = useMemo(() => {
+    const now = new Date();
+    return dedupeArticles(
+      historyItems
+        .filter((item) => !isSameCalendarDay(now, item.batchCreatedAt))
+        .map((item) => articleById.get(item.id) ?? historyItemToArticle(item))
+    );
+  }, [historyItems, articleById]);
+
+  const favoritePool = useMemo(
+    () =>
+      dedupeArticles([
+        ...allArticles,
+        ...historyItems.map((item) => articleById.get(item.id) ?? historyItemToArticle(item))
+      ]),
+    [allArticles, historyItems, articleById]
+  );
+
+  const favoriteArticles = useMemo(() => {
+    return dedupeArticles(
+      favoritePool.filter((article) => {
+        if (usingDemoData) {
+          return demoFavoriteIds.includes(article.id);
+        }
+
+        const hasNote = (article.note ?? "").trim().length > 0;
+        return article.isFavorite || hasNote;
+      })
+    );
+  }, [favoritePool, usingDemoData, demoFavoriteIds]);
+
+  const buildArticleTree = (arts: Article[]) => {
+    const tree = new Map<string, Map<string, number>>();
+
+    for (const article of arts) {
+      const meta = articleMetaById.get(article.id);
+      if (!meta) {
+        continue;
+      }
+
+      const module = meta.module || "other";
+      const bucket = meta.bucket || "unspecified";
+      if (!tree.has(module)) {
+        tree.set(module, new Map());
+      }
+
+      const buckets = tree.get(module)!;
+      buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
+    }
+
+    return tree;
+  };
+
+  const todayTree = useMemo(() => buildArticleTree(todayArticles), [todayArticles, articleMetaById]);
+  const favoritesTree = useMemo(
+    () => buildArticleTree(favoriteArticles),
+    [favoriteArticles, articleMetaById]
+  );
+  const historyTree = useMemo(() => buildArticleTree(historyArticles), [historyArticles, articleMetaById]);
+
+  const todayTreeEntries = useMemo(() => orderedTreeEntries(todayTree), [todayTree]);
+  const favoritesTreeEntries = useMemo(() => orderedTreeEntries(favoritesTree), [favoritesTree]);
+  const historyTreeEntries = useMemo(() => orderedTreeEntries(historyTree), [historyTree]);
+
+  const sectionCounts = useMemo(
+    () => ({
+      unread: unreadArticles.length,
+      today: todayArticles.length,
+      favorites: favoriteArticles.length,
+      history: historyArticles.length
+    }),
+    [unreadArticles, todayArticles, favoriteArticles, historyArticles]
+  );
+
+  const timelineArticles = useMemo((): Article[] => {
+    const matchByBucket = (article: Article, module: string, bucket: string) => {
+      const meta = articleMetaById.get(article.id);
+      return meta?.module === module && meta?.bucket === bucket;
+    };
+
+    if (selection.kind === "unread") {
+      return [...unreadArticles].sort(
+        (left, right) =>
+          articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+          articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
       );
     }
 
-    return sorted;
-  }, [activeSources]);
-
-  const unreadBySource = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const article of articles) {
-      if (!isArticleUnread(article)) {
-        continue;
-      }
-      map.set(article.sourceId, (map.get(article.sourceId) ?? 0) + 1);
-    }
-    return map;
-  }, [articles, manualUnreadSet]);
-
-  const smartCounts = useMemo(() => {
-    const now = new Date();
-    let today = 0;
-    let unread = 0;
-    let starred = 0;
-
-    for (const article of articles) {
-      const date = new Date(article.publishedAt ?? article.fetchedAt ?? 0);
-      if (
-        date.getFullYear() === now.getFullYear() &&
-        date.getMonth() === now.getMonth() &&
-        date.getDate() === now.getDate()
-      ) {
-        today += 1;
-      }
-      if (isArticleUnread(article)) {
-        unread += 1;
-      }
-      if (article.isFavorite) {
-        starred += 1;
-      }
+    const { section, module, bucket } = selection;
+    if (section === "today") {
+      return todayArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
     }
 
-    return { today, unread, starred };
-  }, [articles, manualUnreadSet]);
-
-  const timelineArticles = useMemo(() => {
-    let result = [...articles];
-
-    if (selection.kind === "smart") {
-      if (selection.key === "today") {
-        const now = new Date();
-        result = result.filter((article) => {
-          const date = new Date(article.publishedAt ?? article.fetchedAt ?? 0);
-          return (
-            date.getFullYear() === now.getFullYear() &&
-            date.getMonth() === now.getMonth() &&
-            date.getDate() === now.getDate()
-          );
-        });
-      }
-      if (selection.key === "unread") {
-        result = result.filter((article) => isArticleUnread(article));
-      }
-      if (selection.key === "starred") {
-        result = result.filter((article) => article.isFavorite);
-      }
+    if (section === "favorites") {
+      return favoriteArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
     }
 
-    if (selection.kind === "source") {
-      result = result.filter((article) => article.sourceId === selection.sourceId);
+    if (section === "history") {
+      return historyArticles
+        .filter((article) => matchByBucket(article, module, bucket))
+        .sort(
+          (left, right) =>
+            articleTimestamp(right, articleMetaById.get(right.id)?.pushedAt) -
+            articleTimestamp(left, articleMetaById.get(left.id)?.pushedAt)
+        );
     }
 
-    result.sort((left, right) => {
-      const unreadDiff = Number(isArticleUnread(right)) - Number(isArticleUnread(left));
-      if (unreadDiff !== 0) {
-        return unreadDiff;
-      }
-      return articleTimestamp(right) - articleTimestamp(left);
-    });
+    return [];
+  }, [selection, unreadArticles, todayArticles, favoriteArticles, historyArticles, articleMetaById]);
 
-    return result;
-  }, [articles, selection, manualUnreadSet]);
+  const allKnownArticles = useMemo(
+    () => dedupeArticles([...allArticles, ...todayArticles, ...favoriteArticles, ...historyArticles]),
+    [allArticles, todayArticles, favoriteArticles, historyArticles]
+  );
 
   const selectedArticle = useMemo(() => {
-    const preferredId = usingDemoData ? localSelectedId : snapshot?.selectedArticleId ?? localSelectedId;
+    const preferredId = localSelectedId ?? snapshot?.selectedArticleId ?? null;
     if (preferredId) {
-      const found = timelineArticles.find((item) => item.id === preferredId);
-      if (found) {
-        return found;
+      const inTimeline = timelineArticles.find((item) => item.id === preferredId);
+      if (inTimeline) {
+        return inTimeline;
+      }
+
+      const inAll = allKnownArticles.find((article) => article.id === preferredId);
+      if (inAll) {
+        return inAll;
       }
     }
+
     return timelineArticles[0] ?? null;
-  }, [timelineArticles, usingDemoData, localSelectedId, snapshot?.selectedArticleId]);
+  }, [timelineArticles, allKnownArticles, localSelectedId, snapshot?.selectedArticleId]);
+
+  const selectedArticleMeta = useMemo(() => {
+    if (!selectedArticle) {
+      return null;
+    }
+    return articleMetaById.get(selectedArticle.id) ?? null;
+  }, [selectedArticle, articleMetaById]);
 
   useEffect(() => {
-    if (!selection || selection.kind !== "source") {
+    const incoming = snapshot?.historyArticles ?? [];
+    if (incoming.length === 0) {
+      setHistoryArchive([]);
+      setHistoryOffset(0);
+      setHistoryHasMore(false);
       return;
     }
-    const exists = activeSources.some((source) => source.id === selection.sourceId);
-    if (!exists) {
-      setSelection({ kind: "smart", key: "unread" });
-    }
-  }, [activeSources, selection]);
+
+    const dedupIncoming = dedupeHistoryItems(incoming);
+    setHistoryArchive((prev) => dedupeHistoryItems([...dedupIncoming, ...prev]));
+    setHistoryOffset((prev) => Math.max(prev, dedupIncoming.length));
+    setHistoryHasMore(dedupIncoming.length >= HISTORY_PAGE_SIZE);
+  }, [snapshot?.historyArticles]);
 
   useEffect(() => {
-    if (!snapshot || hasInterestedDiscipline || snapshot.activeView === "settings") {
+    if (!snapshot || isConfigurationComplete || snapshot.activeView === "settings") {
       return;
     }
 
     void setActiveView("settings").then(setSnapshot);
-  }, [snapshot, hasInterestedDiscipline, setSnapshot]);
+  }, [snapshot, isConfigurationComplete, setSnapshot]);
 
   useEffect(() => {
     if (!selectedArticle) {
@@ -1254,6 +1828,62 @@ function MainWindow({
     }
     setLocalSelectedId(selectedArticle.id);
   }, [selectedArticle?.id]);
+
+  useEffect(() => {
+    const remoteSelectedId = snapshot?.selectedArticleId ?? null;
+    if (!remoteSelectedId) {
+      return;
+    }
+
+    setLocalSelectedId((current) =>
+      current === remoteSelectedId ? current : remoteSelectedId
+    );
+  }, [snapshot?.selectedArticleId]);
+
+  useEffect(() => {
+    setNoteDraft(selectedArticle?.note ?? "");
+  }, [selectedArticle?.id, selectedArticle?.note]);
+
+  useEffect(() => {
+    if (!selectedArticle || usingDemoData) {
+      setRawContentLoading(false);
+      return;
+    }
+
+    if (selectedRawArticleId === selectedArticle.id) {
+      setRawContentLoading(false);
+      return;
+    }
+
+    const articleId = selectedArticle.id;
+    let cancelled = false;
+    setRawContentLoading(true);
+    setSelectedRawContent("");
+
+    void getArticleRawContent(articleId)
+      .then((content) => {
+        if (cancelled) {
+          return;
+        }
+        setSelectedRawContent(content);
+        setSelectedRawArticleId(articleId);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        setInteractionMessage(err instanceof Error ? err.message : "加载原文失败");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRawContentLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedArticle?.id, selectedRawArticleId, usingDemoData]);
 
   useEffect(() => {
     const updateCompact = () => {
@@ -1342,11 +1972,51 @@ function MainWindow({
     document.body.style.userSelect = "none";
   }
 
-  async function handleSelectArticle(articleId: number) {
+  async function handleLoadMoreHistory() {
+    if (usingDemoData || historyLoadingMore || !historyHasMore) {
+      return;
+    }
+
+    setHistoryLoadingMore(true);
+    try {
+      const page = await listHistoryArticlesPage(historyOffset, HISTORY_PAGE_SIZE);
+      setHistoryArchive((prev) => dedupeHistoryItems([...prev, ...page]));
+      setHistoryOffset((prev) => prev + page.length);
+      if (page.length < HISTORY_PAGE_SIZE) {
+        setHistoryHasMore(false);
+      }
+    } catch (err) {
+      setInteractionMessage(err instanceof Error ? err.message : "加载历史推送失败");
+    } finally {
+      setHistoryLoadingMore(false);
+    }
+  }
+
+  async function handleSelectArticle(
+    articleId: number,
+    options?: { fromUnreadSelection?: boolean }
+  ) {
+    const unreadSelection = options?.fromUnreadSelection ?? selection.kind === "unread";
+    setLocalSelectedId(articleId);
+
+    if (unreadSelection) {
+      const clicked = unreadClickCounts[articleId] ?? 0;
+      if (clicked < 1) {
+        setUnreadClickCounts({ [articleId]: clicked + 1 });
+        setInteractionMessage("再次点击将归档到 Today");
+        return;
+      }
+
+      setArchivedUnreadAt((prev) => ({
+        ...prev,
+        [articleId]: new Date().toISOString()
+      }));
+    }
+
+    setUnreadClickCounts({});
     setManualUnreadIds((prev) => prev.filter((id) => id !== articleId));
 
     if (usingDemoData) {
-      setLocalSelectedId(articleId);
       return;
     }
 
@@ -1381,10 +2051,46 @@ function MainWindow({
     }
   }
 
+  async function handleSaveNote() {
+    if (!selectedArticle) {
+      return;
+    }
+    if (noteDraft.trim() === (selectedArticle.note ?? "").trim()) {
+      return;
+    }
+    if (usingDemoData) {
+      setInteractionMessage("Demo 模式不保存笔记");
+      return;
+    }
+
+    setNoteSaving(true);
+    try {
+      const next = await saveArticleNote(selectedArticle.id, noteDraft);
+      setSnapshot(next);
+      setInteractionMessage("笔记已保存");
+    } catch (err) {
+      setInteractionMessage(err instanceof Error ? err.message : "保存笔记失败");
+    } finally {
+      setNoteSaving(false);
+    }
+  }
+
   function handleMarkUnread() {
     if (!selectedArticle) {
       return;
     }
+
+    setSelection({ kind: "unread" });
+    setArchivedUnreadAt((prev) => {
+      if (!(selectedArticle.id in prev)) {
+        return prev;
+      }
+
+      const next = { ...prev };
+      delete next[selectedArticle.id];
+      return next;
+    });
+
     setManualUnreadIds((prev) => {
       if (prev.includes(selectedArticle.id)) {
         return prev;
@@ -1415,18 +2121,26 @@ function MainWindow({
   }
 
   const selectedFeedLabel = useMemo(() => {
-    if (selection.kind === "smart") {
-      if (selection.key === "today") {
-        return "Today";
-      }
-      if (selection.key === "unread") {
-        return "Unread";
-      }
-      return "Starred";
-    }
+    if (selection.kind === "unread") return "Unread";
+    const sectionLabel = { today: "Today", favorites: "Favorites", history: "History" }[selection.section];
+    const modLabel = MODULE_LABELS[selection.module as SourceModule] ?? selection.module;
+    const bktLabel = BUCKET_LABELS[selection.bucket as SourceBucket] ?? selection.bucket;
+    return `${sectionLabel} · ${modLabel} / ${bktLabel}`;
+  }, [selection]);
 
-    return activeSources.find((source) => source.id === selection.sourceId)?.name ?? "Feed";
-  }, [activeSources, selection]);
+  const selectedModuleLabel = selectedArticleMeta
+    ? MODULE_LABELS[selectedArticleMeta.module as SourceModule] ?? selectedArticleMeta.module
+    : "未分类";
+  const selectedBucketLabel = selectedArticleMeta
+    ? BUCKET_LABELS[selectedArticleMeta.bucket as SourceBucket] ?? selectedArticleMeta.bucket
+    : "未分类";
+  const selectedSourceLabel = selectedArticleMeta?.sourceName ?? selectedArticle?.sourceName ?? "未知来源";
+  const selectedPublishedTime = selectedArticle
+    ? formatArticleTime(selectedArticle.publishedAt ?? selectedArticle.fetchedAt)
+    : "未知";
+  const selectedPushedTime = selectedArticleMeta?.pushedAt
+    ? formatArticleTime(selectedArticleMeta.pushedAt)
+    : "未记录";
 
   const layoutStyle = useMemo(() => {
     const sidebarWidth = sidebarCollapsed ? 0 : leftWidth;
@@ -1481,8 +2195,8 @@ function MainWindow({
 
           <button
             className={snapshot.activeView === "reading" ? "active" : ""}
-            disabled={!hasInterestedDiscipline}
-            title={!hasInterestedDiscipline ? "请先在设置中选择至少一个感兴趣学科" : undefined}
+            disabled={!isConfigurationComplete}
+            title={!isConfigurationComplete ? "请先完成 API Key 与兴趣配置" : undefined}
             onClick={() => void setActiveView("reading").then(setSnapshot)}
           >
             阅读
@@ -1496,11 +2210,13 @@ function MainWindow({
         </div>
       </header>
 
-      {snapshot.lastError && <div className="error-banner">{snapshot.lastError}</div>}
+      {snapshot.lastError && snapshot.lastError.toLowerCase().includes("api key") && (
+        <div className="error-banner">{snapshot.lastError}</div>
+      )}
       {interactionMessage && <div className="interaction-banner">{interactionMessage}</div>}
       {loading && <div className="loading-strip">正在同步最新快照...</div>}
       {snapshot.petStatus === "scanning" && (
-        <div className="loading-strip">Scanning in progress. Results will appear after this round completes.</div>
+        <div className="loading-strip">正在后台抓取并评分，本批次完成后会更新列表与提醒。</div>
       )}
       {error && <div className="error-banner">{error}</div>}
 
@@ -1512,12 +2228,12 @@ function MainWindow({
         />
       ) : (
         <div className="reader-workbench">
-          {!hasInterestedDiscipline ? (
+          {!isConfigurationComplete ? (
             <div className="discipline-required-panel">
-              <h2>先选择你感兴趣的学科</h2>
-              <p>完成后，左侧订阅池将只保留对应学科的信源，不再展示全部来源。</p>
+              <h2>先完成初始化配置</h2>
+              <p>请先填写有效 API Key，并至少启用 1 个学科且写下兴趣偏好后再进入阅读。</p>
               <button onClick={() => void setActiveView("settings").then(setSnapshot)}>
-                去设置学科
+                去设置
               </button>
             </div>
           ) : (
@@ -1526,105 +2242,277 @@ function MainWindow({
               <div className="pane-head">Feeds</div>
 
               <div className="sidebar-scroll">
+
+                {/* ── Unread ─────────────────────────────── */}
                 <section className="smart-section">
-                  <h2>Smart Feeds</h2>
-
                   <button
-                    className={`feed-row ${selection.kind === "smart" && selection.key === "today" ? "active" : ""}`}
-                    onClick={() => setSelection({ kind: "smart", key: "today" })}
-                  >
-                    <span className="feed-row-left">
-                      <SymbolIcon name="today" className="row-icon" />
-                      Today
-                    </span>
-                    <span className="count-badge">{smartCounts.today}</span>
-                  </button>
-
-                  <button
-                    className={`feed-row ${selection.kind === "smart" && selection.key === "unread" ? "active" : ""}`}
-                    onClick={() => setSelection({ kind: "smart", key: "unread" })}
+                    className={`feed-row${selection.kind === "unread" ? " active" : ""}`}
+                    onClick={() => setSelection({ kind: "unread" })}
                   >
                     <span className="feed-row-left">
                       <SymbolIcon name="unread" className="row-icon" />
-                      Unread
+                      <strong>Unread</strong>
                     </span>
-                    <span className="count-badge">{smartCounts.unread}</span>
-                  </button>
-
-                  <button
-                    className={`feed-row ${selection.kind === "smart" && selection.key === "starred" ? "active" : ""}`}
-                    onClick={() => setSelection({ kind: "smart", key: "starred" })}
-                  >
-                    <span className="feed-row-left">
-                      <SymbolIcon name="star" className="row-icon" />
-                      Starred
-                    </span>
-                    <span className="count-badge">{smartCounts.starred}</span>
+                    {sectionCounts.unread > 0 && (
+                      <span className="count-badge">{sectionCounts.unread}</span>
+                    )}
                   </button>
                 </section>
 
-                <section className="folder-section">
-                  <h2>Folders</h2>
-
-                  {Array.from(folders.entries()).map(([module, sources]) => {
-                    const folderKey = module;
-                    const collapsed = collapsedFolders[folderKey] ?? false;
-
-                    return (
-                      <div key={folderKey} className="folder-block">
-                        <button
-                          className="folder-row"
-                          onClick={() => {
-                            setCollapsedFolders((prev) => ({
-                              ...prev,
-                              [folderKey]: !collapsed
-                            }));
-                          }}
-                        >
-                          <span className={`folder-chevron ${collapsed ? "collapsed" : ""}`}>
-                            <SymbolIcon name="chevron" className="row-icon" />
-                          </span>
-                          <SymbolIcon name="folder" className="row-icon" />
-                          <span>{MODULE_LABELS[module]}</span>
-                        </button>
-
-                        {!collapsed && (
-                          <div className="feed-list">
-                            {sources.map((source) => {
-                              const selected =
-                                selection.kind === "source" && selection.sourceId === source.id;
-                              const unreadCount = unreadBySource.get(source.id) ?? 0;
-
-                              return (
-                                <button
-                                  key={source.id}
-                                  className={`feed-row child ${selected ? "active" : ""}`}
-                                  onClick={() => setSelection({ kind: "source", sourceId: source.id })}
-                                >
-                                  <span className="feed-row-left">
-                                    <Favicon url={source.url} name={source.name} />
-                                    <span className="feed-name">{source.name}</span>
-                                  </span>
-                                  {unreadCount > 0 && (
-                                    <span className="count-badge">{unreadCount}</span>
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
+                {/* ── Today ──────────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "today";
+                  const entries = todayTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="today" className="row-icon" />
+                        <span>Today</span>
+                        {sectionCounts.today > 0 && (
+                          <span className="count-badge">{sectionCounts.today}</span>
                         )}
-                      </div>
-                    );
-                  })}
-                </section>
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? false;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      {!secCollapsed && historyHasMore && (
+                        <button
+                          className="feed-row child"
+                          disabled={historyLoadingMore}
+                          onClick={() => void handleLoadMoreHistory()}
+                        >
+                          <span className="feed-row-left">
+                            <span className="feed-name">
+                              {historyLoadingMore ? "正在加载..." : "加载更多历史推送"}
+                            </span>
+                          </span>
+                        </button>
+                      )}
+                    </section>
+                  );
+                })()}
+
+                {/* ── Favorites ──────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "favorites";
+                  const entries = favoritesTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="star" className="row-icon" />
+                        <span>Favorites</span>
+                        {sectionCounts.favorites > 0 && (
+                          <span className="count-badge">{sectionCounts.favorites}</span>
+                        )}
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? false;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })()}
+
+                {/* ── History ────────────────────────────── */}
+                {(() => {
+                  const sec: FeedSection = "history";
+                  const entries = historyTreeEntries;
+                  const secCollapsed = sectionCollapsed[sec];
+                  return (
+                    <section className="folder-section">
+                      <button
+                        className="folder-row section-head"
+                        onClick={() =>
+                          setSectionCollapsed((prev) => ({ ...prev, [sec]: !prev[sec] }))
+                        }
+                      >
+                        <span className={`folder-chevron ${secCollapsed ? "collapsed" : ""}`}>
+                          <SymbolIcon name="chevron" className="row-icon" />
+                        </span>
+                        <SymbolIcon name="reader" className="row-icon" />
+                        <span>History</span>
+                        <span className="count-badge">{sectionCounts.history}</span>
+                      </button>
+                      {!secCollapsed &&
+                        entries.map(({ module: mod, buckets }) => {
+                          const fk = `${sec}:${mod}`;
+                          const fc = collapsedFolders[fk] ?? true;
+                          return (
+                            <div key={fk} className="folder-block">
+                              <button
+                                className="folder-row"
+                                onClick={() =>
+                                  setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
+                                }
+                              >
+                                <span className={`folder-chevron ${fc ? "collapsed" : ""}`}>
+                                  <SymbolIcon name="chevron" className="row-icon" />
+                                </span>
+                                <SymbolIcon name="folder" className="row-icon" />
+                                <span>{MODULE_LABELS[mod as SourceModule] ?? mod}</span>
+                              </button>
+                              {!fc && (
+                                <div className="feed-list">
+                                  {buckets.map(([bkt, cnt]) => (
+                                    <button
+                                      key={bkt}
+                                      className={`feed-row child${
+                                        selection.kind === "bucket" &&
+                                        selection.section === sec &&
+                                        selection.module === mod &&
+                                        selection.bucket === bkt
+                                          ? " active"
+                                          : ""
+                                      }`}
+                                      onClick={() =>
+                                        setSelection({
+                                          kind: "bucket",
+                                          section: sec,
+                                          module: mod,
+                                          bucket: bkt
+                                        })
+                                      }
+                                    >
+                                      <span className="feed-row-left">
+                                        <span className="feed-name">
+                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                        </span>
+                                      </span>
+                                      <span className="count-badge">{cnt}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </section>
+                  );
+                })()}
+
               </div>
 
               <div className="sidebar-footer">
                 <button
                   className="icon-button"
-                  onClick={() => {
-                    void setActiveView("settings").then(setSnapshot);
-                  }}
+                  onClick={() => void setActiveView("settings").then(setSnapshot)}
                   aria-label="设置"
                 >
                   <SymbolIcon name="settings" className="toolbar-icon" />
@@ -1658,23 +2546,42 @@ function MainWindow({
                 )}
 
                 {timelineArticles.map((article) => {
+                  const meta = articleMetaById.get(article.id);
+                  const moduleLabel = meta
+                    ? MODULE_LABELS[meta.module as SourceModule] ?? meta.module
+                    : "未分类";
+                  const bucketLabel = meta
+                    ? BUCKET_LABELS[meta.bucket as SourceBucket] ?? meta.bucket
+                    : "未分类";
+                  const sourceLabel = meta?.sourceName ?? article.sourceName;
+                  const timelineTime = formatArticleTime(
+                    article.publishedAt ?? article.fetchedAt ?? meta?.pushedAt ?? null
+                  );
                   const selected = selectedArticle?.id === article.id;
-                  const unread = isArticleUnread(article);
+                  const isUnreadItem = unreadIdSet.has(article.id) || manualUnreadSet.has(article.id);
 
                   return (
                     <button
                       key={article.id}
                       className={`timeline-card ${selected ? "selected" : ""}`}
                       onClick={() => {
-                        void handleSelectArticle(article.id);
+                        void handleSelectArticle(article.id, {
+                          fromUnreadSelection: selection.kind === "unread"
+                        });
                       }}
                     >
                       <div className="timeline-card-head">
-                        <span className={`unread-dot ${unread ? "visible" : ""}`} />
+                        <span className={`unread-dot ${isUnreadItem ? "visible" : ""}`} />
                         <h3>{article.title}</h3>
                       </div>
                       <p className="timeline-meta">
-                        {article.sourceName} · {formatTimelineTime(article.publishedAt ?? article.fetchedAt)}
+                        MOD {moduleLabel} · BKT {bucketLabel} · PUB {timelineTime}
+                        {article.fitScore > 0 && (
+                          <span className="score-chip"> · {article.fitScore}分</span>
+                        )}
+                      </p>
+                      <p className="timeline-submeta">
+                        SRC {sourceLabel} · FIT {fitLabel(article.fitLevel)}
                       </p>
                       <p className="timeline-snippet">{article.summary}</p>
                     </button>
@@ -1695,15 +2602,26 @@ function MainWindow({
                     <div>
                       <h2>{selectedArticle.title}</h2>
                       <div className="reader-meta">
-                        <span>作者：{selectedArticle.sourceName}</span>
-                        <span>时间：{formatArticleTime(selectedArticle.publishedAt)}</span>
+                        <span>MOD：{selectedModuleLabel}</span>
+                        <span>BKT：{selectedBucketLabel}</span>
+                        <span>PUB：{selectedPublishedTime}</span>
+                        <span>PUSH：{selectedPushedTime}</span>
                         <button
                           className="feed-link"
-                          onClick={() =>
-                            setSelection({ kind: "source", sourceId: selectedArticle.sourceId })
-                          }
+                          onClick={() => {
+                            if (selectedArticleMeta) {
+                              const targetSection: FeedSection =
+                                selection.kind === "bucket" ? selection.section : "today";
+                              setSelection({
+                                kind: "bucket",
+                                section: targetSection,
+                                module: selectedArticleMeta.module,
+                                bucket: selectedArticleMeta.bucket
+                              });
+                            }
+                          }}
                         >
-                          来源：{selectedArticle.sourceName}
+                          SRC：{selectedSourceLabel}
                         </button>
                       </div>
                     </div>
@@ -1731,6 +2649,46 @@ function MainWindow({
                   <div className="reader-scroll">
                     <div className="reader-content-wrap">
                       <section className="reader-block">
+                        <h3>CHECK 简表</h3>
+                        <div className="reader-check-grid">
+                          <p>
+                            <strong>MOD</strong>
+                            <span>{selectedModuleLabel}</span>
+                          </p>
+                          <p>
+                            <strong>BKT</strong>
+                            <span>{selectedBucketLabel}</span>
+                          </p>
+                          <p>
+                            <strong>SRC</strong>
+                            <span>{selectedSourceLabel}</span>
+                          </p>
+                          <p>
+                            <strong>PUB</strong>
+                            <span>{selectedPublishedTime}</span>
+                          </p>
+                          <p>
+                            <strong>PUSH</strong>
+                            <span>{selectedPushedTime}</span>
+                          </p>
+                          <p>
+                            <strong>FIT</strong>
+                            <span>
+                              {fitLabel(selectedArticle.fitLevel)} / {selectedArticle.fitScore} 分
+                            </span>
+                          </p>
+                          <p>
+                            <strong>FAV</strong>
+                            <span>{selectedArticle.isFavorite ? "是" : "否"}</span>
+                          </p>
+                          <p>
+                            <strong>NOTE</strong>
+                            <span>{(selectedArticle.note ?? "").trim() ? "有" : "无"}</span>
+                          </p>
+                        </div>
+                      </section>
+
+                      <section className="reader-block">
                         <h3>LLM摘要</h3>
                         <p>{selectedArticle.summary || "暂无摘要"}</p>
                       </section>
@@ -1744,9 +2702,29 @@ function MainWindow({
                       </section>
 
                       <section className="reader-block">
+                        <h3>我的笔记</h3>
+                        <textarea
+                          className="reader-note-editor"
+                          value={noteDraft}
+                          onChange={(event) => setNoteDraft(event.target.value)}
+                          onBlur={() => void handleSaveNote()}
+                          placeholder="记录你的想法，失焦后自动保存"
+                        />
+                        <p className="reader-score-line">
+                          {noteSaving ? "正在保存笔记..." : "提示：在 Unread 视图中双击同一条内容可归档"}
+                        </p>
+                      </section>
+
+                      <section className="reader-block">
                         <h3>RSS抓到的原文</h3>
                         <pre className="reader-raw-content">
-                          {rssRawToText(selectedArticle.rawContent || "") || "暂无原文内容"}
+                          {rawContentLoading
+                            ? "正在加载原文..."
+                            : rssRawToText(
+                                usingDemoData
+                                  ? selectedArticle.rawContent || ""
+                                  : selectedRawContent || ""
+                              ) || "暂无原文内容"}
                         </pre>
                         <a href={selectedArticle.link} target="_blank" rel="noreferrer">
                           查看原文链接
@@ -1772,8 +2750,9 @@ function MainWindow({
 
 export default function App() {
   const [windowLabel, setWindowLabel] = useState(() => appWindow.label);
-  const pollIntervalMs = windowLabel === "main" ? 1800 : 400;
-  const { snapshot, setSnapshot, loading, error } = useSnapshotPolling(true, pollIntervalMs);
+  const isMainWindow = windowLabel === "main";
+  const { snapshot, setSnapshot, loading, error } = useSnapshotEvents(isMainWindow);
+  const overlaySnapshot = useOverlayEvents(!isMainWindow);
 
   useEffect(() => {
     const label = appWindow.label;
@@ -1802,11 +2781,11 @@ export default function App() {
   }, [windowLabel]);
 
   if (windowLabel === "pet") {
-    return <PetWindow snapshot={snapshot} />;
+    return <PetWindow snapshot={overlaySnapshot} />;
   }
 
   if (windowLabel === "bubble") {
-    return <BubbleWindow snapshot={snapshot} />;
+    return <BubbleWindow snapshot={overlaySnapshot} />;
   }
 
   return (

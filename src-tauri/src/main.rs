@@ -2,7 +2,6 @@
 
 mod commands;
 mod db;
-mod diagnostics;
 mod llm;
 mod models;
 mod policy;
@@ -15,6 +14,8 @@ use std::sync::Mutex;
 use tauri::{LogicalPosition, LogicalSize, Manager, WindowBuilder, WindowEvent, WindowUrl};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
+use crate::models::AppView;
+
 pub struct AppState {
     is_scanning: Mutex<bool>,
     scheduler_started: Mutex<bool>,
@@ -22,6 +23,7 @@ pub struct AppState {
     api_key_valid: Mutex<Option<bool>>,
     last_scan_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     loading_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    pet_visible_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
@@ -34,7 +36,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
         .skip_taskbar(true)
         .resizable(false)
         .position(32.0, 720.0)
-        .visible(true)
+        .visible(false)
         .build()?;
     Ok(())
 }
@@ -42,7 +44,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
 fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "bubble", WindowUrl::App("index.html".into()))
         .title("Briefy Pet Bubble")
-        .inner_size(380.0, 260.0)
+        .inner_size(420.0, 300.0)
         .transparent(true)
         .decorations(false)
         .always_on_top(true)
@@ -63,6 +65,7 @@ fn main() {
             api_key_valid: Mutex::new(None),
             last_scan_at: Mutex::new(None),
             loading_until: Mutex::new(None),
+            pet_visible_until: Mutex::new(None),
         })
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -83,25 +86,26 @@ fn main() {
 
             let conn = db::connect(&app.handle())?;
             let settings = db::read_settings(&conn)?;
-            diagnostics::log(
-                &app.handle(),
-                "startup",
-                format!(
-                    "app boot: auto_start={} api_key_present={} selected_disciplines={}",
-                    settings.auto_start,
-                    !settings.api_key.trim().is_empty(),
-                    settings.disciplines.iter().filter(|item| item.enabled).count()
-                ),
-            );
+            let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
+            if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
+                *api_key_valid = Some(persisted_api_key_valid);
+            }
+            let should_force_settings =
+                service::requires_configuration(&settings, Some(persisted_api_key_valid));
+            if should_force_settings {
+                db::write_active_view(&conn, &AppView::Settings)?;
+            }
             if settings.auto_start {
                 let _ = app.autolaunch().enable();
             } else {
                 let _ = app.autolaunch().disable();
             }
-            let should_scan = !settings.api_key.trim().is_empty();
+            let should_scan = !should_force_settings;
             if !should_scan {
-                if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
+                if settings.api_key.trim().is_empty() || !persisted_api_key_valid {
+                    if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
                     *api_key_valid = Some(false);
+                    }
                 }
             }
             {
@@ -125,19 +129,14 @@ fn main() {
             build_bubble_window(app)?;
 
             if should_scan {
-                diagnostics::log(
-                    &app.handle(),
-                    "startup",
-                    "scheduler enabled and initial fetch scheduled in 3 seconds",
-                );
+                service::reveal_pet_for_polling(&app.handle());
                 service::ensure_scheduler(&app.handle());
-                service::trigger_fetch_now(&app.handle(), Some(std::time::Duration::from_secs(3)));
-            } else {
-                diagnostics::log(
+                service::trigger_fetch_now(
                     &app.handle(),
-                    "startup",
-                    "initial fetch skipped because api key is missing",
+                    Some(std::time::Duration::from_secs(3)),
+                    true,
                 );
+            } else {
                 service::sync_windows(&app.handle(), false)?;
             }
 
@@ -147,13 +146,18 @@ fn main() {
         .on_system_tray_event(tray::handle_tray_event)
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::bootstrap_overlay,
             commands::save_settings,
             commands::open_article,
             commands::toggle_favorite,
             commands::pet_double_click,
             commands::bubble_action,
             commands::set_active_view,
-            commands::reset_app_data
+            commands::save_article_note,
+            commands::get_article_raw_content,
+            commands::list_history_articles_page,
+            commands::add_custom_rss_source,
+            commands::reset_runtime_data
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
