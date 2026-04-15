@@ -2632,7 +2632,7 @@ fn list_dueable_enabled_sources_count(conn: &Connection) -> Result<i64> {
 
 fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     let mut load_errors = Vec::new();
-    for candidate in build_resource_candidates(app, "rss_catalog_v3_unified.opml") {
+    for candidate in build_resource_candidates(app, "rss-catalog.opml") {
         if !candidate.exists() {
             continue;
         }

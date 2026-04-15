@@ -1,95 +1,39 @@
 # BriefyPet
 
-BriefyPet 是一个基于 Tauri + React + Rust + SQLite 的桌宠信息雷达应用。
+桌面上的信息雷达桌宠，用低打扰提醒帮用户筛出真正值得看的新内容。
 
-目标不是做纯阅读器，而是做低打扰的信息提醒伙伴：
+## 1. 项目简介 
 
-1. 桌宠常驻桌面。
-2. 有高价值内容时做汇总提醒。
-3. 需要深读时进入主窗口统一处理。
+BriefyPet 不是传统 RSS 阅读器，而是一个常驻桌面的信息提醒伙伴。
 
----
+它要解决的问题是：
+- 信息源很多，但真正重要的内容很少
+- 用户不希望一直手动刷订阅、刷网页、刷社媒
+- 用户需要“被提醒”，但不希望被高频打扰
 
-## 1. 当前分支状态
+它适合：
+- 需要持续跟踪科技、社科、医学、新闻等高价值信息的人
+- 想把 RSS、LLM 摘要、兴趣筛选和桌面提醒整合到一个应用里的人
+- 希望先被提醒、再决定是否深入阅读的人
 
-当前维护口径：
+典型使用场景：
+- 桌宠平时驻留桌面
+- 后端定时抓取 RSS 源
+- LLM 根据兴趣偏好做摘要、打分和推荐理由
+- 有高契合度内容时，用气泡提醒用户
+- 用户点击后进入主窗口统一阅读、收藏、记录笔记
 
-1. `mac` 与 `windows` 两个分支共用一套主代码结构。
-2. macOS 与 Windows 的打包能力都需要保留。
-3. 当前这份 README 说明的是仓库现状与双平台构建方式，不再只对应单一分支。
+## 2. 核心功能
 
-当前主要交付目标：
+- 桌宠常驻桌面，支持托盘、置顶、主窗口联动
+- 内置 RSS 源池，支持按学科与模块筛选启用
+- LLM 生成摘要、契合度和推荐理由
+- 只对高价值内容触发汇总提醒，降低打扰
+- 主窗口支持 `Unread / Today / Favorites / History` 视图
+- 本地 SQLite 存储文章、提醒批次、用户偏好与运行状态
+- 支持 macOS 与 Windows 双平台构建
 
-1. 保持 macOS 可安装应用（`.app` / `.dmg`）构建能力。
-2. 保持 Windows 可安装应用（`.msi` / `.exe`）构建能力。
-3. 保持一套源码，支持 mac 与 windows 两套打包脚本。
-
-文档入口：
-
-1. `AGENTS.md`：产品边界与状态规则（单一真相源）。
-2. `Ver2.md`：Ver2 全量合并文档（架构、迭代、验收）。
-
----
-
-## 2. 核心能力
-
-1. 桌宠常驻、置顶、托盘管理。
-2. RSS 抓取 + LLM 摘要/契合度/推荐理由。
-3. 仅高契合内容触发提醒批次。
-4. 主窗口阅读、收藏、笔记与设置统一管理。
-5. 本地 SQLite 存储（文章、设置、提醒批次、记忆）。
-
----
-
-## 3. 最新前端信息架构
-
-主窗口左栏固定为：
-
-1. `Unread`
-2. `Today`
-3. `Favorites`
-4. `History`
-
-语义说明：
-
-1. `Unread`：当前推送批次未归档内容。
-2. `Today`：Unread 归档后的当天推送聚合。
-3. `Favorites`：收藏或有笔记内容。
-4. `History`：除 Today 外的历史推送沉淀。
-
-交互规则：
-
-1. Unread 中同一条首次点击仅选中，第二次点击归档到 Today。
-2. 分组统一按 `Module/Bucket` 展开。
-3. 中栏时间线按倒序展示并显示时间。
-4. 右栏支持 CHECK 信息块（MOD/BKT/SRC/PUB/PUSH/FIT/FAV/NOTE）。
-
----
-
-## 4. 目录结构
-
-```text
-src/                      # React 前端
-src-tauri/                # Rust 后端 + Tauri 壳层
-public/                   # 静态资源（含桌宠素材）
-scripts/                  # 打包脚本（mac/windows）
-reference/                # 本地参考资料（默认忽略，不进入 Git）
-```
-
----
-
-## 5. 环境要求
-
-1. Node.js 18+
-2. npm 9+
-3. Rust stable
-4. Tauri CLI（项目 devDependencies 已含 `@tauri-apps/cli`）
-5. macOS（进行 mac 打包时）
-6. Windows + WiX/NSIS 环境（进行 Windows 打包时）
-
----
-
-## 6. 快速开始
+## 3. 快速开始 
 
 安装依赖：
 
@@ -97,102 +41,209 @@ reference/                # 本地参考资料（默认忽略，不进入 Git）
 npm install
 ```
 
-前端构建：
+前端开发：
 
 ```bash
-npm run build
+npm run dev
 ```
 
-后端测试：
-
-```bash
-cd src-tauri && cargo test
-```
-
-Tauri 开发运行：
+桌面应用开发模式：
 
 ```bash
 npm run tauri -- dev
 ```
 
----
-
-## 7. 打包命令
-
-### 7.1 macOS
-
-debug app + sandbox-safe dmg：
+Windows 打包：
 
 ```bash
-npm run tauri:build:debug:sandbox-dmg
+npm run tauri:build:windows:release
 ```
 
-release dmg：
+macOS 打包：
 
 ```bash
 npm run tauri:build:mac:release-dmg
 ```
 
-### 7.2 Windows
+首次启动后的最小使用路径：
 
-debug bundle（msi + nsis）：
+1. 打开应用
+2. 在设置页填写可用的 LLM API Key
+3. 勾选感兴趣学科并填写兴趣偏好
+4. 保存设置，应用进入扫描
+5. 有高契合度内容时通过桌宠和气泡提醒进入主窗口查看
 
-```bash
-npm run tauri:build:windows:debug
-```
+## 4. 安装说明
 
-release bundle（msi + nsis）：
+环境要求：
 
-```bash
-npm run tauri:build:windows:release
-```
+- Node.js 18+
+- npm 9+
+- Rust stable
+- Tauri CLI
 
----
+平台说明：
 
-## 8. 常见产物路径
+- macOS：用于产出 `.app` / `.dmg`
+- Windows：用于产出 `.msi` / `.exe`
 
-debug：
+Windows 打包依赖：
 
-```text
-src-tauri/target/debug/bundle/macos/Briefy-pet.app
-src-tauri/target/debug/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg
-src-tauri/target/debug/bundle/msi/Briefy-pet_0.1.0_x64_en-US.msi
-src-tauri/target/debug/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe
-```
+- WiX Toolset
+- NSIS
+- PowerShell 可执行环境
 
-release：
+macOS 打包依赖：
 
-```text
-src-tauri/target/release/bundle/macos/Briefy-pet.app
-src-tauri/target/release/bundle/dmg/Briefy-pet_0.1.0_aarch64.dmg
-src-tauri/target/release/bundle/msi/Briefy-pet_0.1.0_x64_en-US.msi
-src-tauri/target/release/bundle/nsis/Briefy-pet_0.1.0_x64-setup.exe
-```
+- macOS 主机
+- shell/bash 环境
+- 对应架构的 Rust target
 
----
+说明：
 
-## 9. 开发约定
+- 当前仓库是私有仓库
+- `reference/` 作为本地参考目录，不进入版本控制
+- 运行和打包都不依赖 `.env` 才能启动项目本体
 
-1. `reference/` 仅作本地参考，不进入 Git。
-2. `tmp_*` 调试产物不入库。
-3. 文档更新统一写入 `Ver2.md`，不再拆分 `Ver2-*.md`。
-4. 重大功能变更需同时更新：代码 + `Ver2.md` + `README.md`。
+## 5. 使用方法 
 
----
-
-## 10. 质量基线
-
-每次准备提交前，建议至少执行：
+常用命令：
 
 ```bash
+npm run dev
 npm run build
-cd src-tauri && cargo test
+npm run preview
+npm run tauri -- dev
 ```
 
-如涉及安装包验证，再执行：
+macOS 构建命令：
 
 ```bash
 npm run tauri:build:debug:sandbox-dmg
+npm run tauri:build:mac:release-dmg
+```
+
+Windows 构建命令：
+
+```bash
 npm run tauri:build:windows:debug
 npm run tauri:build:windows:release
 ```
+
+当前已验证的 Windows 产物目录：
+
+```text
+src-tauri/target/debug/bundle/msi
+src-tauri/target/debug/bundle/nsis
+src-tauri/target/release/bundle/msi
+src-tauri/target/release/bundle/nsis
+```
+
+当前已保留的 macOS 产物目录：
+
+```text
+src-tauri/target/debug/bundle/macos
+src-tauri/target/debug/bundle/dmg
+src-tauri/target/release/bundle/macos
+src-tauri/target/release/bundle/dmg
+```
+
+应用内配置方式：
+
+1. 在设置页选择 LLM 提供商
+2. 填写 API Key
+3. 勾选学科并填写兴趣偏好
+4. 调整 RSS 源启用状态
+5. 按需开启自动启动与记忆模式
+
+运行结果示例：
+
+- RSS 抓取后，文章进入本地库
+- 高契合度内容进入提醒批次
+- 主窗口中可在 `Unread / Today / Favorites / History` 之间切换
+
+## 6. 项目结构 
+
+```text
+src/                         React 前端界面
+src-tauri/                   Tauri + Rust 后端
+src-tauri/src/               窗口、抓取、数据库、调度、命令逻辑
+src-tauri/resources/         打包资源与 RSS 主目录
+public/                      桌宠素材与静态资源
+scripts/                     macOS / Windows 打包脚本
+config/                      预留配置目录
+reference/                   本地参考项目目录（默认不进 Git）
+Claude_DESIGN.md             设计参考文档
+Notion_DESIGN.md             设计参考文档
+```
+
+关键代码定位：
+
+- 桌宠 / 气泡 / 主窗口前端：`src/App.tsx`
+- Tauri 启动与窗口创建：`src-tauri/src/main.rs`
+- Tauri 命令入口：`src-tauri/src/commands.rs`
+- 数据库与目录加载：`src-tauri/src/db.rs`
+- 调度与抓取流程：`src-tauri/src/service.rs`
+- RSS 抓取解析：`src-tauri/src/rss.rs`
+- LLM 调用：`src-tauri/src/llm.rs`
+- 策略与分桶：`src-tauri/src/policy.rs`
+
+## 7. 配置说明 
+
+当前项目主要通过应用内设置和本地数据库配置
+
+应用内主要配置项：
+
+- `apiKey`
+- `llmProvider`
+- `llmModel`
+- `providerApiKeys`
+- `autoStart`
+- `disciplines`
+- `memoryModeEnabled`
+- `memorySummary`
+- `rssSources`
+
+主要数据与状态存储：
+
+- 主数据库：应用数据目录下的 `briefy-pet.db`
+- 推送/提醒数据库：应用数据目录下的 `briefy-pet-push.db`
+
+Windows 常用本地排障位置：
+
+```text
+C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\briefy-pet.db
+C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\briefy-pet-push.db
+C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\fetch-diagnostic.log
+```
+
+默认行为说明：
+
+- 没有有效 API Key 时，应用停留在待配置状态
+- 至少需要启用一个学科，且该学科偏好不能为空
+- 抓取频率由 `module + bucket` 策略控制
+- Windows `debug/release` 与 macOS `debug/release` 分别使用独立脚本
+
+## 8. 开发日志
+
+### Version1.0
+
+第一版完成了桌宠产品的基础闭环：
+
+- 桌宠、气泡、主窗口三层结构打通
+- RSS 抓取、去重、本地 SQLite 存储接入
+- API Key、兴趣偏好、RSS 源管理、自动启动等设置页能力落地
+- LLM 摘要、契合度、推荐理由链路落地
+- 高契合度内容进入提醒批次
+- Windows & macOS 基础打包链路建立
+
+### Version2.0
+
+第二版在结构、策略和交付上做了收敛和增强：
+
+- RSS 源治理升级，按 `module + bucket` 组织
+- 学科和信源策略更明确，支持更稳定的抓取频率与提醒配额
+- 主窗口演进为 `Unread / Today / Favorites / History` 阅读结构
+- 引入本地推送池、历史流转和更清晰的文章归档逻辑
+- 支持笔记、收藏、原文查看等阅读增强能力
+- Windows & macOS 打包链路补齐
