@@ -12,10 +12,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tauri::AppHandle;
 
 use crate::models::{
-    all_disciplines, default_llm_provider, AppView, ArticleRecord, ContentPoolStat, Discipline,
-    FeedArticle, FitLevel, InterestMemoryRecord, PendingArticleRecord, ReminderBatchSnapshot,
-    ResourceType, RssSource, SettingsPayload, Snapshot, SourceCatalogSummary, SourceKind,
-    UserDisciplinePreference,
+    all_disciplines, default_llm_protocol, default_llm_provider, AppView, ArticleRecord,
+    ContentPoolStat, Discipline, FeedArticle, FitLevel, InterestMemoryRecord, PendingArticleRecord,
+    ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload, Snapshot,
+    SourceCatalogSummary, SourceKind, UserDisciplinePreference,
 };
 use crate::policy;
 
@@ -253,14 +253,14 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
 
     let catalog = load_catalog(app)?;
     seed_defaults(&conn, &catalog)?;
-        ensure_push_db_initialized(app, &conn)?;
+    ensure_push_db_initialized(app, &conn)?;
     Ok(conn)
 }
 
 pub fn push_connect(app: &AppHandle) -> Result<Connection> {
-        let path = push_db_path(app)?;
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
+    let path = push_db_path(app)?;
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
                 r#"
                 PRAGMA journal_mode = WAL;
                 CREATE TABLE IF NOT EXISTS push_items (
@@ -282,25 +282,28 @@ pub fn push_connect(app: &AppHandle) -> Result<Connection> {
                     ON push_items(module, bucket, push_status, fit_score DESC, queued_at DESC, article_id DESC);
                 "#,
         )?;
-        Ok(conn)
+    Ok(conn)
 }
 
 fn ensure_push_db_initialized(app: &AppHandle, conn: &Connection) -> Result<()> {
-        let push_conn = push_connect(app)?;
-        let migrated = read_setting(conn, "push_db_migrated_v1")?
-                .unwrap_or_else(|| "false".to_string())
-                == "true";
-        if !migrated {
-                migrate_legacy_reminders_to_push_db(conn, &push_conn)?;
-                write_setting(conn, "push_db_migrated_v1", "true")?;
-        }
-        Ok(())
+    let push_conn = push_connect(app)?;
+    let migrated =
+        read_setting(conn, "push_db_migrated_v1")?.unwrap_or_else(|| "false".to_string()) == "true";
+    if !migrated {
+        migrate_legacy_reminders_to_push_db(conn, &push_conn)?;
+        write_setting(conn, "push_db_migrated_v1", "true")?;
+    }
+    Ok(())
 }
 
 fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
     if read_setting(conn, "api_key")?.is_none() {
         write_setting(conn, "api_key", "")?;
         write_setting(conn, "llm_provider", &default_llm_provider())?;
+        write_setting(conn, "llm_protocol", &default_llm_protocol())?;
+        write_setting(conn, "llm_base_url", "")?;
+        write_setting(conn, "llm_custom_provider_name", "")?;
+        write_setting(conn, "llm_model_name", "")?;
         write_setting(conn, "llm_model", "")?;
         write_setting(conn, "provider_api_keys", "{}")?;
         write_setting(conn, "auto_start", "false")?;
@@ -314,6 +317,10 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         write_setting(conn, "onboarding_completed", "false")?;
     } else {
         ensure_setting(conn, "llm_provider", &default_llm_provider())?;
+        ensure_setting(conn, "llm_protocol", &default_llm_protocol())?;
+        ensure_setting(conn, "llm_base_url", "")?;
+        ensure_setting(conn, "llm_custom_provider_name", "")?;
+        ensure_setting(conn, "llm_model_name", "")?;
         ensure_setting(conn, "llm_model", "")?;
         ensure_setting(conn, "provider_api_keys", "{}")?;
         ensure_setting(conn, "auto_start", "false")?;
@@ -486,7 +493,11 @@ fn sync_source_fetch_state(conn: &Connection, catalog: &[RssSource]) -> Result<(
     Ok(())
 }
 
-pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: bool) -> Result<()> {
+pub fn upsert_source(
+    conn: &Connection,
+    source: &RssSource,
+    mark_custom_origin: bool,
+) -> Result<()> {
     let module = policy::normalize_module(&source.module);
     let bucket = policy::normalize_bucket(&module, &source.bucket);
     let mut origins = source.origin_files.clone();
@@ -541,7 +552,11 @@ pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: 
           enabled = excluded.enabled,
           updated_at = excluded.updated_at
         "#,
-        params![source.id, bool_to_int(source.enabled), Utc::now().to_rfc3339()],
+        params![
+            source.id,
+            bool_to_int(source.enabled),
+            Utc::now().to_rfc3339()
+        ],
     )?;
 
     conn.execute(
@@ -557,25 +572,35 @@ pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: 
 
 pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
     let llm_provider = normalize_llm_provider(
-        &read_setting(conn, "llm_provider")?
-            .unwrap_or_else(default_llm_provider),
+        &read_setting(conn, "llm_provider")?.unwrap_or_else(default_llm_provider),
     );
+    let llm_protocol = normalize_llm_protocol(
+        &read_setting(conn, "llm_protocol")?.unwrap_or_else(default_llm_protocol),
+    );
+    let llm_base_url = read_setting(conn, "llm_base_url")?.unwrap_or_default();
+    let llm_custom_provider_name =
+        read_setting(conn, "llm_custom_provider_name")?.unwrap_or_default();
+    let llm_model_name = read_setting(conn, "llm_model_name")?.unwrap_or_default();
     let llm_model = read_setting(conn, "llm_model")?.unwrap_or_default();
     let legacy_api_key = read_setting(conn, "api_key")?.unwrap_or_default();
     let mut provider_api_keys = read_setting(conn, "provider_api_keys")?
         .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
         .unwrap_or_default();
     if !legacy_api_key.trim().is_empty() {
+        let provider_api_key_key =
+            active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
         let needs_backfill = provider_api_keys
-            .get(&llm_provider)
+            .get(&provider_api_key_key)
             .map(|value| value.trim().is_empty())
             .unwrap_or(true);
         if needs_backfill {
-            provider_api_keys.insert(llm_provider.clone(), legacy_api_key.clone());
+            provider_api_keys.insert(provider_api_key_key, legacy_api_key.clone());
         }
     }
+    let provider_api_key_key =
+        active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
     let api_key = provider_api_keys
-        .get(&llm_provider)
+        .get(&provider_api_key_key)
         .filter(|value| !value.trim().is_empty())
         .cloned()
         .unwrap_or(legacy_api_key);
@@ -583,6 +608,10 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
     Ok(SettingsPayload {
         api_key,
         llm_provider,
+        llm_protocol,
+        llm_base_url,
+        llm_custom_provider_name,
+        llm_model_name,
         llm_model,
         provider_api_keys,
         auto_start: read_setting(conn, "auto_start")?.unwrap_or_else(|| "false".into()) == "true",
@@ -599,21 +628,34 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
 
 pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<()> {
     let llm_provider = normalize_llm_provider(&settings.llm_provider);
+    let llm_protocol = normalize_llm_protocol(&settings.llm_protocol);
+    let llm_base_url = settings.llm_base_url.trim().to_string();
+    let llm_custom_provider_name = settings.llm_custom_provider_name.trim().to_string();
+    let llm_model_name = settings.llm_model_name.trim().to_string();
     let llm_model = settings.llm_model.trim().to_string();
     let mut provider_api_keys = settings.provider_api_keys.clone();
     for value in provider_api_keys.values_mut() {
         *value = value.trim().to_string();
     }
+    let provider_api_key_key =
+        active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
     if !settings.api_key.trim().is_empty() {
-        provider_api_keys.insert(llm_provider.clone(), settings.api_key.trim().to_string());
+        provider_api_keys.insert(
+            provider_api_key_key.clone(),
+            settings.api_key.trim().to_string(),
+        );
     }
     let active_api_key = provider_api_keys
-        .get(&llm_provider)
+        .get(&provider_api_key_key)
         .cloned()
         .unwrap_or_default();
 
     write_setting(conn, "api_key", active_api_key.trim())?;
     write_setting(conn, "llm_provider", &llm_provider)?;
+    write_setting(conn, "llm_protocol", &llm_protocol)?;
+    write_setting(conn, "llm_base_url", &llm_base_url)?;
+    write_setting(conn, "llm_custom_provider_name", &llm_custom_provider_name)?;
+    write_setting(conn, "llm_model_name", &llm_model_name)?;
     write_setting(conn, "llm_model", &llm_model)?;
     write_setting(
         conn,
@@ -730,10 +772,7 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
     if !settings.memory_mode_enabled {
         write_memory_summary(conn, false, "")?;
     } else {
-        conn.execute(
-            "UPDATE daily_interest_memory SET memory_enabled = 1",
-            [],
-        )?;
+        conn.execute("UPDATE daily_interest_memory SET memory_enabled = 1", [])?;
     }
 
     write_memory_summary(
@@ -1031,7 +1070,11 @@ pub fn mark_article_scored_success(
     Ok(())
 }
 
-pub fn mark_article_scored_failed(conn: &Connection, article_id: i64, score_error: &str) -> Result<()> {
+pub fn mark_article_scored_failed(
+    conn: &Connection,
+    article_id: i64,
+    score_error: &str,
+) -> Result<()> {
     conn.execute(
         r#"
         UPDATE articles
@@ -1279,10 +1322,15 @@ pub fn list_history_articles_page(
             batch_created_at: row.get::<_, String>(15)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
-pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i64]) -> Result<usize> {
+pub fn queue_push_articles(
+    conn: &Connection,
+    app: &AppHandle,
+    article_ids: &[i64],
+) -> Result<usize> {
     if article_ids.is_empty() {
         return Ok(0);
     }
@@ -1350,7 +1398,13 @@ pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i6
             )
             .optional()?;
 
-        upsert_stmt.execute(params![id, module.clone(), bucket.clone(), fit_score, now.clone()])?;
+        upsert_stmt.execute(params![
+            id,
+            module.clone(),
+            bucket.clone(),
+            fit_score,
+            now.clone()
+        ])?;
 
         if existing_status.is_none() {
             inserted += 1;
@@ -1423,9 +1477,7 @@ fn push_reminder_snapshot(
 }
 
 pub fn read_onboarding_completed(conn: &Connection) -> Result<bool> {
-    Ok(read_setting(conn, "onboarding_completed")?
-        .unwrap_or_else(|| "false".into())
-        == "true")
+    Ok(read_setting(conn, "onboarding_completed")?.unwrap_or_else(|| "false".into()) == "true")
 }
 
 pub fn write_onboarding_completed(conn: &Connection, value: bool) -> Result<()> {
@@ -1646,12 +1698,14 @@ fn write_push_meta_value(conn: &Connection, key: &str, value: Option<&str>) -> R
     Ok(())
 }
 
-fn migrate_legacy_reminders_to_push_db(main_conn: &Connection, push_conn: &Connection) -> Result<()> {
-    let has_legacy_rows: i64 = main_conn.query_row(
-        "SELECT COUNT(*) FROM reminder_batch_articles",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
+fn migrate_legacy_reminders_to_push_db(
+    main_conn: &Connection,
+    push_conn: &Connection,
+) -> Result<()> {
+    let has_legacy_rows: i64 =
+        main_conn.query_row("SELECT COUNT(*) FROM reminder_batch_articles", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
     if has_legacy_rows == 0 {
         return Ok(());
     }
@@ -1710,7 +1764,14 @@ fn migrate_legacy_reminders_to_push_db(main_conn: &Connection, push_conn: &Conne
                 queued_at = excluded.queued_at,
                 status_updated_at = excluded.status_updated_at
             "#,
-            params![article_id, module.clone(), bucket.clone(), fit_score, push_status, migrated_at],
+            params![
+                article_id,
+                module.clone(),
+                bucket.clone(),
+                fit_score,
+                push_status,
+                migrated_at
+            ],
         )?;
         trim_push_bucket(push_conn, &module, &bucket)?;
     }
@@ -1800,7 +1861,10 @@ pub fn purge_source_history(conn: &Connection, source_id: &str) -> Result<()> {
         "#,
         params![source_id],
     )?;
-    conn.execute("DELETE FROM articles WHERE source_id = ?1", params![source_id])?;
+    conn.execute(
+        "DELETE FROM articles WHERE source_id = ?1",
+        params![source_id],
+    )?;
     conn.execute(
         "DELETE FROM source_fetch_state WHERE source_id = ?1",
         params![source_id],
@@ -1985,7 +2049,11 @@ pub fn list_pending_article_backlog(
     Ok(output)
 }
 
-pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>, force_all: bool) -> Result<Vec<RssSource>> {
+pub fn list_due_sources(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    force_all: bool,
+) -> Result<Vec<RssSource>> {
     let selected = list_selected_effective_disciplines(conn)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -2472,11 +2540,7 @@ pub fn refresh_daily_memory(
             top_buckets
                 .iter()
                 .map(|(module, bucket)| {
-                    format!(
-                        "{} / {}",
-                        module_label(module),
-                        bucket_label(bucket)
-                    )
+                    format!("{} / {}", module_label(module), bucket_label(bucket))
                 })
                 .collect::<Vec<_>>()
                 .join("、")
@@ -2746,10 +2810,7 @@ fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     if load_errors.is_empty() {
         anyhow::bail!("rss v3 catalog file not found")
     } else {
-        anyhow::bail!(
-            "failed to load v3 catalog: {}",
-            load_errors.join(" ; ")
-        )
+        anyhow::bail!("failed to load v3 catalog: {}", load_errors.join(" ; "))
     }
 }
 
@@ -2836,8 +2897,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
-                let resource_type =
-                    map_v3_resource_type(attrs.get("resourceType").map(String::as_str), &canonical_url);
+                let resource_type = map_v3_resource_type(
+                    attrs.get("resourceType").map(String::as_str),
+                    &canonical_url,
+                );
                 let origin_files = attrs
                     .get("origin")
                     .map(|value| split_origin_files(value))
@@ -2875,8 +2938,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 source.bucket = bucket_code.clone();
                 source.discipline = map_v3_module_to_discipline(&module_code);
                 source.source_kind = map_v3_bucket_to_source_kind(&bucket_code);
-                source.resource_type =
-                    map_v3_resource_type(attrs.get("resourceType").map(String::as_str), &canonical_url);
+                source.resource_type = map_v3_resource_type(
+                    attrs.get("resourceType").map(String::as_str),
+                    &canonical_url,
+                );
                 source.url = canonical_url.clone();
 
                 for origin in origin_files {
@@ -2997,21 +3062,48 @@ fn split_origin_files(raw: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-    fn is_custom_source_origin(origin_files_json: &str) -> bool {
-        let origins = serde_json::from_str::<Vec<String>>(origin_files_json).unwrap_or_default();
-        origins
+fn is_custom_source_origin(origin_files_json: &str) -> bool {
+    let origins = serde_json::from_str::<Vec<String>>(origin_files_json).unwrap_or_default();
+    origins
         .iter()
         .any(|origin| origin.eq_ignore_ascii_case("user-custom"))
-    }
+}
 
 fn normalize_llm_provider(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "deepseek" => "deepseek".to_string(),
+        "qwen" | "dashscope" | "alibaba" => "qwen".to_string(),
+        "minimax" => "minimax".to_string(),
         "glm" | "zhipu" | "zhipuai" => "glm".to_string(),
         "kimi" | "moonshot" => "kimi".to_string(),
         "openai" => "openai".to_string(),
+        "gemini" | "google" => "gemini".to_string(),
+        "anthropic" | "claude" => "anthropic".to_string(),
+        "custom" => "custom".to_string(),
         "siliconflow" => "siliconflow".to_string(),
         _ => default_llm_provider(),
+    }
+}
+
+fn normalize_llm_protocol(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "openai-compatible" | "openai" => "openai-compatible".to_string(),
+        "anthropic-native" | "anthropic" => "anthropic-native".to_string(),
+        "gemini-native" | "gemini" => "gemini-native".to_string(),
+        _ => default_llm_protocol(),
+    }
+}
+
+fn active_provider_api_key_key(provider: &str, custom_provider_name: &str) -> String {
+    if provider == "custom" {
+        let name = custom_provider_name.trim();
+        if name.is_empty() {
+            "custom".to_string()
+        } else {
+            format!("custom:{name}")
+        }
+    } else {
+        provider.to_string()
     }
 }
 
@@ -3033,9 +3125,7 @@ fn normalize_url(url: &str) -> String {
 fn canonicalize_feed_url(url: &str) -> String {
     let trimmed = url.trim();
     if let Some(channel_id) = extract_youtube_channel_id(trimmed) {
-        return format!(
-            "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        );
+        return format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}");
     }
     trimmed.to_string()
 }
@@ -3053,11 +3143,7 @@ fn extract_youtube_channel_id(url: &str) -> Option<String> {
         .strip_prefix("www.")
         .unwrap_or(without_scheme);
     let rest = without_www.strip_prefix("youtube.com/channel/")?;
-    let channel_id = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let channel_id = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
     if channel_id.is_empty() {
         None
     } else {

@@ -39,7 +39,11 @@ pub fn normalize_bucket(module: &str, raw: &str) -> String {
     }
 }
 
-pub fn policy_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> SourceRuntimePolicy {
+pub fn policy_for_source(
+    module: &str,
+    bucket: &str,
+    source_kind: &SourceKind,
+) -> SourceRuntimePolicy {
     let module = normalize_module(module);
     let bucket = normalize_bucket(&module, bucket);
 
@@ -132,16 +136,24 @@ mod tests {
 
     #[test]
     fn normalizes_social_science_research_bucket() {
-        assert_eq!(normalize_bucket("social_science", "research"), "academic_frontier");
+        assert_eq!(
+            normalize_bucket("social_science", "research"),
+            "academic_frontier"
+        );
     }
 
     #[test]
     fn exposes_bucket_specific_policy() {
-        let tech_research = policy_for_source("technology", "research", &SourceKind::AcademicJournal);
-        let news_breaking = policy_for_source("news_opinion", "news", &SourceKind::CommunityHotspot);
+        let tech_research =
+            policy_for_source("technology", "research", &SourceKind::AcademicJournal);
+        let news_breaking =
+            policy_for_source("news_opinion", "news", &SourceKind::CommunityHotspot);
         let growth_blogs = policy_for_source("growth", "blogs", &SourceKind::TechnicalBlog);
-        let medicine_research =
-            policy_for_source("medicine", "academic_frontier", &SourceKind::AcademicJournal);
+        let medicine_research = policy_for_source(
+            "medicine",
+            "academic_frontier",
+            &SourceKind::AcademicJournal,
+        );
 
         assert_eq!(tech_research.fetch_interval.num_hours(), 24);
         assert_eq!(news_breaking.fetch_interval.num_hours(), 6);

@@ -12,6 +12,7 @@ const LLM_RETRIES: usize = 3;
 const LLM_REQUEST_TIMEOUT_SECS: u64 = 20;
 
 struct ProviderConfig {
+    protocol: &'static str,
     base_url: &'static str,
     default_model: &'static str,
 }
@@ -19,79 +20,154 @@ struct ProviderConfig {
 pub fn normalize_provider(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "deepseek" => "deepseek".to_string(),
+        "qwen" | "dashscope" | "alibaba" => "qwen".to_string(),
+        "minimax" => "minimax".to_string(),
         "glm" | "zhipu" | "zhipuai" => "glm".to_string(),
         "kimi" | "moonshot" => "kimi".to_string(),
         "openai" => "openai".to_string(),
+        "gemini" | "google" => "gemini".to_string(),
+        "anthropic" | "claude" => "anthropic".to_string(),
+        "custom" => "custom".to_string(),
         "siliconflow" => "siliconflow".to_string(),
         _ => "deepseek".to_string(),
     }
 }
 
+pub fn normalize_protocol(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "openai-compatible" | "openai" => "openai-compatible".to_string(),
+        "anthropic-native" | "anthropic" => "anthropic-native".to_string(),
+        "gemini-native" | "gemini" => "gemini-native".to_string(),
+        _ => "openai-compatible".to_string(),
+    }
+}
+
 fn provider_config(provider: &str) -> ProviderConfig {
     match normalize_provider(provider).as_str() {
+        "qwen" => ProviderConfig {
+            protocol: "openai-compatible",
+            base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            default_model: "qwen3.5-flash",
+        },
+        "minimax" => ProviderConfig {
+            protocol: "openai-compatible",
+            base_url: "https://api.minimaxi.com/v1",
+            default_model: "MiniMax-M2.5",
+        },
         "glm" => ProviderConfig {
+            protocol: "openai-compatible",
             base_url: "https://open.bigmodel.cn/api/paas/v4",
-            default_model: "glm-4-flash",
+            default_model: "glm-4.7-flashx",
         },
         "kimi" => ProviderConfig {
+            protocol: "openai-compatible",
             base_url: "https://api.moonshot.cn/v1",
-            default_model: "moonshot-v1-8k",
+            default_model: "kimi-k2.5",
         },
         "openai" => ProviderConfig {
+            protocol: "openai-compatible",
             base_url: "https://api.openai.com/v1",
-            default_model: "gpt-4o-mini",
+            default_model: "gpt-5.4-mini",
+        },
+        "gemini" => ProviderConfig {
+            protocol: "gemini-native",
+            base_url: "https://generativelanguage.googleapis.com/v1beta",
+            default_model: "gemini-2.5-flash",
+        },
+        "anthropic" => ProviderConfig {
+            protocol: "anthropic-native",
+            base_url: "https://api.anthropic.com",
+            default_model: "claude-sonnet-4-20250514",
         },
         "siliconflow" => ProviderConfig {
+            protocol: "openai-compatible",
             base_url: "https://api.siliconflow.cn/v1",
             default_model: "Qwen/Qwen2.5-72B-Instruct",
         },
         _ => ProviderConfig {
+            protocol: "openai-compatible",
             base_url: "https://api.deepseek.com",
             default_model: "deepseek-chat",
         },
     }
 }
 
+fn resolve_protocol(provider: &str, protocol_override: Option<&str>) -> String {
+    if let Some(protocol) = protocol_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_protocol(protocol);
+    }
+    provider_config(provider).protocol.to_string()
+}
+
+fn resolve_base_url(provider: &str, base_url_override: Option<&str>) -> String {
+    if let Some(base_url) = base_url_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return base_url.trim_end_matches('/').to_string();
+    }
+    provider_config(provider)
+        .base_url
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn resolve_model(provider: &str, model_override: Option<&str>) -> String {
-    if let Some(model) = model_override.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(model) = model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return model.to_string();
     }
     provider_config(provider).default_model.to_string()
 }
 
-fn chat_completions_url(provider: &str) -> String {
-    let base = provider_config(provider).base_url.trim_end_matches('/');
-    format!("{base}/chat/completions")
+fn openai_chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
-pub async fn validate_api_key(provider: &str, model_override: Option<&str>, api_key: &str) -> Result<()> {
+fn anthropic_messages_url(base_url: &str) -> String {
+    format!("{}/v1/messages", base_url.trim_end_matches('/'))
+}
+
+fn gemini_generate_content_url(base_url: &str, model: &str, api_key: &str) -> String {
+    format!(
+        "{}/models/{}:generateContent?key={}",
+        base_url.trim_end_matches('/'),
+        model,
+        api_key
+    )
+}
+
+pub async fn validate_api_key(
+    provider: &str,
+    protocol_override: Option<&str>,
+    base_url_override: Option<&str>,
+    model_override: Option<&str>,
+    api_key: &str,
+) -> Result<()> {
     let trimmed_key = api_key.trim();
     if trimmed_key.is_empty() {
         return Err(anyhow!("missing api key"));
     }
 
+    let protocol = resolve_protocol(provider, protocol_override);
+    let base_url = resolve_base_url(provider, base_url_override);
     let model = resolve_model(provider, model_override);
+    let body = build_request_body(&protocol, &model, "Reply with OK.", 8, false);
 
-    let body = json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": "Reply with OK."
-            }
-        ],
-        "max_tokens": 8,
-        "temperature": 0,
-        "stream": false
-    });
-
-    let _ = send_chat_completion_with_retries(provider, trimmed_key, &body).await?;
+    let _ = send_request_with_retries(&protocol, &base_url, trimmed_key, &model, &body).await?;
 
     Ok(())
 }
 
 pub async fn summarize_and_score_batch(
     provider: &str,
+    protocol_override: Option<&str>,
+    base_url_override: Option<&str>,
     model_override: Option<&str>,
     api_key: &str,
     interest_context: &str,
@@ -104,6 +180,8 @@ pub async fn summarize_and_score_batch(
     if articles.is_empty() {
         return Ok(Vec::new());
     }
+    let protocol = resolve_protocol(provider, protocol_override);
+    let base_url = resolve_base_url(provider, base_url_override);
     let model = resolve_model(provider, model_override);
 
     let article_payload = articles
@@ -147,30 +225,21 @@ Personalization context:\n{interest_context}\n\
 Articles:\n{article_payload}"
     );
 
-    let body = json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Return exactly one JSON object. No markdown, no code fences, no explanation."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "response_format": {
-            "type": "json_object"
-        },
-        "max_tokens": 1600,
-        "temperature": 0,
-        "stream": false
-    });
+    let body = build_request_body(&protocol, &model, &prompt, 1600, true);
 
     let mut last_error = None;
 
     for attempt in 1..=LLM_RETRIES {
-        match score_batch_once(provider, trimmed_key, &body, articles.len()).await {
+        match score_batch_once(
+            &protocol,
+            &base_url,
+            &model,
+            trimmed_key,
+            &body,
+            articles.len(),
+        )
+        .await
+        {
             Ok(results) => return Ok(results),
             Err(err) => {
                 last_error = Some(err);
@@ -187,21 +256,24 @@ Articles:\n{article_payload}"
 
 pub async fn summarize_and_score_single(
     provider: &str,
+    protocol_override: Option<&str>,
+    base_url_override: Option<&str>,
     model_override: Option<&str>,
     api_key: &str,
     interest_context: &str,
     article: &FeedArticle,
 ) -> Result<LlmResult> {
-    let mut results =
-        summarize_and_score_batch(
-            provider,
-            model_override,
-            api_key,
-            interest_context,
-            std::slice::from_ref(article),
-        )
-            .await
-            .with_context(|| format!("single article scoring failed: {}", article.title))?;
+    let mut results = summarize_and_score_batch(
+        provider,
+        protocol_override,
+        base_url_override,
+        model_override,
+        api_key,
+        interest_context,
+        std::slice::from_ref(article),
+    )
+    .await
+    .with_context(|| format!("single article scoring failed: {}", article.title))?;
     results.pop().ok_or_else(|| {
         anyhow!(
             "single article scoring returned no result: {}",
@@ -221,9 +293,7 @@ fn scoring_focus_for_source(module: &str, bucket: &str, source_kind: &SourceKind
         ("medicine", "academic_frontier") => {
             "Prioritize clinical reliability, patient impact, and evidence hierarchy."
         }
-        ("news_opinion", "news") => {
-            "Prioritize factual density, timeliness, and low speculation."
-        }
+        ("news_opinion", "news") => "Prioritize factual density, timeliness, and low speculation.",
         ("news_opinion", "community_opinion")
         | ("news_opinion", "personal_opinion")
         | ("news_opinion", "streaming_opinion") => {
@@ -252,6 +322,73 @@ fn scoring_focus_for_source(module: &str, bucket: &str, source_kind: &SourceKind
     }
 }
 
+fn build_request_body(
+    protocol: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: i64,
+    json_mode: bool,
+) -> Value {
+    match normalize_protocol(protocol).as_str() {
+        "anthropic-native" => json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        }),
+        "gemini-native" => json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json"
+            }
+        }),
+        _ => {
+            let mut body = json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": if json_mode {
+                            "Return exactly one JSON object. No markdown, no code fences, no explanation."
+                        } else {
+                            "Reply briefly and directly."
+                        }
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "stream": false
+            });
+            if json_mode {
+                body["response_format"] = json!({
+                    "type": "json_object"
+                });
+            }
+            body
+        }
+    }
+}
+
 fn extract_message_content(payload: &Value) -> Option<String> {
     let content = &payload["choices"][0]["message"]["content"];
     if let Some(text) = content.as_str() {
@@ -273,14 +410,59 @@ fn extract_message_content(payload: &Value) -> Option<String> {
     }
 }
 
+fn extract_anthropic_content(payload: &Value) -> Option<String> {
+    let items = payload.get("content")?.as_array()?;
+    let mut text = String::new();
+    for item in items {
+        if let Some(part) = item.get("text").and_then(Value::as_str) {
+            text.push_str(part);
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn extract_gemini_content(payload: &Value) -> Option<String> {
+    let parts = payload
+        .get("candidates")?
+        .get(0)?
+        .get("content")?
+        .get("parts")?
+        .as_array()?;
+    let mut text = String::new();
+    for part in parts {
+        if let Some(value) = part.get("text").and_then(Value::as_str) {
+            text.push_str(value);
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 async fn score_batch_once(
-    provider: &str,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
     api_key: &str,
     body: &Value,
     expected_len: usize,
 ) -> Result<Vec<LlmResult>> {
-    let payload = send_chat_completion_with_retries(provider, api_key, body).await?;
-    let raw_content = extract_message_content(&payload).context("missing llm response content")?;
+    let payload = send_request_with_retries(protocol, base_url, api_key, model, body).await?;
+    let raw_content = match normalize_protocol(protocol).as_str() {
+        "anthropic-native" => {
+            extract_anthropic_content(&payload).context("missing anthropic response content")?
+        }
+        "gemini-native" => {
+            extract_gemini_content(&payload).context("missing gemini response content")?
+        }
+        _ => extract_message_content(&payload).context("missing llm response content")?,
+    };
     let normalized = normalize_json_response(&raw_content).ok_or_else(|| {
         anyhow!(
             "no parseable JSON found in model response: {}",
@@ -293,9 +475,11 @@ async fn score_batch_once(
         .with_context(|| format!("model batch shape invalid: {}", truncate(&normalized, 200)))
 }
 
-async fn send_chat_completion_with_retries(
-    provider: &str,
+async fn send_request_with_retries(
+    protocol: &str,
+    base_url: &str,
     api_key: &str,
+    model: &str,
     body: &Value,
 ) -> Result<Value> {
     let client = reqwest::Client::builder()
@@ -306,7 +490,7 @@ async fn send_chat_completion_with_retries(
     let mut last_error = None;
 
     for attempt in 1..=LLM_RETRIES {
-        match send_chat_completion_once(&client, provider, api_key, body).await {
+        match send_request_once(&client, protocol, base_url, api_key, model, body).await {
             Ok(payload) => return Ok(payload),
             Err(err) => {
                 let retryable = is_retryable_llm_error(&err);
@@ -323,19 +507,33 @@ async fn send_chat_completion_with_retries(
     Err(last_error.unwrap_or_else(|| anyhow!("unknown llm request failure")))
 }
 
-async fn send_chat_completion_once(
+async fn send_request_once(
     client: &reqwest::Client,
-    provider: &str,
+    protocol: &str,
+    base_url: &str,
     api_key: &str,
+    model: &str,
     body: &Value,
 ) -> Result<Value> {
-    let response = client
-        .post(chat_completions_url(provider))
-        .header(AUTHORIZATION, format!("Bearer {api_key}"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(body)
-        .send()
-        .await?;
+    let protocol = normalize_protocol(protocol);
+    let request = match protocol.as_str() {
+        "anthropic-native" => client
+            .post(anthropic_messages_url(base_url))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(CONTENT_TYPE, "application/json")
+            .json(body),
+        "gemini-native" => client
+            .post(gemini_generate_content_url(base_url, model, api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(body),
+        _ => client
+            .post(openai_chat_completions_url(base_url))
+            .header(AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(CONTENT_TYPE, "application/json")
+            .json(body),
+    };
+    let response = request.send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -622,9 +820,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        normalize_json_response, parse_batch_result, parse_fit_level, parse_fit_score,
-    };
+    use super::{normalize_json_response, parse_batch_result, parse_fit_level, parse_fit_score};
     use crate::models::FitLevel;
     use serde_json::json;
 

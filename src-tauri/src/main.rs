@@ -164,7 +164,7 @@ fn main() {
             if !should_scan {
                 if settings.api_key.trim().is_empty() || !persisted_api_key_valid {
                     if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
-                    *api_key_valid = Some(false);
+                        *api_key_valid = Some(false);
                     }
                 }
             }

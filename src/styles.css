@@ -1211,6 +1211,12 @@ a {
   padding: 12px;
 }
 
+.settings-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
 .source-groups {
   margin-top: 12px;
   display: flex;
@@ -1229,6 +1235,36 @@ a {
 .source-discipline-head h3 {
   margin: 0;
   font-size: 16px;
+}
+
+.source-summary-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.source-summary-meta {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.source-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  color: var(--text-muted);
+  transition: transform 160ms ease;
+}
+
+.source-discipline-block[open] > .source-discipline-head .source-chevron,
+.source-kind-block[open] > .source-kind-head .source-chevron {
+  transform: rotate(90deg);
+}
+
+.source-kind-block {
+  margin-left: 24px;
 }
 
 .source-kind-block + .source-kind-block {
@@ -1263,6 +1299,7 @@ a {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-left: 24px;
 }
 
 .rss-item {

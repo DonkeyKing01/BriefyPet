@@ -7,18 +7,22 @@ use crate::{
         AppView, Discipline, HistoryItem, OverlaySnapshot, ResourceType, RssSource,
         SettingsPayload, Snapshot, SourceKind,
     },
-    policy,
-    service, AppState,
+    policy, service, AppState,
 };
 
 #[tauri::command]
 pub fn bootstrap(app: AppHandle, state: State<AppState>) -> Result<Snapshot, String> {
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
     service::snapshot(&app, is_scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn bootstrap_overlay(app: AppHandle, state: State<AppState>) -> Result<OverlaySnapshot, String> {
+pub fn bootstrap_overlay(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<OverlaySnapshot, String> {
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
     service::snapshot_overlay(&app, is_scanning).map_err(|err| err.to_string())
 }
@@ -63,8 +67,7 @@ pub async fn save_settings(
         app.autolaunch().disable().map_err(|err| err.to_string())?;
     }
 
-    service::ensure_scheduler(&app);
-    service::trigger_fetch_now(&app, None, false);
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let scanning = service::current_scanning(&app);
     service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
     service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
@@ -158,7 +161,11 @@ pub fn set_active_view(app: AppHandle, view: AppView) -> Result<Snapshot, String
 }
 
 #[tauri::command]
-pub fn save_article_note(app: AppHandle, article_id: i64, note: String) -> Result<Snapshot, String> {
+pub fn save_article_note(
+    app: AppHandle,
+    article_id: i64,
+    note: String,
+) -> Result<Snapshot, String> {
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::update_article_note(&conn, article_id, &note).map_err(|err| err.to_string())?;
     let source_id = db::article_source_id(&conn, article_id).map_err(|err| err.to_string())?;

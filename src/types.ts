@@ -20,7 +20,19 @@ export type SourceKind =
   | "technical-blog"
   | "community-hotspot";
 
-export type LlmProvider = "deepseek" | "glm" | "kimi" | "openai" | "siliconflow";
+export type LlmProvider =
+  | "deepseek"
+  | "qwen"
+  | "minimax"
+  | "glm"
+  | "kimi"
+  | "openai"
+  | "gemini"
+  | "anthropic"
+  | "custom"
+  | "siliconflow";
+
+export type LlmProtocol = "openai-compatible" | "anthropic-native" | "gemini-native";
 
 export type SourceModule =
   | "technology"
@@ -78,6 +90,10 @@ export type RssSource = {
 export type SettingsPayload = {
   apiKey: string;
   llmProvider: LlmProvider;
+  llmProtocol: LlmProtocol;
+  llmBaseUrl: string;
+  llmCustomProviderName: string;
+  llmModelName: string;
   llmModel: string;
   providerApiKeys: Record<string, string>;
   autoStart: boolean;

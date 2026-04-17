@@ -134,6 +134,14 @@ pub struct SettingsPayload {
     pub api_key: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
+    #[serde(default = "default_llm_protocol")]
+    pub llm_protocol: String,
+    #[serde(default)]
+    pub llm_base_url: String,
+    #[serde(default)]
+    pub llm_custom_provider_name: String,
+    #[serde(default)]
+    pub llm_model_name: String,
     #[serde(default)]
     pub llm_model: String,
     #[serde(default)]
@@ -289,6 +297,10 @@ pub struct LlmResult {
 
 pub fn default_llm_provider() -> String {
     "deepseek".to_string()
+}
+
+pub fn default_llm_protocol() -> String {
+    "openai-compatible".to_string()
 }
 
 pub fn all_disciplines() -> Vec<Discipline> {
