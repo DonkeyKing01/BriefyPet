@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum PetStatus {
     Loading,
     NeedsConfig,
+    Polling,
     Scanning,
     Idle,
     NewInfo,

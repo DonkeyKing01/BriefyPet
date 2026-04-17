@@ -7,7 +7,9 @@ import {
   bootstrapOverlay,
   bubbleAction,
   getArticleRawContent,
+  dismissHelpWindow,
   listHistoryArticlesPage,
+  openHelpWindow,
   openArticle,
   petDoubleClick,
   resetRuntimeData,
@@ -36,6 +38,7 @@ import type {
 const PET_STATUS_LABELS = {
   loading: "加载中",
   "needs-config": "待配置",
+  polling: "轮询中",
   scanning: "扫描中",
   idle: "待命中",
   "new-info": "新提醒"
@@ -44,6 +47,7 @@ const PET_STATUS_LABELS = {
 const PET_STATUS_HINTS = {
   loading: "",
   "needs-config": "先去完善配置",
+  polling: "轮询中",
   scanning: "按学科与子分类抓取中",
   idle: "当前没有高优提醒",
   "new-info": "双击或点气泡查看"
@@ -58,6 +62,11 @@ const PET_ASSET_BY_STATUS = {
   "needs-config": {
     src: "/pets/clawd/clawd-mini-peek.gif",
     alt: "Clawd needs config",
+    size: 154
+  },
+  polling: {
+    src: "/pets/clawd/clawd-idle-reading.gif",
+    alt: "Clawd polling",
     size: 154
   },
   scanning: {
@@ -1113,6 +1122,138 @@ function BubbleWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   );
 }
 
+function HelpWindow() {
+  const pointerState = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+  const steps = [
+    {
+      title: "欢迎使用 BriefyPet",
+      body: "BriefyPet 会常驻桌面，帮你从订阅内容中挑出更值得优先阅读的信息，减轻信息焦虑。"
+    },
+    {
+      title: "功能介绍",
+      body: "你可以按兴趣选择内容来源。\nBriefyPet 会自动检查更新、提炼重点，并把更相关的内容推送到桌面。\n你也可以在应用内阅读、收藏、标记未读和查看历史。"
+    },
+    {
+      title: "为什么要配置 API Key",
+      body: "BriefyPet 需要调用模型能力来理解内容、生成摘要和推荐结果。\n未配置或校验失败时，应用将无法正常分析内容。"
+    },
+    {
+      title: "为什么要填写兴趣偏好",
+      body: "你的兴趣偏好会影响内容推荐结果。\n写得越具体，推送、摘要和排序通常越准确。"
+    },
+    {
+      title: "项目与联系",
+      body: "项目源码：https://github.com/DonkeyKing01/BriefyPet\n\n开发者邮箱：\nQingyang Jin: jinqingyang01@sjtu.edu.cn\n\nYuecheng He: 24300680058@m.fudan.edu.cn"
+    },
+    {
+      title: "之后如何再次查看",
+      body: "可点击主界面右上角的“帮助”重新打开本页。"
+    }
+  ] as const;
+  const [stepIndex, setStepIndex] = useState(0);
+  const isLastStep = stepIndex === steps.length - 1;
+
+  useEffect(() => {
+    const unlistenPromise = listen("briefy://help-opened", () => {
+      setStepIndex(0);
+    });
+
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, a")) {
+      pointerState.current = null;
+      return;
+    }
+
+    pointerState.current = {
+      x: event.clientX,
+      y: event.clientY,
+      dragging: false
+    };
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const state = pointerState.current;
+    if (!state || state.dragging) {
+      return;
+    }
+
+    const movedX = Math.abs(event.clientX - state.x);
+    const movedY = Math.abs(event.clientY - state.y);
+    if (movedX + movedY < 4) {
+      return;
+    }
+
+    state.dragging = true;
+    void appWindow.startDragging();
+  }
+
+  function handlePointerEnd() {
+    pointerState.current = null;
+  }
+
+  async function handleClose(complete: boolean) {
+    await dismissHelpWindow(complete);
+  }
+
+  return (
+    <div className="help-window">
+      <div className="help-card">
+        <div
+          className="help-card-top"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          onPointerLeave={handlePointerEnd}
+        >
+          <span className="help-eyebrow">Guide</span>
+          <button className="help-close" onClick={() => void handleClose(true)}>
+            跳过引导
+          </button>
+        </div>
+        <div className="help-progress">
+          {steps.map((_, index) => (
+            <span
+              key={index}
+              className={`help-progress-dot${index === stepIndex ? " active" : ""}`}
+            />
+          ))}
+        </div>
+        <div className="help-body">
+          <h1>{steps[stepIndex].title}</h1>
+          <p>{steps[stepIndex].body}</p>
+        </div>
+        <div className="help-actions">
+          {stepIndex > 0 && (
+            <button className="help-secondary" onClick={() => setStepIndex((prev) => prev - 1)}>
+              上一步
+            </button>
+          )}
+          {isLastStep ? (
+            <button className="help-primary" onClick={() => void handleClose(true)}>
+              完成
+            </button>
+          ) : (
+            <button className="help-primary" onClick={() => setStepIndex((prev) => prev + 1)}>
+              下一步
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({
   snapshot,
   forceDisciplineSelection,
@@ -1494,6 +1635,7 @@ function MainWindow({
   const [isCompact, setIsCompact] = useState(false);
 
   const layoutRef = useRef<HTMLDivElement | null>(null);
+  const readerScrollRef = useRef<HTMLDivElement | null>(null);
   const resizeTargetRef = useRef<ResizeTarget | null>(null);
 
   const interestedDisciplines = useMemo(() => {
@@ -1608,13 +1750,14 @@ function MainWindow({
   );
 
   const unreadArticles = useMemo(() => {
-    const unread = reminderArticles.filter(
-      (article) =>
-        !archivedUnreadSet.has(article.id) &&
-        ((reminderArticleIds.has(article.id) && article.isNew) || manualUnreadSet.has(article.id))
+    const pushedUnread = reminderArticles.filter(
+      (article) => !archivedUnreadSet.has(article.id) && reminderArticleIds.has(article.id) && article.isNew
     );
-    return dedupeArticles(unread);
-  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet]);
+    const manualUnread = allArticles.filter(
+      (article) => !archivedUnreadSet.has(article.id) && manualUnreadSet.has(article.id)
+    );
+    return dedupeArticles([...pushedUnread, ...manualUnread]);
+  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet, allArticles]);
 
   const unreadIdSet = useMemo(() => new Set(unreadArticles.map((article) => article.id)), [unreadArticles]);
 
@@ -1843,6 +1986,10 @@ function MainWindow({
   useEffect(() => {
     setNoteDraft(selectedArticle?.note ?? "");
   }, [selectedArticle?.id, selectedArticle?.note]);
+
+  useEffect(() => {
+    readerScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [selectedArticle?.id]);
 
   useEffect(() => {
     if (!selectedArticle || usingDemoData) {
@@ -2207,6 +2354,9 @@ function MainWindow({
           >
             设置
           </button>
+          <button onClick={() => void openHelpWindow()}>
+            帮助
+          </button>
         </div>
       </header>
 
@@ -2215,6 +2365,9 @@ function MainWindow({
       )}
       {interactionMessage && <div className="interaction-banner">{interactionMessage}</div>}
       {loading && <div className="loading-strip">正在同步最新快照...</div>}
+      {snapshot.petStatus === "polling" && (
+        <div className="loading-strip">正在轮询检查是否有到点信源或待提醒内容...</div>
+      )}
       {snapshot.petStatus === "scanning" && (
         <div className="loading-strip">正在后台抓取并评分，本批次完成后会更新列表与提醒。</div>
       )}
@@ -2288,7 +2441,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2380,7 +2533,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2457,7 +2610,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2646,7 +2799,7 @@ function MainWindow({
                     </div>
                   </header>
 
-                  <div className="reader-scroll">
+                  <div ref={readerScrollRef} className="reader-scroll">
                     <div className="reader-content-wrap">
                       <section className="reader-block">
                         <h3>CHECK 简表</h3>
@@ -2786,6 +2939,10 @@ export default function App() {
 
   if (windowLabel === "bubble") {
     return <BubbleWindow snapshot={overlaySnapshot} />;
+  }
+
+  if (windowLabel === "help") {
+    return <HelpWindow />;
   }
 
   return (

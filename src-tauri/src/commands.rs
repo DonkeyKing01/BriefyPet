@@ -63,15 +63,11 @@ pub async fn save_settings(
         app.autolaunch().disable().map_err(|err| err.to_string())?;
     }
 
-    {
-        let mut scanning = state.is_scanning.lock().map_err(|err| err.to_string())?;
-        *scanning = true;
-    }
-
     service::ensure_scheduler(&app);
     service::trigger_fetch_now(&app, None, false);
-    service::sync_windows(&app, true).map_err(|err| err.to_string())?;
-    service::publish_snapshot(&app, true).map_err(|err| err.to_string())
+    let scanning = service::current_scanning(&app);
+    service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -132,6 +128,20 @@ pub fn pet_double_click(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn bubble_action(app: AppHandle, action: String) -> Result<Snapshot, String> {
     service::handle_bubble_action(&app, &action).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn open_help_window(app: AppHandle) -> Result<(), String> {
+    service::show_help_window(&app).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn dismiss_help_window(app: AppHandle, complete_onboarding: bool) -> Result<(), String> {
+    let conn = db::connect(&app).map_err(|err| err.to_string())?;
+    if complete_onboarding {
+        db::write_onboarding_completed(&conn, true).map_err(|err| err.to_string())?;
+    }
+    service::hide_help_window(&app).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -256,6 +266,9 @@ pub fn reset_runtime_data(app: AppHandle, state: State<'_, AppState>) -> Result<
     if let Ok(mut pet_visible_until) = state.pet_visible_until.lock() {
         *pet_visible_until = None;
     }
+    if let Ok(mut polling_until) = state.polling_until.lock() {
+        *polling_until = None;
+    }
     process::restart(&app.env());
     Ok(())
 }
@@ -302,6 +315,9 @@ pub fn reset_app_data(app: AppHandle, state: State<'_, AppState>) -> Result<Snap
     }
     if let Ok(mut scanning) = state.is_scanning.lock() {
         *scanning = false;
+    }
+    if let Ok(mut polling_until) = state.polling_until.lock() {
+        *polling_until = None;
     }
     app.autolaunch().disable().map_err(|err| err.to_string())?;
     service::sync_windows(&app, false).map_err(|err| err.to_string())?;

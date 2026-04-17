@@ -1,4 +1,4 @@
-export type PetStatus = "loading" | "needs-config" | "scanning" | "idle" | "new-info";
+export type PetStatus = "loading" | "needs-config" | "polling" | "scanning" | "idle" | "new-info";
 
 export type AppView = "reading" | "settings";
 

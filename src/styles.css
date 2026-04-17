@@ -1,6 +1,6 @@
 :root {
   color-scheme: light;
-  --font-ui: "Anthropic Sans", "SF Pro Text", "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-ui: "Anthropic Sans", "Segoe UI", "SF Pro Text", "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-heading: "Anthropic Serif", "Iowan Old Style", "Georgia", "Times New Roman", serif;
   --font-reading: "Anthropic Serif", "Iowan Old Style", "Charter", "Times New Roman", serif;
 
@@ -122,6 +122,7 @@ a {
   position: relative;
   width: 100%;
   height: 100%;
+  padding-top: 18px;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -155,7 +156,7 @@ a {
 .pet-stage {
   position: relative;
   width: 176px;
-  height: 184px;
+  height: 178px;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -189,20 +190,25 @@ a {
 
 .pet-whisper {
   position: absolute;
-  top: 6px;
+  top: 8px;
   left: 50%;
   transform: translateX(-50%);
-  max-width: calc(100% - 14px);
-  padding: 6px 10px;
-  border-radius: 10px;
+  max-width: calc(100% - 20px);
+  min-height: 40px;
+  padding: 8px 12px 9px;
+  border-radius: 12px;
   background: rgba(252, 249, 241, 0.92);
   border: 1px solid rgba(199, 189, 174, 0.58);
   color: #695f50;
   font-size: 11px;
-  line-height: 1.3;
+  line-height: 1.45;
+  font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   white-space: normal;
   text-align: center;
   word-break: break-word;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   pointer-events: none;
 }
 
@@ -585,6 +591,10 @@ a {
   padding-left: 24px;
 }
 
+.folder-row.module-row {
+  padding-left: 18px;
+}
+
 .row-icon {
   width: 14px;
   height: 14px;
@@ -606,6 +616,9 @@ a {
 
 .feed-list {
   margin-top: 2px;
+  margin-left: 18px;
+  padding-left: 10px;
+  border-left: 1px solid color-mix(in srgb, var(--line-soft) 90%, transparent);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1029,6 +1042,116 @@ a {
   min-height: 96px;
   resize: vertical;
   line-height: 1.52;
+}
+
+.help-window {
+  width: 100%;
+  height: 100%;
+  padding: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+}
+
+.help-card {
+  width: min(100%, 520px);
+  min-height: 420px;
+  max-height: 100%;
+  border-radius: 24px;
+  border: 1px solid var(--line-soft);
+  background:
+    radial-gradient(circle at top right, rgba(201, 100, 66, 0.12), rgba(201, 100, 66, 0) 34%),
+    color-mix(in srgb, var(--surface) 94%, white 6%);
+  box-shadow: var(--shadow-1);
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+}
+
+.help-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: grab;
+}
+
+.help-card-top:active {
+  cursor: grabbing;
+}
+
+.help-eyebrow {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.help-close,
+.help-secondary,
+.help-primary {
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
+}
+
+.help-close,
+.help-secondary {
+  background: color-mix(in srgb, var(--surface-muted) 80%, transparent);
+  color: var(--text-soft);
+}
+
+.help-primary {
+  background: var(--accent);
+  color: white;
+}
+
+.help-progress {
+  display: flex;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.help-progress-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 85%, transparent);
+}
+
+.help-progress-dot.active {
+  background: var(--accent);
+}
+
+.help-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 16px;
+}
+
+.help-body h1 {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-size: 32px;
+  line-height: 1.18;
+}
+
+.help-body p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 16px;
+  line-height: 1.75;
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+.help-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .settings-danger-card {

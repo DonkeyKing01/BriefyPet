@@ -12,9 +12,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tauri::AppHandle;
 
 use crate::models::{
-    all_disciplines, default_llm_provider, AppView, ArticleRecord, ContentPoolStat, Discipline, FitLevel,
-    InterestMemoryRecord, ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload,
-    Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
+    all_disciplines, default_llm_provider, AppView, ArticleRecord, ContentPoolStat, Discipline,
+    FeedArticle, FitLevel, InterestMemoryRecord, PendingArticleRecord, ReminderBatchSnapshot,
+    ResourceType, RssSource, SettingsPayload, Snapshot, SourceCatalogSummary, SourceKind,
+    UserDisciplinePreference,
 };
 use crate::policy;
 
@@ -310,6 +311,7 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         write_setting(conn, "memory_mode_enabled", "true")?;
         write_setting(conn, "pool_cleanup_v1_done", "false")?;
         write_setting(conn, "push_db_migrated_v1", "false")?;
+        write_setting(conn, "onboarding_completed", "false")?;
     } else {
         ensure_setting(conn, "llm_provider", &default_llm_provider())?;
         ensure_setting(conn, "llm_model", "")?;
@@ -322,6 +324,7 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         ensure_setting(conn, "memory_mode_enabled", "true")?;
         ensure_setting(conn, "pool_cleanup_v1_done", "false")?;
         ensure_setting(conn, "push_db_migrated_v1", "false")?;
+        ensure_setting(conn, "onboarding_completed", "false")?;
     }
 
     sync_source_catalog(conn, catalog)?;
@@ -1363,15 +1366,19 @@ pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i6
     Ok(inserted)
 }
 
-pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
-    let push_conn = push_connect(app)?;
-    if let Some(raw_until) = read_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY)? {
-        if let Some(until) = parse_datetime(&raw_until) {
-            if until > Utc::now() {
-                return Ok(None);
+fn push_reminder_snapshot(
+    push_conn: &Connection,
+    respect_snooze: bool,
+) -> Result<Option<ReminderBatchSnapshot>> {
+    if respect_snooze {
+        if let Some(raw_until) = read_push_meta_value(push_conn, PUSH_SNOOZE_UNTIL_KEY)? {
+            if let Some(until) = parse_datetime(&raw_until) {
+                if until > Utc::now() {
+                    return Ok(None);
+                }
             }
+            write_push_meta_value(push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
         }
-        write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
     }
 
     let mut stmt = push_conn.prepare(
@@ -1413,6 +1420,30 @@ pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnaps
         top_article_id,
         partition_count: partitions.len(),
     }))
+}
+
+pub fn read_onboarding_completed(conn: &Connection) -> Result<bool> {
+    Ok(read_setting(conn, "onboarding_completed")?
+        .unwrap_or_else(|| "false".into())
+        == "true")
+}
+
+pub fn write_onboarding_completed(conn: &Connection, value: bool) -> Result<()> {
+    write_setting(
+        conn,
+        "onboarding_completed",
+        if value { "true" } else { "false" },
+    )
+}
+
+pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
+    let push_conn = push_connect(app)?;
+    push_reminder_snapshot(&push_conn, true)
+}
+
+pub fn push_waiting_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
+    let push_conn = push_connect(app)?;
+    push_reminder_snapshot(&push_conn, false)
 }
 
 pub fn list_push_history_articles_page(
@@ -1890,6 +1921,70 @@ pub fn reset_fetch_state_for_module(conn: &Connection, module: &str) -> Result<(
     Ok(())
 }
 
+pub fn list_pending_article_backlog(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<PendingArticleRecord>> {
+    let safe_limit = limit.max(1).min(1000) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            a.id,
+            a.article_key,
+            a.fetched_at,
+            a.source_id,
+            a.title,
+            a.link,
+            a.source_name,
+            a.discipline,
+            a.source_kind,
+            a.resource_type,
+            a.published_at,
+            a.raw_content,
+            COALESCE(sc.module, 'other') AS module,
+            COALESCE(sc.bucket, 'unspecified') AS bucket
+        FROM articles a
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE a.score_status = 'pending'
+        ORDER BY COALESCE(a.fetched_at, a.published_at, '1970-01-01T00:00:00Z') ASC, a.id ASC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map(params![safe_limit], |row| {
+        let fetched_at_raw: Option<String> = row.get(2)?;
+        let published_at_raw: Option<String> = row.get(10)?;
+        let link: String = row.get(5)?;
+        Ok(PendingArticleRecord {
+            id: row.get(0)?,
+            article_key: row.get(1)?,
+            fetched_at: parse_optional_datetime(fetched_at_raw)
+                .or_else(|| parse_optional_datetime(published_at_raw.clone()))
+                .unwrap_or_else(Utc::now),
+            article: FeedArticle {
+                source_id: row.get(3)?,
+                title: row.get(4)?,
+                link: link.clone(),
+                source_name: row.get(6)?,
+                discipline: parse_discipline(&row.get::<_, String>(7)?),
+                source_kind: parse_source_kind(&row.get::<_, String>(8)?),
+                resource_type: parse_resource_type(&row.get::<_, String>(9)?),
+                published_at: parse_optional_datetime(published_at_raw),
+                content: row.get(11)?,
+                module: row.get(12)?,
+                bucket: row.get(13)?,
+                normalized_link: canonicalize_source_url(&link),
+                guid: row.get::<_, String>(1)?,
+            },
+        })
+    })?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row?);
+    }
+    Ok(output)
+}
+
 pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>, force_all: bool) -> Result<Vec<RssSource>> {
     let selected = list_selected_effective_disciplines(conn)?
         .into_iter()
@@ -2123,6 +2218,7 @@ pub fn list_top_bucket_candidates(
     buckets: &BTreeSet<(String, String)>,
     max_per_bucket: usize,
     max_age_days: i64,
+    min_fit_score: i64,
 ) -> Result<Vec<i64>> {
     if buckets.is_empty() || max_per_bucket == 0 {
         return Ok(Vec::new());
@@ -2141,13 +2237,14 @@ pub fn list_top_bucket_candidates(
               AND rcp.bucket = ?2
               AND a.score_status = 'success'
               AND COALESCE(a.published_at, a.fetched_at, '1970-01-01T00:00:00Z') >= ?3
+              AND rcp.fit_score >= ?4
             ORDER BY rcp.fit_score DESC, COALESCE(a.published_at, a.fetched_at) DESC, rcp.article_id DESC
-            LIMIT ?4
+            LIMIT ?5
             "#,
         )?;
 
         let rows = stmt.query_map(
-            params![module, bucket, cutoff, max_per_bucket as i64],
+            params![module, bucket, cutoff, min_fit_score, max_per_bucket as i64],
             |row| {
                 let published_at_raw: Option<String> = row.get(2)?;
                 let fetched_at_raw: Option<String> = row.get(3)?;
@@ -2632,7 +2729,7 @@ fn list_dueable_enabled_sources_count(conn: &Connection) -> Result<i64> {
 
 fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     let mut load_errors = Vec::new();
-    for candidate in build_resource_candidates(app, "rss_catalog_v3_unified.opml") {
+    for candidate in build_resource_candidates(app, "rss-catalog.opml") {
         if !candidate.exists() {
             continue;
         }

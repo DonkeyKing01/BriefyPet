@@ -20,10 +20,12 @@ use crate::{
 const SCORE_BATCH_SIZE: usize = 3;
 const MAX_CONCURRENT_SCORE_BATCHES: usize = 20;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
-const PET_PEEK_SECONDS: u64 = 120;
+const POLLING_PEEK_SECONDS: u64 = 2;
 const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 7;
 const PUSH_TOP_PER_BUCKET: usize = 3;
 const PUSH_MAX_AGE_DAYS: i64 = 2;
+const PUSH_MIN_FIT_SCORE: i64 = 60;
+const PENDING_BACKLOG_BATCH_SIZE: usize = 180;
 pub const EVENT_SNAPSHOT_UPDATED: &str = "briefy://snapshot-updated";
 pub const EVENT_OVERLAY_UPDATED: &str = "briefy://overlay-updated";
 
@@ -88,7 +90,7 @@ pub fn derive_pet_status(
 pub fn snapshot(app: &AppHandle, is_scanning: bool) -> Result<Snapshot> {
     let conn = db::connect(app)?;
     let settings = db::read_settings(&conn)?;
-    let active_reminder = db::push_active_reminder(app)?;
+    let active_reminder = db::push_waiting_reminder(app)?;
     let last_error = app
         .state::<AppState>()
         .last_error
@@ -116,13 +118,19 @@ pub fn snapshot(app: &AppHandle, is_scanning: bool) -> Result<Snapshot> {
         .ok()
         .and_then(|value| *value)
         .is_some();
-    let pet_status = derive_pet_status(
-        &settings,
-        api_key_valid,
-        active_reminder.is_some(),
-        is_scanning,
-        is_loading,
-    );
+    let pet_status = if is_loading {
+        PetStatus::Loading
+    } else if current_polling(app, Some(Utc::now())) {
+        PetStatus::Polling
+    } else {
+        derive_pet_status(
+            &settings,
+            api_key_valid,
+            active_reminder.is_some(),
+            is_scanning,
+            false,
+        )
+    };
 
     let mut snapshot = db::build_snapshot(
         &conn,
@@ -176,6 +184,8 @@ pub fn snapshot_overlay(app: &AppHandle, is_scanning: bool) -> Result<OverlaySna
 
     let pet_status = if is_loading {
         PetStatus::Loading
+    } else if current_polling(app, Some(Utc::now())) {
+        PetStatus::Polling
     } else if requires_configuration_flags(discipline_ready, has_api_key, api_key_valid) {
         PetStatus::NeedsConfig
     } else if is_scanning || api_key_valid.is_none() {
@@ -237,15 +247,37 @@ pub fn ensure_scheduler(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             sleep(TokioDuration::from_secs(SCHEDULER_TICK_MINUTES * 60)).await;
-            reveal_pet_for_polling(&app_handle);
-            log_fetch_result(run_fetch_cycle(app_handle.clone(), false).await, &app_handle);
+            run_scheduler_poll_cycle(app_handle.clone()).await;
         }
     });
 }
 
-pub fn reveal_pet_for_polling(app: &AppHandle) {
-    let visible_until = Utc::now() + Duration::seconds(PET_PEEK_SECONDS as i64);
+pub fn show_help_window(app: &AppHandle) -> Result<()> {
+    if let Some(window) = app.get_window("help") {
+        window.show()?;
+        window.set_focus()?;
+    }
+    let _ = app.emit_all("briefy://help-opened", ());
+    Ok(())
+}
+
+pub fn hide_help_window(app: &AppHandle) -> Result<()> {
+    if let Some(window) = app.get_window("help") {
+        window.hide()?;
+    }
+    Ok(())
+}
+
+pub fn reveal_pet_on_launch(app: &AppHandle, seconds: i64) -> Result<()> {
+    let visible_until = Utc::now() + Duration::seconds(seconds);
     set_pet_visible_until(app, Some(visible_until));
+    sync_windows(app, current_scanning(app))
+}
+
+pub fn reveal_pet_for_polling(app: &AppHandle) {
+    let visible_until = Utc::now() + Duration::seconds(POLLING_PEEK_SECONDS as i64);
+    set_pet_visible_until(app, Some(visible_until));
+    set_polling_until(app, Some(visible_until));
 
     let is_scanning = app
         .state::<AppState>()
@@ -257,7 +289,7 @@ pub fn reveal_pet_for_polling(app: &AppHandle) {
 
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        sleep(TokioDuration::from_secs(PET_PEEK_SECONDS)).await;
+        sleep(TokioDuration::from_secs(POLLING_PEEK_SECONDS)).await;
         let is_scanning = app_handle
             .state::<AppState>()
             .is_scanning
@@ -266,6 +298,43 @@ pub fn reveal_pet_for_polling(app: &AppHandle) {
             .unwrap_or(false);
         let _ = sync_windows(&app_handle, is_scanning);
     });
+}
+
+async fn run_scheduler_poll_cycle(app: AppHandle) {
+    reveal_pet_for_polling(&app);
+    sleep(TokioDuration::from_secs(POLLING_PEEK_SECONDS)).await;
+    clear_polling_until(&app);
+
+    let Ok(conn) = db::connect(&app) else {
+        let _ = sync_windows(&app, false);
+        return;
+    };
+    let Ok(settings) = db::read_settings(&conn) else {
+        let _ = sync_windows(&app, false);
+        return;
+    };
+    let api_key_valid = app
+        .state::<AppState>()
+        .api_key_valid
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .or(db::read_api_key_valid(&conn).ok());
+
+    if requires_configuration(&settings, api_key_valid) {
+        let _ = sync_windows(&app, false);
+        let _ = publish_snapshot(&app, false);
+        return;
+    }
+
+    let due_sources = db::list_due_sources(&conn, Utc::now(), false).unwrap_or_default();
+    if due_sources.is_empty() {
+        let _ = sync_windows(&app, false);
+        let _ = publish_snapshot(&app, false);
+        return;
+    }
+
+    log_fetch_result(run_fetch_cycle(app.clone(), false).await, &app);
 }
 
 pub fn trigger_fetch_now(
@@ -316,7 +385,10 @@ pub async fn validate_api_key_for_settings(app: &AppHandle, settings: &SettingsP
 }
 
 pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<()> {
-    set_scanning(&app, true);
+    if !begin_scan(&app) {
+        return Ok(());
+    }
+    clear_polling_until(&app);
     clear_loading_until(&app);
     let _ = sync_windows(&app, true);
     let _ = publish_snapshot(&app, true);
@@ -363,8 +435,9 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     ensure_api_key_ready(&app, &settings).await?;
 
     let now = Utc::now();
+    let backlog_records = db::list_pending_article_backlog(&conn, PENDING_BACKLOG_BATCH_SIZE)?;
     let due_sources = db::list_due_sources(&conn, now, force_incremental)?;
-    if due_sources.is_empty() {
+    if due_sources.is_empty() && backlog_records.is_empty() {
         let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
         if memory.is_some() {
             clear_last_error(&app);
@@ -391,77 +464,85 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         return Ok(());
     }
 
-    let fetch_started_at = Instant::now();
-    let fetch_outcome = match rss::fetch_sources(&due_sources).await {
-        Ok(value) => value,
-        Err(err) => {
-            let cycle_ended_at = Utc::now();
-            let _ = db::log_crawl_cycle(
-                &conn,
-                cycle_started_at,
-                cycle_ended_at,
-                "failed-fetch",
-                due_sources.len(),
-                0,
-                0,
-                0,
-                fetch_started_at.elapsed().as_millis(),
-                0,
-                started_at.elapsed().as_millis(),
-                None,
-                Some(&format_compact_error(&err, 300)),
-            );
-            return Err(err).context("RSS fetch/parse failed");
-        }
-    };
-    let fetch_elapsed = fetch_started_at.elapsed();
-
-    let mut pending_articles = Vec::<PendingArticle>::new();
+    let mut pending_articles = backlog_records
+        .into_iter()
+        .map(|record| PendingArticle {
+            article_id: record.id,
+            article: record.article,
+        })
+        .collect::<Vec<_>>();
     let mut fetch_errors = Vec::new();
     let mut successful_source_ids = Vec::new();
-    for result in fetch_outcome.results {
-        if let Some(error) = result.error {
-            db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
-            fetch_errors.push(format!("{}: {}", result.source.name, error));
-            continue;
-        }
-
-        let is_initial_fetch = !db::source_has_successful_fetch(&conn, &result.source.id)?;
-        let incremental_cutoff = if force_incremental && !is_initial_fetch {
-            db::source_last_fetched_at(&conn, &result.source.id)?
-        } else {
-            None
+    let fetch_started_at = Instant::now();
+    if !due_sources.is_empty() {
+        let fetch_outcome = match rss::fetch_sources(&due_sources).await {
+            Ok(value) => value,
+            Err(err) => {
+                let cycle_ended_at = Utc::now();
+                let _ = db::log_crawl_cycle(
+                    &conn,
+                    cycle_started_at,
+                    cycle_ended_at,
+                    "failed-fetch",
+                    due_sources.len(),
+                    0,
+                    0,
+                    0,
+                    fetch_started_at.elapsed().as_millis(),
+                    0,
+                    started_at.elapsed().as_millis(),
+                    None,
+                    Some(&format_compact_error(&err, 300)),
+                );
+                return Err(err).context("RSS fetch/parse failed");
+            }
         };
-        let filtered = collect_pending_articles(
-            &conn,
-            result.articles,
-            is_initial_fetch,
-            now,
-            incremental_cutoff,
-        )?;
-        for article in filtered {
-            let article_key = build_article_key(&article);
-            let guid = effective_guid(&article, &article_key);
-            let article_id = db::insert_pending_article(
+
+        for result in fetch_outcome.results {
+            if let Some(error) = result.error {
+                db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
+                fetch_errors.push(format!("{}: {}", result.source.name, error));
+                continue;
+            }
+
+            let is_initial_fetch = !db::source_has_successful_fetch(&conn, &result.source.id)?;
+            let incremental_cutoff = if force_incremental && !is_initial_fetch {
+                db::source_last_fetched_at(&conn, &result.source.id)?
+            } else {
+                None
+            };
+            let filtered = collect_pending_articles(
                 &conn,
-                &article.source_id,
-                &guid,
-                &article_key,
-                &article.normalized_link,
-                &article.title,
-                &article.link,
-                &article.source_name,
-                &article.discipline,
-                &article.source_kind,
-                &article.resource_type,
-                article.published_at,
+                result.articles,
+                is_initial_fetch,
                 now,
-                &article.content,
+                incremental_cutoff,
             )?;
-            pending_articles.push(PendingArticle { article_id, article });
+            for article in filtered {
+                let article_key = build_article_key(&article);
+                let guid = effective_guid(&article, &article_key);
+                let article_id = db::insert_pending_article(
+                    &conn,
+                    &article.source_id,
+                    &guid,
+                    &article_key,
+                    &article.normalized_link,
+                    &article.title,
+                    &article.link,
+                    &article.source_name,
+                    &article.discipline,
+                    &article.source_kind,
+                    &article.resource_type,
+                    article.published_at,
+                    now,
+                    &article.content,
+                )?;
+                pending_articles.push(PendingArticle { article_id, article });
+            }
+            successful_source_ids.push(result.source.id);
         }
-        successful_source_ids.push(result.source.id);
     }
+    let fetch_elapsed = fetch_started_at.elapsed();
 
     let interest_context = build_interest_context(&settings);
     let score_started_at = Instant::now();
@@ -522,6 +603,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         &updated_buckets,
         PUSH_TOP_PER_BUCKET,
         PUSH_MAX_AGE_DAYS,
+        PUSH_MIN_FIT_SCORE,
     )?;
     if !reminder_candidates.is_empty() {
         let _ = db::queue_push_articles(&conn, &app, &reminder_candidates)?;
@@ -1055,8 +1137,7 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
                 db::write_active_view(&conn, &AppView::Reading)?;
                 db::log_user_event(&conn, "bubble-view", batch.top_article_id, None, None)?;
                 if let Some(top_article_id) = batch.top_article_id {
-                    db::mark_article_opened(&conn, top_article_id)?;
-                    let _ = db::mark_push_article_pushed(app, top_article_id)?;
+                    db::write_selected_article_id(&conn, Some(top_article_id))?;
                     let source_id = db::article_source_id(&conn, top_article_id)?;
                     db::log_user_event(
                         &conn,
@@ -1102,7 +1183,7 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
 pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
     let current = publish_overlay(app, is_scanning)?;
     if let Some(window) = app.get_window("bubble") {
-        if current.active_reminder.is_some() {
+        if current.pet_status != PetStatus::Polling && current.active_reminder.is_some() {
             let _ = window.show();
         } else {
             let _ = window.hide();
@@ -1120,7 +1201,7 @@ pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
 }
 
 fn should_show_pet_window(app: &AppHandle, has_active_reminder: bool, is_scanning: bool) -> bool {
-    if has_active_reminder || is_scanning {
+    if has_active_reminder || is_scanning || current_polling(app, Some(Utc::now())) {
         return true;
     }
 
@@ -1167,6 +1248,12 @@ fn clear_loading_until(app: &AppHandle) {
     }
 }
 
+fn clear_polling_until(app: &AppHandle) {
+    if let Ok(mut polling_until) = app.state::<AppState>().polling_until.lock() {
+        *polling_until = None;
+    }
+}
+
 fn set_pet_visible_until(app: &AppHandle, value: Option<DateTime<Utc>>) {
     if let Ok(mut pet_visible_until) = app.state::<AppState>().pet_visible_until.lock() {
         *pet_visible_until = value;
@@ -1177,6 +1264,36 @@ fn set_scanning(app: &AppHandle, value: bool) {
     if let Ok(mut scanning) = app.state::<AppState>().is_scanning.lock() {
         *scanning = value;
     }
+}
+
+fn begin_scan(app: &AppHandle) -> bool {
+    if let Ok(mut scanning) = app.state::<AppState>().is_scanning.lock() {
+        if *scanning {
+            return false;
+        }
+        *scanning = true;
+        return true;
+    }
+    false
+}
+
+fn set_polling_until(app: &AppHandle, value: Option<DateTime<Utc>>) {
+    if let Ok(mut polling_until) = app.state::<AppState>().polling_until.lock() {
+        *polling_until = value;
+    }
+}
+
+fn current_polling(app: &AppHandle, now: Option<DateTime<Utc>>) -> bool {
+    let now = now.unwrap_or_else(Utc::now);
+    if let Ok(mut polling_until) = app.state::<AppState>().polling_until.lock() {
+        if let Some(until) = *polling_until {
+            if until > now {
+                return true;
+            }
+            *polling_until = None;
+        }
+    }
+    false
 }
 
 #[derive(Clone)]
