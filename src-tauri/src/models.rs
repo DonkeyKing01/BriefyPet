@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum PetStatus {
     Loading,
     NeedsConfig,
+    Polling,
     Scanning,
     Idle,
     NewInfo,
@@ -133,10 +134,22 @@ pub struct SettingsPayload {
     pub api_key: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
+    #[serde(default = "default_llm_protocol")]
+    pub llm_protocol: String,
+    #[serde(default)]
+    pub llm_base_url: String,
+    #[serde(default)]
+    pub llm_custom_provider_name: String,
+    #[serde(default)]
+    pub llm_model_name: String,
     #[serde(default)]
     pub llm_model: String,
     #[serde(default)]
     pub provider_api_keys: BTreeMap<String, String>,
+    #[serde(default = "default_module_fetch_intervals")]
+    pub module_fetch_intervals: BTreeMap<String, i64>,
+    #[serde(default = "default_module_push_top_n")]
+    pub module_push_top_n: BTreeMap<String, i64>,
     pub auto_start: bool,
     pub disciplines: Vec<UserDisciplinePreference>,
     pub memory_mode_enabled: bool,
@@ -220,6 +233,17 @@ pub struct InterestMemoryRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryReviewProposal {
+    pub id: String,
+    pub week_key: String,
+    pub base_summary: String,
+    pub proposed_summary: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceCatalogSummary {
     pub total_sources: usize,
     pub enabled_sources: usize,
@@ -243,6 +267,7 @@ pub struct Snapshot {
     pub last_scan_at: Option<DateTime<Utc>>,
     pub content_pool_stats: Vec<ContentPoolStat>,
     pub memory: Option<InterestMemoryRecord>,
+    pub memory_review: Option<MemoryReviewProposal>,
     pub source_summary: SourceCatalogSummary,
 }
 
@@ -270,6 +295,14 @@ pub struct FeedArticle {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingArticleRecord {
+    pub id: i64,
+    pub article_key: String,
+    pub fetched_at: DateTime<Utc>,
+    pub article: FeedArticle,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LlmResult {
     pub summary: String,
@@ -280,6 +313,38 @@ pub struct LlmResult {
 
 pub fn default_llm_provider() -> String {
     "deepseek".to_string()
+}
+
+pub fn default_llm_protocol() -> String {
+    "openai-compatible".to_string()
+}
+
+pub fn default_module_fetch_intervals() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), 6),
+        ("social_science".to_string(), 12),
+        ("business".to_string(), 12),
+        ("growth".to_string(), 12),
+        ("news_opinion".to_string(), 12),
+        ("entertainment".to_string(), 12),
+        ("science".to_string(), 12),
+        ("medicine".to_string(), 12),
+        ("other".to_string(), 12),
+    ])
+}
+
+pub fn default_module_push_top_n() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), 6),
+        ("social_science".to_string(), 6),
+        ("business".to_string(), 6),
+        ("growth".to_string(), 6),
+        ("news_opinion".to_string(), 6),
+        ("entertainment".to_string(), 6),
+        ("science".to_string(), 6),
+        ("medicine".to_string(), 6),
+        ("other".to_string(), 6),
+    ])
 }
 
 pub fn all_disciplines() -> Vec<Discipline> {

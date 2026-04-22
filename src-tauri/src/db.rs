@@ -12,9 +12,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tauri::AppHandle;
 
 use crate::models::{
-    all_disciplines, default_llm_provider, AppView, ArticleRecord, ContentPoolStat, Discipline, FitLevel,
-    InterestMemoryRecord, ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload,
-    Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
+    all_disciplines, default_llm_protocol, default_llm_provider, AppView, ArticleRecord,
+    ContentPoolStat, Discipline, FeedArticle, FitLevel, InterestMemoryRecord,
+    MemoryReviewProposal, PendingArticleRecord, ReminderBatchSnapshot, ResourceType, RssSource,
+    SettingsPayload, Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
 };
 use crate::policy;
 
@@ -128,13 +129,23 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           published_at TEXT,
           inserted_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS daily_interest_memory (
+                CREATE TABLE IF NOT EXISTS daily_interest_memory (
           day_key TEXT PRIMARY KEY,
           generated_summary TEXT NOT NULL DEFAULT '',
           confirmed_summary TEXT,
           memory_enabled INTEGER NOT NULL DEFAULT 1,
           event_count INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_review_proposals (
+          id TEXT PRIMARY KEY,
+          week_key TEXT NOT NULL UNIQUE,
+          base_summary TEXT NOT NULL DEFAULT '',
+          proposed_summary TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending',
+          user_response TEXT,
+          created_at TEXT NOT NULL,
+          decided_at TEXT
         );
                 CREATE TABLE IF NOT EXISTS crawl_cycle_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,17 +248,29 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_ranked_content_pool_bucket ON ranked_content_pool(module, bucket, fit_score DESC);
         "#,
     )?;
+    conn.execute(
+        r#"
+        UPDATE articles
+        SET guid = COALESCE(
+          NULLIF(article_key, ''),
+          NULLIF(source_id || '::' || normalized_link, source_id || '::'),
+          source_id || '::legacy::' || id
+        )
+        WHERE TRIM(guid) = ''
+        "#,
+        [],
+    )?;
 
     let catalog = load_catalog(app)?;
     seed_defaults(&conn, &catalog)?;
-        ensure_push_db_initialized(app, &conn)?;
+    ensure_push_db_initialized(app, &conn)?;
     Ok(conn)
 }
 
 pub fn push_connect(app: &AppHandle) -> Result<Connection> {
-        let path = push_db_path(app)?;
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
+    let path = push_db_path(app)?;
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
                 r#"
                 PRAGMA journal_mode = WAL;
                 CREATE TABLE IF NOT EXISTS push_items (
@@ -269,27 +292,40 @@ pub fn push_connect(app: &AppHandle) -> Result<Connection> {
                     ON push_items(module, bucket, push_status, fit_score DESC, queued_at DESC, article_id DESC);
                 "#,
         )?;
-        Ok(conn)
+    Ok(conn)
 }
 
 fn ensure_push_db_initialized(app: &AppHandle, conn: &Connection) -> Result<()> {
-        let push_conn = push_connect(app)?;
-        let migrated = read_setting(conn, "push_db_migrated_v1")?
-                .unwrap_or_else(|| "false".to_string())
-                == "true";
-        if !migrated {
-                migrate_legacy_reminders_to_push_db(conn, &push_conn)?;
-                write_setting(conn, "push_db_migrated_v1", "true")?;
-        }
-        Ok(())
+    let push_conn = push_connect(app)?;
+    let migrated =
+        read_setting(conn, "push_db_migrated_v1")?.unwrap_or_else(|| "false".to_string()) == "true";
+    if !migrated {
+        migrate_legacy_reminders_to_push_db(conn, &push_conn)?;
+        write_setting(conn, "push_db_migrated_v1", "true")?;
+    }
+    Ok(())
 }
 
 fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
     if read_setting(conn, "api_key")?.is_none() {
         write_setting(conn, "api_key", "")?;
         write_setting(conn, "llm_provider", &default_llm_provider())?;
+        write_setting(conn, "llm_protocol", &default_llm_protocol())?;
+        write_setting(conn, "llm_base_url", "")?;
+        write_setting(conn, "llm_custom_provider_name", "")?;
+        write_setting(conn, "llm_model_name", "")?;
         write_setting(conn, "llm_model", "")?;
         write_setting(conn, "provider_api_keys", "{}")?;
+        write_setting(
+            conn,
+            "module_fetch_intervals",
+            &serde_json::to_string(&policy::default_module_fetch_intervals())?,
+        )?;
+        write_setting(
+            conn,
+            "module_push_top_n",
+            &serde_json::to_string(&policy::default_module_push_top_n_map())?,
+        )?;
         write_setting(conn, "auto_start", "false")?;
         write_setting(conn, "active_view", "\"settings\"")?;
         write_setting(conn, "selected_article_id", "null")?;
@@ -298,10 +334,25 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         write_setting(conn, "memory_mode_enabled", "true")?;
         write_setting(conn, "pool_cleanup_v1_done", "false")?;
         write_setting(conn, "push_db_migrated_v1", "false")?;
+        write_setting(conn, "onboarding_completed", "false")?;
     } else {
         ensure_setting(conn, "llm_provider", &default_llm_provider())?;
+        ensure_setting(conn, "llm_protocol", &default_llm_protocol())?;
+        ensure_setting(conn, "llm_base_url", "")?;
+        ensure_setting(conn, "llm_custom_provider_name", "")?;
+        ensure_setting(conn, "llm_model_name", "")?;
         ensure_setting(conn, "llm_model", "")?;
         ensure_setting(conn, "provider_api_keys", "{}")?;
+        ensure_setting(
+            conn,
+            "module_fetch_intervals",
+            &serde_json::to_string(&policy::default_module_fetch_intervals())?,
+        )?;
+        ensure_setting(
+            conn,
+            "module_push_top_n",
+            &serde_json::to_string(&policy::default_module_push_top_n_map())?,
+        )?;
         ensure_setting(conn, "auto_start", "false")?;
         ensure_setting(conn, "active_view", "\"settings\"")?;
         ensure_setting(conn, "selected_article_id", "null")?;
@@ -310,6 +361,7 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         ensure_setting(conn, "memory_mode_enabled", "true")?;
         ensure_setting(conn, "pool_cleanup_v1_done", "false")?;
         ensure_setting(conn, "push_db_migrated_v1", "false")?;
+        ensure_setting(conn, "onboarding_completed", "false")?;
     }
 
     sync_source_catalog(conn, catalog)?;
@@ -471,7 +523,11 @@ fn sync_source_fetch_state(conn: &Connection, catalog: &[RssSource]) -> Result<(
     Ok(())
 }
 
-pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: bool) -> Result<()> {
+pub fn upsert_source(
+    conn: &Connection,
+    source: &RssSource,
+    mark_custom_origin: bool,
+) -> Result<()> {
     let module = policy::normalize_module(&source.module);
     let bucket = policy::normalize_bucket(&module, &source.bucket);
     let mut origins = source.origin_files.clone();
@@ -526,7 +582,11 @@ pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: 
           enabled = excluded.enabled,
           updated_at = excluded.updated_at
         "#,
-        params![source.id, bool_to_int(source.enabled), Utc::now().to_rfc3339()],
+        params![
+            source.id,
+            bool_to_int(source.enabled),
+            Utc::now().to_rfc3339()
+        ],
     )?;
 
     conn.execute(
@@ -542,25 +602,53 @@ pub fn upsert_source(conn: &Connection, source: &RssSource, mark_custom_origin: 
 
 pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
     let llm_provider = normalize_llm_provider(
-        &read_setting(conn, "llm_provider")?
-            .unwrap_or_else(default_llm_provider),
+        &read_setting(conn, "llm_provider")?.unwrap_or_else(default_llm_provider),
     );
+    let llm_protocol = normalize_llm_protocol(
+        &read_setting(conn, "llm_protocol")?.unwrap_or_else(default_llm_protocol),
+    );
+    let llm_base_url = read_setting(conn, "llm_base_url")?.unwrap_or_default();
+    let llm_custom_provider_name =
+        read_setting(conn, "llm_custom_provider_name")?.unwrap_or_default();
+    let llm_model_name = read_setting(conn, "llm_model_name")?.unwrap_or_default();
     let llm_model = read_setting(conn, "llm_model")?.unwrap_or_default();
+    let mut module_fetch_intervals = policy::default_module_fetch_intervals();
+    if let Some(raw) = read_setting(conn, "module_fetch_intervals")? {
+        if let Ok(overrides) = serde_json::from_str::<BTreeMap<String, i64>>(&raw) {
+            for (module, hours) in overrides {
+                let normalized = policy::normalize_module(&module);
+                module_fetch_intervals.insert(normalized, hours.clamp(1, 168));
+            }
+        }
+    }
+    let mut module_push_top_n = policy::default_module_push_top_n_map();
+    if let Some(raw) = read_setting(conn, "module_push_top_n")? {
+        if let Ok(overrides) = serde_json::from_str::<BTreeMap<String, i64>>(&raw) {
+            for (module, count) in overrides {
+                let normalized = policy::normalize_module(&module);
+                module_push_top_n.insert(normalized, count.clamp(1, 24));
+            }
+        }
+    }
     let legacy_api_key = read_setting(conn, "api_key")?.unwrap_or_default();
     let mut provider_api_keys = read_setting(conn, "provider_api_keys")?
         .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
         .unwrap_or_default();
     if !legacy_api_key.trim().is_empty() {
+        let provider_api_key_key =
+            active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
         let needs_backfill = provider_api_keys
-            .get(&llm_provider)
+            .get(&provider_api_key_key)
             .map(|value| value.trim().is_empty())
             .unwrap_or(true);
         if needs_backfill {
-            provider_api_keys.insert(llm_provider.clone(), legacy_api_key.clone());
+            provider_api_keys.insert(provider_api_key_key, legacy_api_key.clone());
         }
     }
+    let provider_api_key_key =
+        active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
     let api_key = provider_api_keys
-        .get(&llm_provider)
+        .get(&provider_api_key_key)
         .filter(|value| !value.trim().is_empty())
         .cloned()
         .unwrap_or(legacy_api_key);
@@ -568,8 +656,14 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
     Ok(SettingsPayload {
         api_key,
         llm_provider,
+        llm_protocol,
+        llm_base_url,
+        llm_custom_provider_name,
+        llm_model_name,
         llm_model,
         provider_api_keys,
+        module_fetch_intervals,
+        module_push_top_n,
         auto_start: read_setting(conn, "auto_start")?.unwrap_or_else(|| "false".into()) == "true",
         disciplines: list_discipline_preferences(conn)?,
         memory_mode_enabled: read_setting(conn, "memory_mode_enabled")?
@@ -584,22 +678,55 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
 
 pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<()> {
     let llm_provider = normalize_llm_provider(&settings.llm_provider);
+    let llm_protocol = normalize_llm_protocol(&settings.llm_protocol);
+    let llm_base_url = settings.llm_base_url.trim().to_string();
+    let llm_custom_provider_name = settings.llm_custom_provider_name.trim().to_string();
+    let llm_model_name = settings.llm_model_name.trim().to_string();
     let llm_model = settings.llm_model.trim().to_string();
+    let mut module_fetch_intervals = policy::default_module_fetch_intervals();
+    for (module, hours) in &settings.module_fetch_intervals {
+        let normalized = policy::normalize_module(module);
+        module_fetch_intervals.insert(normalized, (*hours).clamp(1, 168));
+    }
+    let mut module_push_top_n = policy::default_module_push_top_n_map();
+    for (module, count) in &settings.module_push_top_n {
+        let normalized = policy::normalize_module(module);
+        module_push_top_n.insert(normalized, (*count).clamp(1, 24));
+    }
     let mut provider_api_keys = settings.provider_api_keys.clone();
     for value in provider_api_keys.values_mut() {
         *value = value.trim().to_string();
     }
+    let provider_api_key_key =
+        active_provider_api_key_key(&llm_provider, &llm_custom_provider_name);
     if !settings.api_key.trim().is_empty() {
-        provider_api_keys.insert(llm_provider.clone(), settings.api_key.trim().to_string());
+        provider_api_keys.insert(
+            provider_api_key_key.clone(),
+            settings.api_key.trim().to_string(),
+        );
     }
     let active_api_key = provider_api_keys
-        .get(&llm_provider)
+        .get(&provider_api_key_key)
         .cloned()
         .unwrap_or_default();
 
     write_setting(conn, "api_key", active_api_key.trim())?;
     write_setting(conn, "llm_provider", &llm_provider)?;
+    write_setting(conn, "llm_protocol", &llm_protocol)?;
+    write_setting(conn, "llm_base_url", &llm_base_url)?;
+    write_setting(conn, "llm_custom_provider_name", &llm_custom_provider_name)?;
+    write_setting(conn, "llm_model_name", &llm_model_name)?;
     write_setting(conn, "llm_model", &llm_model)?;
+    write_setting(
+        conn,
+        "module_fetch_intervals",
+        &serde_json::to_string(&module_fetch_intervals)?,
+    )?;
+    write_setting(
+        conn,
+        "module_push_top_n",
+        &serde_json::to_string(&module_push_top_n)?,
+    )?;
     write_setting(
         conn,
         "provider_api_keys",
@@ -715,10 +842,7 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
     if !settings.memory_mode_enabled {
         write_memory_summary(conn, false, "")?;
     } else {
-        conn.execute(
-            "UPDATE daily_interest_memory SET memory_enabled = 1",
-            [],
-        )?;
+        conn.execute("UPDATE daily_interest_memory SET memory_enabled = 1", [])?;
     }
 
     write_memory_summary(
@@ -917,16 +1041,18 @@ pub fn find_article_id_by_identity(
     source_id: &str,
     article_key: &str,
     normalized_link: &str,
+    guid: &str,
 ) -> Result<Option<i64>> {
     conn.query_row(
         r#"
         SELECT id
         FROM articles
-        WHERE (source_id = ?1 AND article_key = ?2)
+        WHERE guid = ?4
+           OR (source_id = ?1 AND article_key = ?2)
            OR normalized_link = ?3
         LIMIT 1
         "#,
-        params![source_id, article_key, normalized_link],
+        params![source_id, article_key, normalized_link, guid],
         |row| row.get(0),
     )
     .optional()
@@ -950,7 +1076,9 @@ pub fn insert_pending_article(
     fetched_at: DateTime<Utc>,
     raw_content: &str,
 ) -> Result<i64> {
-    if let Some(article_id) = find_article_id_by_identity(conn, source_id, article_key, normalized_link)? {
+    if let Some(article_id) =
+        find_article_id_by_identity(conn, source_id, article_key, normalized_link, guid)?
+    {
         return Ok(article_id);
     }
 
@@ -1012,7 +1140,11 @@ pub fn mark_article_scored_success(
     Ok(())
 }
 
-pub fn mark_article_scored_failed(conn: &Connection, article_id: i64, score_error: &str) -> Result<()> {
+pub fn mark_article_scored_failed(
+    conn: &Connection,
+    article_id: i64,
+    score_error: &str,
+) -> Result<()> {
     conn.execute(
         r#"
         UPDATE articles
@@ -1260,10 +1392,15 @@ pub fn list_history_articles_page(
             batch_created_at: row.get::<_, String>(15)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
-pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i64]) -> Result<usize> {
+pub fn queue_push_articles(
+    conn: &Connection,
+    app: &AppHandle,
+    article_ids: &[i64],
+) -> Result<usize> {
     if article_ids.is_empty() {
         return Ok(0);
     }
@@ -1331,7 +1468,13 @@ pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i6
             )
             .optional()?;
 
-        upsert_stmt.execute(params![id, module.clone(), bucket.clone(), fit_score, now.clone()])?;
+        upsert_stmt.execute(params![
+            id,
+            module.clone(),
+            bucket.clone(),
+            fit_score,
+            now.clone()
+        ])?;
 
         if existing_status.is_none() {
             inserted += 1;
@@ -1347,15 +1490,19 @@ pub fn queue_push_articles(conn: &Connection, app: &AppHandle, article_ids: &[i6
     Ok(inserted)
 }
 
-pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
-    let push_conn = push_connect(app)?;
-    if let Some(raw_until) = read_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY)? {
-        if let Some(until) = parse_datetime(&raw_until) {
-            if until > Utc::now() {
-                return Ok(None);
+fn push_reminder_snapshot(
+    push_conn: &Connection,
+    respect_snooze: bool,
+) -> Result<Option<ReminderBatchSnapshot>> {
+    if respect_snooze {
+        if let Some(raw_until) = read_push_meta_value(push_conn, PUSH_SNOOZE_UNTIL_KEY)? {
+            if let Some(until) = parse_datetime(&raw_until) {
+                if until > Utc::now() {
+                    return Ok(None);
+                }
             }
+            write_push_meta_value(push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
         }
-        write_push_meta_value(&push_conn, PUSH_SNOOZE_UNTIL_KEY, None)?;
     }
 
     let mut stmt = push_conn.prepare(
@@ -1397,6 +1544,28 @@ pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnaps
         top_article_id,
         partition_count: partitions.len(),
     }))
+}
+
+pub fn read_onboarding_completed(conn: &Connection) -> Result<bool> {
+    Ok(read_setting(conn, "onboarding_completed")?.unwrap_or_else(|| "false".into()) == "true")
+}
+
+pub fn write_onboarding_completed(conn: &Connection, value: bool) -> Result<()> {
+    write_setting(
+        conn,
+        "onboarding_completed",
+        if value { "true" } else { "false" },
+    )
+}
+
+pub fn push_active_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
+    let push_conn = push_connect(app)?;
+    push_reminder_snapshot(&push_conn, true)
+}
+
+pub fn push_waiting_reminder(app: &AppHandle) -> Result<Option<ReminderBatchSnapshot>> {
+    let push_conn = push_connect(app)?;
+    push_reminder_snapshot(&push_conn, false)
 }
 
 pub fn list_push_history_articles_page(
@@ -1599,12 +1768,14 @@ fn write_push_meta_value(conn: &Connection, key: &str, value: Option<&str>) -> R
     Ok(())
 }
 
-fn migrate_legacy_reminders_to_push_db(main_conn: &Connection, push_conn: &Connection) -> Result<()> {
-    let has_legacy_rows: i64 = main_conn.query_row(
-        "SELECT COUNT(*) FROM reminder_batch_articles",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
+fn migrate_legacy_reminders_to_push_db(
+    main_conn: &Connection,
+    push_conn: &Connection,
+) -> Result<()> {
+    let has_legacy_rows: i64 =
+        main_conn.query_row("SELECT COUNT(*) FROM reminder_batch_articles", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
     if has_legacy_rows == 0 {
         return Ok(());
     }
@@ -1663,7 +1834,14 @@ fn migrate_legacy_reminders_to_push_db(main_conn: &Connection, push_conn: &Conne
                 queued_at = excluded.queued_at,
                 status_updated_at = excluded.status_updated_at
             "#,
-            params![article_id, module.clone(), bucket.clone(), fit_score, push_status, migrated_at],
+            params![
+                article_id,
+                module.clone(),
+                bucket.clone(),
+                fit_score,
+                push_status,
+                migrated_at
+            ],
         )?;
         trim_push_bucket(push_conn, &module, &bucket)?;
     }
@@ -1753,7 +1931,10 @@ pub fn purge_source_history(conn: &Connection, source_id: &str) -> Result<()> {
         "#,
         params![source_id],
     )?;
-    conn.execute("DELETE FROM articles WHERE source_id = ?1", params![source_id])?;
+    conn.execute(
+        "DELETE FROM articles WHERE source_id = ?1",
+        params![source_id],
+    )?;
     conn.execute(
         "DELETE FROM source_fetch_state WHERE source_id = ?1",
         params![source_id],
@@ -1874,7 +2055,76 @@ pub fn reset_fetch_state_for_module(conn: &Connection, module: &str) -> Result<(
     Ok(())
 }
 
-pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>, force_all: bool) -> Result<Vec<RssSource>> {
+pub fn list_pending_article_backlog(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<PendingArticleRecord>> {
+    let safe_limit = limit.max(1).min(1000) as i64;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            a.id,
+            a.article_key,
+            a.fetched_at,
+            a.source_id,
+            a.title,
+            a.link,
+            a.source_name,
+            a.discipline,
+            a.source_kind,
+            a.resource_type,
+            a.published_at,
+            a.raw_content,
+            COALESCE(sc.module, 'other') AS module,
+            COALESCE(sc.bucket, 'unspecified') AS bucket
+        FROM articles a
+        LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
+        WHERE a.score_status = 'pending'
+        ORDER BY COALESCE(a.fetched_at, a.published_at, '1970-01-01T00:00:00Z') ASC, a.id ASC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map(params![safe_limit], |row| {
+        let fetched_at_raw: Option<String> = row.get(2)?;
+        let published_at_raw: Option<String> = row.get(10)?;
+        let link: String = row.get(5)?;
+        Ok(PendingArticleRecord {
+            id: row.get(0)?,
+            article_key: row.get(1)?,
+            fetched_at: parse_optional_datetime(fetched_at_raw)
+                .or_else(|| parse_optional_datetime(published_at_raw.clone()))
+                .unwrap_or_else(Utc::now),
+            article: FeedArticle {
+                source_id: row.get(3)?,
+                title: row.get(4)?,
+                link: link.clone(),
+                source_name: row.get(6)?,
+                discipline: parse_discipline(&row.get::<_, String>(7)?),
+                source_kind: parse_source_kind(&row.get::<_, String>(8)?),
+                resource_type: parse_resource_type(&row.get::<_, String>(9)?),
+                published_at: parse_optional_datetime(published_at_raw),
+                content: row.get(11)?,
+                module: row.get(12)?,
+                bucket: row.get(13)?,
+                normalized_link: canonicalize_source_url(&link),
+                guid: row.get::<_, String>(1)?,
+            },
+        })
+    })?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row?);
+    }
+    Ok(output)
+}
+
+pub fn list_due_sources(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    force_all: bool,
+) -> Result<Vec<RssSource>> {
+    let settings = read_settings(conn)?;
     let selected = list_selected_effective_disciplines(conn)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1932,8 +2182,15 @@ pub fn list_due_sources(conn: &Connection, now: DateTime<Utc>, force_all: bool) 
         if !source.enabled || !selected.contains(&source.discipline) {
             continue;
         }
-        let regular_interval =
-            policy::fetch_interval_for_source(&source.module, &source.bucket, &source.source_kind);
+        let module_key = policy::normalize_module(&source.module);
+        let regular_interval = chrono::Duration::hours(
+            settings
+                .module_fetch_intervals
+                .get(&module_key)
+                .copied()
+                .unwrap_or_else(|| policy::default_module_fetch_interval_hours(&module_key))
+                .clamp(1, 168),
+        );
         let failed_retry_interval = policy::fetch_retry_interval_for_failed_source(
             &source.module,
             &source.bucket,
@@ -2102,36 +2359,46 @@ pub fn content_pool_stats(conn: &Connection) -> Result<Vec<ContentPoolStat>> {
     Ok(stats)
 }
 
-pub fn list_top_bucket_candidates(
+pub fn list_top_module_candidates(
     conn: &Connection,
-    buckets: &BTreeSet<(String, String)>,
-    max_per_bucket: usize,
+    modules: &BTreeSet<String>,
+    module_push_top_n: &BTreeMap<String, i64>,
     max_age_days: i64,
+    min_fit_score: i64,
 ) -> Result<Vec<i64>> {
-    if buckets.is_empty() || max_per_bucket == 0 {
+    if modules.is_empty() {
         return Ok(Vec::new());
     }
 
     let cutoff = (Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
     let mut selected = Vec::<(i64, i64, Option<DateTime<Utc>>)>::new();
 
-    for (module, bucket) in buckets {
+    for module in modules {
+        let max_per_module = module_push_top_n
+            .get(module)
+            .copied()
+            .unwrap_or_else(|| policy::default_module_push_top_n(module))
+            .clamp(1, 24) as usize;
+        if max_per_module == 0 {
+            continue;
+        }
+
         let mut stmt = conn.prepare(
             r#"
             SELECT rcp.article_id, rcp.fit_score, a.published_at, a.fetched_at
             FROM ranked_content_pool rcp
             JOIN articles a ON a.id = rcp.article_id
             WHERE rcp.module = ?1
-              AND rcp.bucket = ?2
               AND a.score_status = 'success'
               AND COALESCE(a.published_at, a.fetched_at, '1970-01-01T00:00:00Z') >= ?3
+              AND rcp.fit_score >= ?2
             ORDER BY rcp.fit_score DESC, COALESCE(a.published_at, a.fetched_at) DESC, rcp.article_id DESC
             LIMIT ?4
             "#,
         )?;
 
         let rows = stmt.query_map(
-            params![module, bucket, cutoff, max_per_bucket as i64],
+            params![module, min_fit_score, cutoff, max_per_module as i64],
             |row| {
                 let published_at_raw: Option<String> = row.get(2)?;
                 let fetched_at_raw: Option<String> = row.get(3)?;
@@ -2232,165 +2499,149 @@ pub fn log_user_event(
 
 pub fn refresh_daily_memory(
     conn: &Connection,
-    memory_enabled: bool,
+    _memory_enabled: bool,
 ) -> Result<Option<InterestMemoryRecord>> {
-    if !memory_enabled {
-        return read_latest_memory(conn);
-    }
+    read_latest_memory(conn)
+}
 
-    let day_key = Utc::now().format("%Y-%m-%d").to_string();
-    let like_prefix = format!("{day_key}%");
-    let opened_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'open-article' AND created_at LIKE ?1",
-        params![like_prefix],
-        |row| row.get(0),
-    )?;
-    let favorite_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'favorite-added' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-    let reminder_view_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'bubble-view' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-    let reminder_ignore_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'bubble-ignore' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-
-    let mut top_disciplines_stmt = conn.prepare(
+pub fn list_weekly_memory_signals(
+    conn: &Connection,
+    start_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Result<Vec<(String, String, String, String)>> {
+    let mut stmt = conn.prepare(
         r#"
-        SELECT a.discipline, COUNT(*)
-        FROM user_behavior_events ube
-        JOIN articles a ON a.id = ube.article_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY a.discipline
-        ORDER BY COUNT(*) DESC, a.discipline ASC
-        LIMIT 2
-        "#,
-    )?;
-    let top_discipline_rows = top_disciplines_stmt
-        .query_map(params![format!("{day_key}%")], |row| {
-            Ok(parse_discipline(&row.get::<_, String>(0)?))
-        })?;
-    let mut top_disciplines = Vec::new();
-    for row in top_discipline_rows {
-        top_disciplines.push(row?);
-    }
-
-    let mut top_kind_stmt = conn.prepare(
-        r#"
-        SELECT a.source_kind, COUNT(*)
-        FROM user_behavior_events ube
-        JOIN articles a ON a.id = ube.article_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY a.source_kind
-        ORDER BY COUNT(*) DESC, a.source_kind ASC
-        LIMIT 1
-        "#,
-    )?;
-    let top_source_kind = top_kind_stmt
-        .query_row(params![format!("{day_key}%")], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?
-        .map(|value| parse_source_kind(&value));
-
-    let mut top_bucket_stmt = conn.prepare(
-        r#"
-        SELECT sc.module, sc.bucket, COUNT(*)
+        SELECT DISTINCT
+          a.title,
+          COALESCE(a.summary, ''),
+          COALESCE(a.note, ''),
+          COALESCE(sc.module, 'other') || '/' || COALESCE(sc.bucket, 'unspecified') AS source_path
         FROM user_behavior_events ube
         JOIN articles a ON a.id = ube.article_id
         LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY sc.module, sc.bucket
-        ORDER BY COUNT(*) DESC, sc.module ASC, sc.bucket ASC
-        LIMIT 2
+        WHERE ube.created_at >= ?1
+          AND ube.created_at < ?2
+          AND (
+            ube.event_type = 'favorite-added'
+            OR ube.event_type = 'note-updated'
+          )
+        ORDER BY ube.created_at DESC, a.id DESC
+        LIMIT 24
         "#,
     )?;
-    let top_bucket_rows = top_bucket_stmt.query_map(params![format!("{day_key}%")], |row| {
-        let module = row
-            .get::<_, Option<String>>(0)?
-            .unwrap_or_else(|| "other".to_string());
-        let bucket = row
-            .get::<_, Option<String>>(1)?
-            .unwrap_or_else(|| "unspecified".to_string());
-        Ok((module, bucket))
-    })?;
-    let mut top_buckets = Vec::new();
-    for row in top_bucket_rows {
-        top_buckets.push(row?);
+    let rows = stmt.query_map(
+        params![start_at.to_rfc3339(), end_at.to_rfc3339()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row?);
     }
+    Ok(output)
+}
 
-    let discipline_summary = if top_disciplines.is_empty() {
-        "你今天的行为还不够多，系统暂时沿用当前已配置的兴趣方向。".to_string()
-    } else {
-        format!(
-            "你今天更关注 {} 方向的内容，说明这些主题仍然最值得优先推送。",
-            top_disciplines
-                .iter()
-                .map(Discipline::display_name)
-                .collect::<Vec<_>>()
-                .join("、")
-        )
-    };
-    let action_summary = format!(
-        "今天共打开 {} 篇、收藏 {} 篇、主动查看提醒 {} 次、忽略提醒 {} 次{}。",
-        opened_count,
-        favorite_count,
-        reminder_view_count,
-        reminder_ignore_count,
-        top_source_kind
-            .map(|kind| format!("，你对 {} 的响应更积极", source_kind_label(&kind)))
-            .unwrap_or_default()
-    );
+pub fn has_memory_review_for_week(conn: &Connection, week_key: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM memory_review_proposals WHERE week_key = ?1 LIMIT 1",
+        params![week_key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(Into::into)
+}
 
-    let bucket_summary = if top_buckets.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " 高频子分类集中在 {}。",
-            top_buckets
-                .iter()
-                .map(|(module, bucket)| {
-                    format!(
-                        "{} / {}",
-                        module_label(module),
-                        bucket_label(bucket)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("、")
-        )
-    };
-
-    let generated_summary = format!("{discipline_summary} {action_summary}{bucket_summary}");
+pub fn create_memory_review_proposal(
+    conn: &Connection,
+    week_key: &str,
+    base_summary: &str,
+    proposed_summary: &str,
+) -> Result<MemoryReviewProposal> {
+    let id = format!("memory-review-{week_key}");
+    let created_at = Utc::now();
     conn.execute(
         r#"
-        INSERT INTO daily_interest_memory (day_key, generated_summary, confirmed_summary, memory_enabled, event_count, updated_at)
-        VALUES (?1, ?2, COALESCE((SELECT confirmed_summary FROM daily_interest_memory WHERE day_key = ?1), NULL), ?3, ?4, ?5)
-        ON CONFLICT(day_key) DO UPDATE SET
-          generated_summary = excluded.generated_summary,
-          memory_enabled = excluded.memory_enabled,
-          event_count = excluded.event_count,
-          updated_at = excluded.updated_at
+        INSERT OR REPLACE INTO memory_review_proposals (
+          id, week_key, base_summary, proposed_summary, status, user_response, created_at, decided_at
+        ) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)
         "#,
         params![
-            day_key,
-            generated_summary,
-            bool_to_int(memory_enabled),
-            (opened_count + favorite_count + reminder_view_count + reminder_ignore_count) as i64,
-            Utc::now().to_rfc3339(),
+            id,
+            week_key,
+            base_summary.trim(),
+            proposed_summary.trim(),
+            created_at.to_rfc3339(),
         ],
     )?;
 
-    read_latest_memory(conn)
+    Ok(MemoryReviewProposal {
+        id: format!("memory-review-{week_key}"),
+        week_key: week_key.to_string(),
+        base_summary: base_summary.trim().to_string(),
+        proposed_summary: proposed_summary.trim().to_string(),
+        status: "pending".to_string(),
+        created_at,
+    })
+}
+
+pub fn read_pending_memory_review(conn: &Connection) -> Result<Option<MemoryReviewProposal>> {
+    conn.query_row(
+        r#"
+        SELECT id, week_key, base_summary, proposed_summary, status, created_at
+        FROM memory_review_proposals
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        [],
+        |row| {
+            let created_at_raw: String = row.get(5)?;
+            Ok(MemoryReviewProposal {
+                id: row.get(0)?,
+                week_key: row.get(1)?,
+                base_summary: row.get(2)?,
+                proposed_summary: row.get(3)?,
+                status: row.get(4)?,
+                created_at: parse_datetime(&created_at_raw).unwrap_or_else(Utc::now),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn resolve_memory_review_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+    status: &str,
+    user_response: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE memory_review_proposals
+        SET status = ?2,
+            user_response = ?3,
+            decided_at = ?4
+        WHERE id = ?1
+        "#,
+        params![proposal_id, status, user_response, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn reject_pending_memory_reviews(conn: &Connection) -> Result<usize> {
+    let changed = conn.execute(
+        r#"
+        UPDATE memory_review_proposals
+        SET status = 'rejected',
+            user_response = COALESCE(user_response, 'auto-rejected on app restart'),
+            decided_at = ?1
+        WHERE status = 'pending'
+        "#,
+        params![Utc::now().to_rfc3339()],
+    )?;
+    Ok(changed)
 }
 
 pub fn read_latest_memory(conn: &Connection) -> Result<Option<InterestMemoryRecord>> {
@@ -2478,6 +2729,7 @@ pub fn build_snapshot(
         last_scan_at,
         content_pool_stats: content_pool_stats(conn)?,
         memory: read_latest_memory(conn)?,
+        memory_review: read_pending_memory_review(conn)?,
         source_summary: SourceCatalogSummary {
             total_sources,
             enabled_sources,
@@ -2616,7 +2868,7 @@ fn list_dueable_enabled_sources_count(conn: &Connection) -> Result<i64> {
 
 fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     let mut load_errors = Vec::new();
-    for candidate in build_resource_candidates(app, "rss_catalog_v3_unified.opml") {
+    for candidate in build_resource_candidates(app, "rss-catalog.opml") {
         if !candidate.exists() {
             continue;
         }
@@ -2633,10 +2885,7 @@ fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     if load_errors.is_empty() {
         anyhow::bail!("rss v3 catalog file not found")
     } else {
-        anyhow::bail!(
-            "failed to load v3 catalog: {}",
-            load_errors.join(" ; ")
-        )
+        anyhow::bail!("failed to load v3 catalog: {}", load_errors.join(" ; "))
     }
 }
 
@@ -2723,8 +2972,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
-                let resource_type =
-                    map_v3_resource_type(attrs.get("resourceType").map(String::as_str), &canonical_url);
+                let resource_type = map_v3_resource_type(
+                    attrs.get("resourceType").map(String::as_str),
+                    &canonical_url,
+                );
                 let origin_files = attrs
                     .get("origin")
                     .map(|value| split_origin_files(value))
@@ -2762,8 +3013,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 source.bucket = bucket_code.clone();
                 source.discipline = map_v3_module_to_discipline(&module_code);
                 source.source_kind = map_v3_bucket_to_source_kind(&bucket_code);
-                source.resource_type =
-                    map_v3_resource_type(attrs.get("resourceType").map(String::as_str), &canonical_url);
+                source.resource_type = map_v3_resource_type(
+                    attrs.get("resourceType").map(String::as_str),
+                    &canonical_url,
+                );
                 source.url = canonical_url.clone();
 
                 for origin in origin_files {
@@ -2884,21 +3137,48 @@ fn split_origin_files(raw: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-    fn is_custom_source_origin(origin_files_json: &str) -> bool {
-        let origins = serde_json::from_str::<Vec<String>>(origin_files_json).unwrap_or_default();
-        origins
+fn is_custom_source_origin(origin_files_json: &str) -> bool {
+    let origins = serde_json::from_str::<Vec<String>>(origin_files_json).unwrap_or_default();
+    origins
         .iter()
         .any(|origin| origin.eq_ignore_ascii_case("user-custom"))
-    }
+}
 
 fn normalize_llm_provider(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "deepseek" => "deepseek".to_string(),
+        "qwen" | "dashscope" | "alibaba" => "qwen".to_string(),
+        "minimax" => "minimax".to_string(),
         "glm" | "zhipu" | "zhipuai" => "glm".to_string(),
         "kimi" | "moonshot" => "kimi".to_string(),
         "openai" => "openai".to_string(),
+        "gemini" | "google" => "gemini".to_string(),
+        "anthropic" | "claude" => "anthropic".to_string(),
+        "custom" => "custom".to_string(),
         "siliconflow" => "siliconflow".to_string(),
         _ => default_llm_provider(),
+    }
+}
+
+fn normalize_llm_protocol(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "openai-compatible" | "openai" => "openai-compatible".to_string(),
+        "anthropic-native" | "anthropic" => "anthropic-native".to_string(),
+        "gemini-native" | "gemini" => "gemini-native".to_string(),
+        _ => default_llm_protocol(),
+    }
+}
+
+fn active_provider_api_key_key(provider: &str, custom_provider_name: &str) -> String {
+    if provider == "custom" {
+        let name = custom_provider_name.trim();
+        if name.is_empty() {
+            "custom".to_string()
+        } else {
+            format!("custom:{name}")
+        }
+    } else {
+        provider.to_string()
     }
 }
 
@@ -2920,9 +3200,7 @@ fn normalize_url(url: &str) -> String {
 fn canonicalize_feed_url(url: &str) -> String {
     let trimmed = url.trim();
     if let Some(channel_id) = extract_youtube_channel_id(trimmed) {
-        return format!(
-            "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        );
+        return format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}");
     }
     trimmed.to_string()
 }
@@ -2940,11 +3218,7 @@ fn extract_youtube_channel_id(url: &str) -> Option<String> {
         .strip_prefix("www.")
         .unwrap_or(without_scheme);
     let rest = without_www.strip_prefix("youtube.com/channel/")?;
-    let channel_id = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let channel_id = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
     if channel_id.is_empty() {
         None
     } else {

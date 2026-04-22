@@ -1,4 +1,4 @@
-export type PetStatus = "loading" | "needs-config" | "scanning" | "idle" | "new-info";
+export type PetStatus = "loading" | "needs-config" | "polling" | "scanning" | "idle" | "new-info";
 
 export type AppView = "reading" | "settings";
 
@@ -20,7 +20,19 @@ export type SourceKind =
   | "technical-blog"
   | "community-hotspot";
 
-export type LlmProvider = "deepseek" | "glm" | "kimi" | "openai" | "siliconflow";
+export type LlmProvider =
+  | "deepseek"
+  | "qwen"
+  | "minimax"
+  | "glm"
+  | "kimi"
+  | "openai"
+  | "gemini"
+  | "anthropic"
+  | "custom"
+  | "siliconflow";
+
+export type LlmProtocol = "openai-compatible" | "anthropic-native" | "gemini-native";
 
 export type SourceModule =
   | "technology"
@@ -78,8 +90,14 @@ export type RssSource = {
 export type SettingsPayload = {
   apiKey: string;
   llmProvider: LlmProvider;
+  llmProtocol: LlmProtocol;
+  llmBaseUrl: string;
+  llmCustomProviderName: string;
+  llmModelName: string;
   llmModel: string;
   providerApiKeys: Record<string, string>;
+  moduleFetchIntervals: Record<SourceModule, number>;
+  modulePushTopN: Record<SourceModule, number>;
   autoStart: boolean;
   disciplines: UserDisciplinePreference[];
   memoryModeEnabled: boolean;
@@ -151,6 +169,15 @@ export type InterestMemoryRecord = {
   updatedAt: string | null;
 };
 
+export type MemoryReviewProposal = {
+  id: string;
+  weekKey: string;
+  baseSummary: string;
+  proposedSummary: string;
+  status: string;
+  createdAt: string;
+};
+
 export type SourceCatalogSummary = {
   totalSources: number;
   enabledSources: number;
@@ -172,6 +199,7 @@ export type Snapshot = {
   lastScanAt: string | null;
   contentPoolStats: ContentPoolStat[];
   memory: InterestMemoryRecord | null;
+  memoryReview: MemoryReviewProposal | null;
   sourceSummary: SourceCatalogSummary;
 };
 
