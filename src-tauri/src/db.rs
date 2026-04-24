@@ -84,6 +84,10 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           last_success_at TEXT,
           last_error TEXT
         );
+        CREATE TABLE IF NOT EXISTS module_fetch_state (
+          module TEXT PRIMARY KEY,
+          last_module_run_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS articles (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           guid TEXT NOT NULL UNIQUE,
@@ -368,6 +372,7 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
     sync_discipline_preferences(conn)?;
     sync_user_source_pool(conn, catalog)?;
     sync_source_fetch_state(conn, catalog)?;
+    sync_module_fetch_state(conn)?;
 
     let cleanup_done = read_setting(conn, "pool_cleanup_v1_done")?
         .unwrap_or_else(|| "false".to_string())
@@ -518,6 +523,20 @@ fn sync_source_fetch_state(conn: &Connection, catalog: &[RssSource]) -> Result<(
             ON CONFLICT(source_id) DO NOTHING
             "#,
             params![source.id],
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_module_fetch_state(conn: &Connection) -> Result<()> {
+    for module in policy::all_modules() {
+        conn.execute(
+            r#"
+            INSERT INTO module_fetch_state (module, last_module_run_at)
+            VALUES (?1, NULL)
+            ON CONFLICT(module) DO NOTHING
+            "#,
+            params![module],
         )?;
     }
     Ok(())
@@ -1908,6 +1927,61 @@ pub fn update_fetch_state(
     Ok(())
 }
 
+pub fn read_module_last_run_at(conn: &Connection, module: &str) -> Result<Option<DateTime<Utc>>> {
+    let module = policy::normalize_module(module);
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT last_module_run_at FROM module_fetch_state WHERE module = ?1 LIMIT 1",
+            params![module],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().as_deref().and_then(parse_datetime))
+}
+
+pub fn update_module_fetch_state(
+    conn: &Connection,
+    module: &str,
+    last_module_run_at: DateTime<Utc>,
+) -> Result<()> {
+    let module = policy::normalize_module(module);
+    conn.execute(
+        r#"
+        INSERT INTO module_fetch_state (module, last_module_run_at)
+        VALUES (?1, ?2)
+        ON CONFLICT(module) DO UPDATE SET
+          last_module_run_at = excluded.last_module_run_at
+        "#,
+        params![module, last_module_run_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn update_module_fetch_states(
+    conn: &Connection,
+    modules: &BTreeSet<String>,
+    last_module_run_at: DateTime<Utc>,
+) -> Result<()> {
+    for module in modules {
+        update_module_fetch_state(conn, module, last_module_run_at)?;
+    }
+    Ok(())
+}
+
+pub fn reset_module_fetch_state(conn: &Connection, module: &str) -> Result<()> {
+    let module = policy::normalize_module(module);
+    conn.execute(
+        r#"
+        INSERT INTO module_fetch_state (module, last_module_run_at)
+        VALUES (?1, NULL)
+        ON CONFLICT(module) DO UPDATE SET
+          last_module_run_at = NULL
+        "#,
+        params![module],
+    )?;
+    Ok(())
+}
+
 pub fn purge_source_history(conn: &Connection, source_id: &str) -> Result<()> {
     conn.execute(
         r#"
@@ -1951,6 +2025,7 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM daily_interest_memory", [])?;
     conn.execute("DELETE FROM articles", [])?;
     conn.execute("DELETE FROM source_fetch_state", [])?;
+    conn.execute("DELETE FROM module_fetch_state", [])?;
 
     let mut stmt = conn.prepare("SELECT source_id FROM source_catalog")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1963,6 +2038,7 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
             params![row?],
         )?;
     }
+    sync_module_fetch_state(conn)?;
 
     write_setting(conn, "selected_article_id", "null")?;
     write_setting(conn, "last_scan_at", "null")?;
@@ -2052,6 +2128,7 @@ pub fn reset_fetch_state_for_module(conn: &Connection, module: &str) -> Result<(
     for row in rows {
         reset_source_fetch_state(conn, &row?)?;
     }
+    reset_module_fetch_state(conn, &module)?;
     Ok(())
 }
 
@@ -2119,12 +2196,15 @@ pub fn list_pending_article_backlog(
     Ok(output)
 }
 
-pub fn list_due_sources(
-    conn: &Connection,
-    now: DateTime<Utc>,
-    force_all: bool,
-) -> Result<Vec<RssSource>> {
-    let settings = read_settings(conn)?;
+#[derive(Clone)]
+struct SourceFetchStateRow {
+    source: RssSource,
+    last_fetched_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    has_error: bool,
+}
+
+fn list_selected_source_fetch_rows(conn: &Connection) -> Result<Vec<SourceFetchStateRow>> {
     let selected = list_selected_effective_disciplines(conn)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -2182,47 +2262,157 @@ pub fn list_due_sources(
         if !source.enabled || !selected.contains(&source.discipline) {
             continue;
         }
-        let module_key = policy::normalize_module(&source.module);
-        let regular_interval = chrono::Duration::hours(
-            settings
-                .module_fetch_intervals
-                .get(&module_key)
-                .copied()
-                .unwrap_or_else(|| policy::default_module_fetch_interval_hours(&module_key))
-                .clamp(1, 168),
-        );
-        let failed_retry_interval = policy::fetch_retry_interval_for_failed_source(
-            &source.module,
-            &source.bucket,
-            &source.source_kind,
-        );
-        let last_fetched = last_fetched_raw.as_deref().and_then(parse_datetime);
-        let last_success = last_success_raw.as_deref().and_then(parse_datetime);
-        let has_error = last_error_raw
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
+        sources.push(SourceFetchStateRow {
+            source,
+            last_fetched_at: last_fetched_raw.as_deref().and_then(parse_datetime),
+            last_success_at: last_success_raw.as_deref().and_then(parse_datetime),
+            has_error: last_error_raw
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        });
+    }
+    Ok(sources)
+}
 
-        let due = match last_fetched {
-            None => true,
-            Some(last_fetched_at) => {
-                let last_cycle_failed = has_error
-                    && last_success
-                        .map(|last_success_at| last_success_at < last_fetched_at)
-                        .unwrap_or(true);
-                let required_interval = if last_cycle_failed {
-                    failed_retry_interval
-                } else {
-                    regular_interval
-                };
-                now - last_fetched_at >= required_interval
-            }
-        };
-        if force_all || due {
-            sources.push(source);
+fn module_fetch_interval(settings: &SettingsPayload, module: &str) -> chrono::Duration {
+    let module = policy::normalize_module(module);
+    chrono::Duration::hours(
+        settings
+            .module_fetch_intervals
+            .get(&module)
+            .copied()
+            .unwrap_or_else(|| policy::default_module_fetch_interval_hours(&module))
+            .clamp(1, 168),
+    )
+}
+
+fn module_refresh_due(
+    last_module_run_at: Option<DateTime<Utc>>,
+    interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    match last_module_run_at {
+        None => true,
+        Some(last_run_at) => now - last_run_at >= interval,
+    }
+}
+
+fn source_due_for_module_refresh(
+    last_success_at: Option<DateTime<Utc>>,
+    interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    match last_success_at {
+        None => true,
+        Some(last_success_at) => now - last_success_at >= interval,
+    }
+}
+
+fn source_due_for_retry(
+    last_fetched_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    has_error: bool,
+    retry_interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    if !has_error {
+        return false;
+    }
+    let Some(last_fetched_at) = last_fetched_at else {
+        return false;
+    };
+    let last_cycle_failed = last_success_at
+        .map(|last_success_at| last_success_at < last_fetched_at)
+        .unwrap_or(true);
+    last_cycle_failed && now - last_fetched_at >= retry_interval
+}
+
+pub fn list_enabled_modules(conn: &Connection) -> Result<BTreeSet<String>> {
+    let rows = list_selected_source_fetch_rows(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| policy::normalize_module(&row.source.module))
+        .collect())
+}
+
+pub fn list_due_modules(conn: &Connection, now: DateTime<Utc>) -> Result<BTreeSet<String>> {
+    let settings = read_settings(conn)?;
+    let enabled_modules = list_enabled_modules(conn)?;
+    let mut due_modules = BTreeSet::new();
+    for module in enabled_modules {
+        if module_refresh_due(
+            read_module_last_run_at(conn, &module)?,
+            module_fetch_interval(&settings, &module),
+            now,
+        ) {
+            due_modules.insert(module);
+        }
+    }
+    Ok(due_modules)
+}
+
+pub fn list_module_refresh_sources(
+    conn: &Connection,
+    modules: &BTreeSet<String>,
+    now: DateTime<Utc>,
+) -> Result<Vec<RssSource>> {
+    if modules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let settings = read_settings(conn)?;
+    let rows = list_selected_source_fetch_rows(conn)?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let module = policy::normalize_module(&row.source.module);
+        if !modules.contains(&module) {
+            continue;
+        }
+        if source_due_for_module_refresh(
+            row.last_success_at,
+            module_fetch_interval(&settings, &module),
+            now,
+        ) {
+            sources.push(row.source);
         }
     }
     Ok(sources)
+}
+
+pub fn list_retry_due_sources(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    excluded_modules: &BTreeSet<String>,
+) -> Result<Vec<RssSource>> {
+    let rows = list_selected_source_fetch_rows(conn)?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let module = policy::normalize_module(&row.source.module);
+        if excluded_modules.contains(&module) {
+            continue;
+        }
+        if source_due_for_retry(
+            row.last_fetched_at,
+            row.last_success_at,
+            row.has_error,
+            policy::fetch_retry_interval_for_failed_source(
+                &row.source.module,
+                &row.source.bucket,
+                &row.source.source_kind,
+            ),
+            now,
+        ) {
+            sources.push(row.source);
+        }
+    }
+    Ok(sources)
+}
+
+pub fn count_due_sources(conn: &Connection, now: DateTime<Utc>) -> Result<usize> {
+    let due_modules = list_due_modules(conn, now)?;
+    Ok(list_module_refresh_sources(conn, &due_modules, now)?.len()
+        + list_retry_due_sources(conn, now, &due_modules)?.len())
 }
 
 pub fn upsert_content_pool_entry(
@@ -2697,7 +2887,7 @@ pub fn build_snapshot(
     last_scan_at: Option<DateTime<Utc>>,
 ) -> Result<Snapshot> {
     let settings = read_settings(conn)?;
-    let due_sources = list_due_sources(conn, Utc::now(), false)?.len();
+    let due_sources = count_due_sources(conn, Utc::now())?;
     let selected_disciplines = settings
         .disciplines
         .iter()
@@ -3440,5 +3630,72 @@ fn bucket_label(raw: &str) -> &'static str {
         "chemistry" => "化学",
         "biology" => "生物",
         _ => "未分类",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::{module_refresh_due, source_due_for_module_refresh, source_due_for_retry};
+
+    #[test]
+    fn module_refresh_uses_module_clock() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        assert!(module_refresh_due(None, Duration::hours(6), now));
+        assert!(module_refresh_due(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 6, 0, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+        assert!(!module_refresh_due(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 8, 30, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+    }
+
+    #[test]
+    fn module_refresh_source_uses_last_success_time() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        assert!(source_due_for_module_refresh(None, Duration::hours(12), now));
+        assert!(source_due_for_module_refresh(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 0, 0, 0).unwrap()),
+            Duration::hours(12),
+            now,
+        ));
+        assert!(!source_due_for_module_refresh(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 10, 30, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+    }
+
+    #[test]
+    fn retry_only_runs_for_unrecovered_failures() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        let failed_at = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
+        let old_success = Utc.with_ymd_and_hms(2026, 4, 24, 8, 0, 0).unwrap();
+        assert!(source_due_for_retry(
+            Some(failed_at),
+            Some(old_success),
+            true,
+            Duration::hours(2),
+            now,
+        ));
+        assert!(!source_due_for_retry(
+            Some(failed_at),
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 11, 0, 0).unwrap()),
+            true,
+            Duration::hours(2),
+            now,
+        ));
+        assert!(!source_due_for_retry(
+            Some(failed_at),
+            Some(old_success),
+            false,
+            Duration::hours(2),
+            now,
+        ));
     }
 }

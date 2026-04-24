@@ -10,6 +10,20 @@ pub struct SourceRuntimePolicy {
     pub medium_cutoff: i64,
 }
 
+pub fn all_modules() -> &'static [&'static str] {
+    &[
+        "technology",
+        "social_science",
+        "business",
+        "growth",
+        "news_opinion",
+        "entertainment",
+        "science",
+        "medicine",
+        "other",
+    ]
+}
+
 pub fn normalize_module(raw: &str) -> String {
     let value = raw.trim().to_ascii_lowercase().replace('-', "_");
     match value.as_str() {

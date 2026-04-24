@@ -58,34 +58,34 @@ const PET_STATUS_HINTS = {
 
 const PET_ASSET_BY_STATUS = {
   loading: {
-    src: "/pets/clawd/clawd-typing.gif",
-    alt: "Clawd loading",
-    size: 164
+    src: "/pets/briefy-ip/main/briefy-loading.gif",
+    alt: "Briefy loading",
+    size: 154
   },
   "needs-config": {
-    src: "/pets/clawd/clawd-mini-peek.gif",
-    alt: "Clawd needs config",
-    size: 154
+    src: "/pets/briefy-ip/main/briefy-needs-config.gif",
+    alt: "Briefy needs config",
+    size: 146
   },
   polling: {
-    src: "/pets/clawd/clawd-idle-reading.gif",
-    alt: "Clawd polling",
-    size: 154
+    src: "/pets/briefy-ip/main/briefy-polling.gif",
+    alt: "Briefy polling",
+    size: 148
   },
   scanning: {
-    src: "/pets/clawd/clawd-thinking.gif",
-    alt: "Clawd scanning",
-    size: 164
-  },
-  idle: {
-    src: "/pets/clawd/clawd-mini-idle.gif",
-    alt: "Clawd idle",
+    src: "/pets/briefy-ip/main/briefy-scanning.gif",
+    alt: "Briefy scanning",
     size: 154
   },
+  idle: {
+    src: "/pets/briefy-ip/main/briefy-idle.gif",
+    alt: "Briefy idle",
+    size: 146
+  },
   "new-info": {
-    src: "/pets/clawd/clawd-mini-alert.gif",
-    alt: "Clawd new info",
-    size: 160
+    src: "/pets/briefy-ip/main/briefy-new-info.gif",
+    alt: "Briefy new info",
+    size: 150
   }
 } as const;
 

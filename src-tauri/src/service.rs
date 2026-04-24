@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Utc, Weekday};
 use futures::future::join_all;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::OpenOptions,
     io::Write,
     time::Instant,
@@ -292,7 +292,7 @@ pub fn reconcile_fetch_runtime(app: &AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    if db::list_due_sources(&conn, Utc::now(), false)?.is_empty() {
+    if db::count_due_sources(&conn, Utc::now())? == 0 {
         append_fetch_debug_log(app, "reconcile: skipped because there are no due sources");
         return Ok(());
     }
@@ -378,8 +378,8 @@ async fn run_scheduler_poll_cycle(app: AppHandle) {
         return;
     }
 
-    let due_sources = db::list_due_sources(&conn, Utc::now(), false).unwrap_or_default();
-    if due_sources.is_empty() {
+    let due_sources = db::count_due_sources(&conn, Utc::now()).unwrap_or_default();
+    if due_sources == 0 {
         let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
         let _ = sync_windows(&app, false);
         let _ = publish_snapshot(&app, false);
@@ -392,7 +392,7 @@ async fn run_scheduler_poll_cycle(app: AppHandle) {
 pub fn trigger_fetch_now(
     app: &AppHandle,
     delay: Option<std::time::Duration>,
-    force_incremental: bool,
+    force_module_refresh: bool,
 ) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -401,10 +401,12 @@ pub fn trigger_fetch_now(
         }
         append_fetch_debug_log(
             &app_handle,
-            &format!("trigger_fetch_now: firing fetch task force_incremental={force_incremental}"),
+            &format!(
+                "trigger_fetch_now: firing fetch task force_module_refresh={force_module_refresh}"
+            ),
         );
         log_fetch_result(
-            run_fetch_cycle(app_handle.clone(), force_incremental).await,
+            run_fetch_cycle(app_handle.clone(), force_module_refresh).await,
             &app_handle,
         );
     });
@@ -473,7 +475,7 @@ pub async fn validate_api_key_for_settings(
     Ok(())
 }
 
-pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<()> {
+pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Result<()> {
     if !begin_scan(&app) {
         append_fetch_debug_log(
             &app,
@@ -483,7 +485,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     }
     append_fetch_debug_log(
         &app,
-        &format!("run_fetch_cycle: entered force_incremental={force_incremental}"),
+        &format!("run_fetch_cycle: entered force_module_refresh={force_module_refresh}"),
     );
     clear_polling_until(&app);
     clear_loading_until(&app);
@@ -548,11 +550,64 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         .map(|record| PendingArticle {
             article_id: record.id,
             article: record.article,
+            push_eligible: false,
         })
         .collect::<Vec<_>>();
     let interest_context = build_interest_context(&settings);
-    let mut next_force_incremental = force_incremental;
-    let mut total_due_sources = 0usize;
+    let plan_now = Utc::now();
+    let fetch_plan = build_fetch_plan(&conn, plan_now, force_module_refresh)?;
+    let cycle_kind = cycle_kind_label(&fetch_plan).to_string();
+    let modules_for_refresh = fetch_plan.modules_for_refresh.clone();
+    let module_source_count = fetch_plan.module_source_count;
+    let retry_source_count = fetch_plan.retry_source_count;
+    if !modules_for_refresh.is_empty() {
+        db::update_module_fetch_states(&conn, &modules_for_refresh, plan_now)?;
+    }
+    append_fetch_debug_log(
+        &app,
+        &format!(
+            "run_fetch_cycle: fetch plan kind={} modules={} module_sources={} retry_sources={} backlog={}",
+            cycle_kind.as_str(),
+            describe_modules(&modules_for_refresh),
+            module_source_count,
+            retry_source_count,
+            pending_articles.len()
+        ),
+    );
+
+    if fetch_plan.sources.is_empty()
+        && pending_articles.is_empty()
+        && modules_for_refresh.is_empty()
+    {
+        let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
+        if memory.is_some() {
+            clear_last_error(&app);
+        }
+        let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
+        set_scanning(&app, false);
+        sync_windows(&app, false)?;
+        let _ = publish_snapshot(&app, false);
+        let cycle_ended_at = Utc::now();
+        let _ = db::log_crawl_cycle(
+            &conn,
+            cycle_started_at,
+            cycle_ended_at,
+            "idle-no-due-sources",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            started_at.elapsed().as_millis(),
+            None,
+            None,
+        );
+        return Ok(());
+    }
+
+    let mut remaining_sources = fetch_plan.sources;
+    let total_due_sources = remaining_sources.len();
     let mut total_pending_articles = 0usize;
     let mut inserted_count = 0usize;
     let mut failed_scoring_count = 0usize;
@@ -561,19 +616,23 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     let mut total_fetch_duration_ms = 0u128;
     let mut total_llm_duration_ms = 0u128;
     let mut updated_modules = BTreeSet::<String>::new();
-    let mut had_any_work = !pending_articles.is_empty();
-
-    loop {
-        let now = Utc::now();
-        let due_sources = db::list_due_sources(&conn, now, next_force_incremental)?;
-        let original_due_count = due_sources.len();
-        let (due_sources, remaining_due_sources) = clamp_due_sources_for_cycle(due_sources);
-        if remaining_due_sources > 0 {
+    while !remaining_sources.is_empty() || !pending_articles.is_empty() {
+        let current_due_count = remaining_sources.len();
+        let batch_len = current_due_count.min(MAX_SOURCES_PER_CYCLE);
+        let planned_batch = if batch_len > 0 {
+            remaining_sources
+                .drain(..batch_len)
+                .collect::<Vec<PlannedSource>>()
+        } else {
+            Vec::new()
+        };
+        let remaining_due_sources = remaining_sources.len();
+        if current_due_count > batch_len {
             append_fetch_debug_log(
                 &app,
                 &format!(
                     "run_fetch_cycle: limiting due sources this cycle from {} to {}",
-                    original_due_count, MAX_SOURCES_PER_CYCLE
+                    current_due_count, MAX_SOURCES_PER_CYCLE
                 ),
             );
         }
@@ -581,49 +640,24 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
             &app,
             &format!(
                 "run_fetch_cycle: due source resolution complete due_sources={} backlog={} remaining_due_sources={}",
-                due_sources.len(),
+                planned_batch.len(),
                 pending_articles.len(),
                 remaining_due_sources
             ),
         );
 
-        if due_sources.is_empty() && pending_articles.is_empty() {
-            if !had_any_work {
-                let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
-                if memory.is_some() {
-                    clear_last_error(&app);
-                }
-                let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
-                set_scanning(&app, false);
-                sync_windows(&app, false)?;
-                let _ = publish_snapshot(&app, false);
-                let cycle_ended_at = Utc::now();
-                let _ = db::log_crawl_cycle(
-                    &conn,
-                    cycle_started_at,
-                    cycle_ended_at,
-                    "idle-no-due-sources",
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    started_at.elapsed().as_millis(),
-                    None,
-                    None,
-                );
-                return Ok(());
-            }
-            break;
-        }
-
-        had_any_work = true;
-        total_due_sources += due_sources.len();
-
-        if !due_sources.is_empty() {
+        if !planned_batch.is_empty() {
+            let fetch_timestamp = Utc::now();
+            let fetch_sources = planned_batch
+                .iter()
+                .map(|item| item.source.clone())
+                .collect::<Vec<_>>();
+            let reason_by_source = planned_batch
+                .iter()
+                .map(|item| (item.source.id.clone(), item.reason))
+                .collect::<HashMap<_, _>>();
             let fetch_started_at = Instant::now();
-            let fetch_outcome = match rss::fetch_sources(&due_sources).await {
+            let fetch_outcome = match rss::fetch_sources(&fetch_sources).await {
                 Ok(value) => value,
                 Err(err) => {
                     let cycle_ended_at = Utc::now();
@@ -655,26 +689,32 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                 ),
             );
 
-            let mut successful_source_ids = Vec::new();
             for result in fetch_outcome.results {
+                let push_eligible = reason_by_source
+                    .get(&result.source.id)
+                    .copied()
+                    .unwrap_or(FetchReason::RetryRecovery)
+                    == FetchReason::ModuleRefresh;
+                let is_initial_fetch =
+                    !db::source_has_successful_fetch(&conn, &result.source.id)?;
                 if let Some(error) = result.error {
-                    db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
+                    db::update_fetch_state(
+                        &conn,
+                        &result.source.id,
+                        fetch_timestamp,
+                        None,
+                        Some(&error),
+                    )?;
                     fetch_errors.push(format!("{}: {}", result.source.name, error));
                     continue;
                 }
 
-                let is_initial_fetch = !db::source_has_successful_fetch(&conn, &result.source.id)?;
-                let incremental_cutoff = if next_force_incremental && !is_initial_fetch {
-                    db::source_last_fetched_at(&conn, &result.source.id)?
-                } else {
-                    None
-                };
                 let filtered = collect_pending_articles(
                     &conn,
                     result.articles,
                     is_initial_fetch,
-                    now,
-                    incremental_cutoff,
+                    fetch_timestamp,
+                    None,
                 )?;
                 for article in filtered {
                     let article_key = build_article_key(&article);
@@ -692,19 +732,22 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                         &article.source_kind,
                         &article.resource_type,
                         article.published_at,
-                        now,
+                        fetch_timestamp,
                         &article.content,
                     )?;
                     pending_articles.push(PendingArticle {
                         article_id,
                         article,
+                        push_eligible,
                     });
                 }
-                successful_source_ids.push(result.source.id);
-            }
-
-            for source_id in successful_source_ids {
-                db::update_fetch_state(&conn, &source_id, now, Some(now), None)?;
+                db::update_fetch_state(
+                    &conn,
+                    &result.source.id,
+                    fetch_timestamp,
+                    Some(fetch_timestamp),
+                    None,
+                )?;
             }
         }
 
@@ -769,7 +812,9 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                         analysis.fit_score,
                         result.article.published_at,
                     )?;
-                    updated_modules.insert(module);
+                    if result.push_eligible {
+                        updated_modules.insert(module);
+                    }
                     inserted_count += 1;
                 } else {
                     failed_scoring_count += 1;
@@ -794,7 +839,6 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                 "run_fetch_cycle: continuing fetch session with remaining_due_sources={remaining_due_sources}"
             ),
         );
-        next_force_incremental = false;
     }
 
     let reminder_candidates = db::list_top_module_candidates(
@@ -828,15 +872,15 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         Some(warnings.join(" | "))
     };
     let cycle_status = if warning_summary.is_some() || failed_scoring_count > 0 {
-        "completed-with-warnings"
+        format!("completed-{}-with-warnings", cycle_kind)
     } else {
-        "completed"
+        format!("completed-{}", cycle_kind)
     };
     let _ = db::log_crawl_cycle(
         &conn,
         cycle_started_at,
         cycle_ended_at,
-        cycle_status,
+        &cycle_status,
         total_due_sources,
         total_pending_articles,
         inserted_count,
@@ -1019,6 +1063,7 @@ async fn score_articles_in_batches(
                             .map(|(item, analysis)| ArticleScoreResult {
                                 article_id: item.article_id,
                                 article: item.article,
+                                push_eligible: item.push_eligible,
                                 analysis: Some(analysis),
                                 error: None,
                             })
@@ -1057,6 +1102,7 @@ async fn score_articles_in_batches(
                                 Ok(analysis) => fallback_results.push(ArticleScoreResult {
                                     article_id: item.article_id,
                                     article: item.article,
+                                    push_eligible: item.push_eligible,
                                     analysis: Some(analysis),
                                     error: None,
                                 }),
@@ -1070,6 +1116,7 @@ async fn score_articles_in_batches(
                                     fallback_results.push(ArticleScoreResult {
                                         article_id: item.article_id,
                                         article: item.article,
+                                        push_eligible: item.push_eligible,
                                         analysis: None,
                                         error: Some(message),
                                     });
@@ -1105,6 +1152,7 @@ async fn score_articles_in_batches(
                                 Ok(analysis) => fallback_results.push(ArticleScoreResult {
                                     article_id: item.article_id,
                                     article: item.article,
+                                    push_eligible: item.push_eligible,
                                     analysis: Some(analysis),
                                     error: None,
                                 }),
@@ -1118,6 +1166,7 @@ async fn score_articles_in_batches(
                                     fallback_results.push(ArticleScoreResult {
                                         article_id: item.article_id,
                                         article: item.article,
+                                        push_eligible: item.push_eligible,
                                         analysis: None,
                                         error: Some(message),
                                     });
@@ -1703,11 +1752,32 @@ fn current_polling(app: &AppHandle, now: Option<DateTime<Utc>>) -> bool {
 struct PendingArticle {
     article_id: i64,
     article: FeedArticle,
+    push_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchReason {
+    ModuleRefresh,
+    RetryRecovery,
+}
+
+#[derive(Clone)]
+struct PlannedSource {
+    source: crate::models::RssSource,
+    reason: FetchReason,
+}
+
+struct FetchPlan {
+    modules_for_refresh: BTreeSet<String>,
+    sources: Vec<PlannedSource>,
+    module_source_count: usize,
+    retry_source_count: usize,
 }
 
 struct ArticleScoreResult {
     article_id: i64,
     article: FeedArticle,
+    push_eligible: bool,
     analysis: Option<LlmResult>,
     error: Option<String>,
 }
@@ -1720,6 +1790,60 @@ struct ScoreOutcome {
 struct BatchScoreOutcome {
     results: Vec<ArticleScoreResult>,
     errors: Vec<String>,
+}
+
+fn describe_modules(modules: &BTreeSet<String>) -> String {
+    if modules.is_empty() {
+        return "none".to_string();
+    }
+    modules.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+fn cycle_kind_label(plan: &FetchPlan) -> &'static str {
+    match (
+        !plan.modules_for_refresh.is_empty(),
+        plan.retry_source_count > 0,
+    ) {
+        (true, true) => "mixed",
+        (true, false) => "module-refresh",
+        (false, true) => "retry-only",
+        (false, false) => "idle",
+    }
+}
+
+fn build_fetch_plan(
+    conn: &rusqlite::Connection,
+    now: DateTime<Utc>,
+    force_module_refresh: bool,
+) -> Result<FetchPlan> {
+    let modules_for_refresh = if force_module_refresh {
+        db::list_enabled_modules(conn)?
+    } else {
+        db::list_due_modules(conn, now)?
+    };
+    let module_sources = db::list_module_refresh_sources(conn, &modules_for_refresh, now)?;
+    let retry_sources = db::list_retry_due_sources(conn, now, &modules_for_refresh)?;
+
+    let module_source_count = module_sources.len();
+    let retry_source_count = retry_sources.len();
+    let mut sources = module_sources
+        .into_iter()
+        .map(|source| PlannedSource {
+            source,
+            reason: FetchReason::ModuleRefresh,
+        })
+        .collect::<Vec<_>>();
+    sources.extend(retry_sources.into_iter().map(|source| PlannedSource {
+        source,
+        reason: FetchReason::RetryRecovery,
+    }));
+
+    Ok(FetchPlan {
+        modules_for_refresh,
+        sources,
+        module_source_count,
+        retry_source_count,
+    })
 }
 
 fn clamp_due_sources_for_cycle<T>(mut items: Vec<T>) -> (Vec<T>, usize) {

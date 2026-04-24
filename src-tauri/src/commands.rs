@@ -244,6 +244,7 @@ pub fn add_custom_rss_source(
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::upsert_source(&conn, &source, true).map_err(|err| err.to_string())?;
     db::reset_source_fetch_state(&conn, &source.id).map_err(|err| err.to_string())?;
+    db::reset_module_fetch_state(&conn, &module).map_err(|err| err.to_string())?;
 
     let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
     let api_key_valid = db::read_api_key_valid(&conn).map_err(|err| err.to_string())?;
