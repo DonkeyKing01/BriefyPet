@@ -68,8 +68,9 @@ export async function addCustomRssSource(
   url: string,
   module: string,
   bucket: string,
+  group: string,
 ): Promise<Snapshot> {
-  return invoke("add_custom_rss_source", { name, url, module, bucket });
+  return invoke("add_custom_rss_source", { name, url, module, bucket, group });
 }
 
 export async function resetRuntimeData(): Promise<void> {

@@ -110,6 +110,16 @@ pub struct UserDisciplinePreference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UserModulePreference {
+    pub module: String,
+    pub enabled: bool,
+    pub preference: String,
+    #[serde(default)]
+    pub selected_buckets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RssSource {
     pub id: String,
     pub name: String,
@@ -118,6 +128,8 @@ pub struct RssSource {
     pub module: String,
     #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
+    pub group: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,
@@ -151,6 +163,9 @@ pub struct SettingsPayload {
     #[serde(default = "default_module_push_top_n")]
     pub module_push_top_n: BTreeMap<String, i64>,
     pub auto_start: bool,
+    #[serde(default)]
+    pub module_preferences: Vec<UserModulePreference>,
+    #[serde(default)]
     pub disciplines: Vec<UserDisciplinePreference>,
     pub memory_mode_enabled: bool,
     pub memory_summary: String,
@@ -200,6 +215,7 @@ pub struct HistoryItem {
     pub source_name: String,
     pub module: String,
     pub bucket: String,
+    pub group: String,
     pub published_at: Option<String>,
     pub summary: String,
     pub fit_score: i64,
@@ -284,6 +300,7 @@ pub struct FeedArticle {
     pub source_name: String,
     pub module: String,
     pub bucket: String,
+    pub group: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,
@@ -324,9 +341,7 @@ pub fn default_module_fetch_intervals() -> BTreeMap<String, i64> {
         ("technology".to_string(), 6),
         ("social_science".to_string(), 12),
         ("business".to_string(), 12),
-        ("growth".to_string(), 12),
-        ("news_opinion".to_string(), 12),
-        ("entertainment".to_string(), 12),
+        ("design".to_string(), 12),
         ("science".to_string(), 12),
         ("medicine".to_string(), 12),
         ("other".to_string(), 12),
@@ -338,9 +353,7 @@ pub fn default_module_push_top_n() -> BTreeMap<String, i64> {
         ("technology".to_string(), 6),
         ("social_science".to_string(), 6),
         ("business".to_string(), 6),
-        ("growth".to_string(), 6),
-        ("news_opinion".to_string(), 6),
-        ("entertainment".to_string(), 6),
+        ("design".to_string(), 6),
         ("science".to_string(), 6),
         ("medicine".to_string(), 6),
         ("other".to_string(), 6),

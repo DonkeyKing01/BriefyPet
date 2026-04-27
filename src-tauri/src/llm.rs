@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 
 use crate::{
-    models::{FeedArticle, FitLevel, LlmResult, SourceKind, UserDisciplinePreference},
+    models::{FeedArticle, FitLevel, LlmResult, SourceKind, UserModulePreference},
     policy,
 };
 
@@ -189,13 +189,16 @@ pub async fn summarize_and_score_batch(
         .enumerate()
         .map(|(index, article)| {
             let module = policy::normalize_module(&article.module);
-            let bucket = policy::normalize_bucket(&module, &article.bucket);
-            let scoring_hint = scoring_focus_for_source(&module, &bucket, &article.source_kind);
+            let bucket = policy::normalize_bucket(&article.bucket);
+            let source_group = policy::normalize_group(&article.group);
+            let scoring_hint =
+                scoring_focus_for_source(&module, &bucket, &source_group, &article.source_kind);
             format!(
-                "INDEX: {index}\nSOURCE: {}\nMODULE: {}\nBUCKET: {}\nDISCIPLINE: {:?}\nSOURCE_KIND: {:?}\nRESOURCE_TYPE: {:?}\nSCORING_HINT: {}\nTITLE: {}\nCONTENT: {}",
+                "INDEX: {index}\nSOURCE: {}\nMODULE: {}\nBUCKET: {}\nGROUP: {}\nDISCIPLINE: {:?}\nSOURCE_KIND: {:?}\nRESOURCE_TYPE: {:?}\nSCORING_HINT: {}\nTITLE: {}\nCONTENT: {}",
                 article.source_name,
                 module,
                 bucket,
+                source_group,
                 article.discipline,
                 article.source_kind,
                 article.resource_type,
@@ -289,7 +292,7 @@ pub async fn generate_weekly_memory_refinement(
     model_override: Option<&str>,
     api_key: &str,
     base_summary: &str,
-    disciplines: &[UserDisciplinePreference],
+    module_preferences: &[UserModulePreference],
     signals: &[(String, String, String, String)],
 ) -> Result<String> {
     let trimmed_key = api_key.trim();
@@ -303,10 +306,17 @@ pub async fn generate_weekly_memory_refinement(
     let protocol = resolve_protocol(provider, protocol_override);
     let base_url = resolve_base_url(provider, base_url_override);
     let model = resolve_model(provider, model_override);
-    let preferences = disciplines
+    let preferences = module_preferences
         .iter()
         .filter(|item| item.enabled)
-        .map(|item| format!("{}: {}", item.discipline.display_name(), item.preference.trim()))
+        .map(|item| {
+            let buckets = if item.selected_buckets.is_empty() {
+                "未限定二级学科".to_string()
+            } else {
+                item.selected_buckets.join(" / ")
+            };
+            format!("{}（{}）: {}", item.module, buckets, item.preference.trim())
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let signal_text = signals
@@ -331,11 +341,13 @@ pub async fn generate_weekly_memory_refinement(
 
     let prompt = format!(
         "你是 BriefyPet 的用户兴趣记忆整理助手。\n\
-请根据用户原本的兴趣描述、本周收藏内容摘要和用户笔记，输出一句更精细但不偏离原意的中文兴趣描述。\n\
+请根据用户原本的兴趣描述、本周收藏内容摘要和用户批注，提炼更底层、更稳定的兴趣母题与判断标准，输出一句更精细但不偏离原意的中文兴趣描述。\n\
 要求：\n\
 - 只输出一句中文，不要编号，不要解释，不要引号。\n\
 - 保留用户原本的主体兴趣方向，只做细化，不要改写成完全不同的偏好。\n\
-- 语气像用户自己写的兴趣说明，长度尽量控制在 40 到 90 个中文字符。\n\
+- 语气像用户自己写的兴趣说明，长度尽量控制在 45 到 110 个中文字符。\n\
+- 优先提炼用户反复在意的问题意识、分析框架、审美偏好和判断标准，而不是机械复述看过哪些产品或领域。\n\
+- 如果用户评论里透露了偏好原因、排斥点、选择标准，请优先把这些抽象出来。\n\
 - 如果本周信号不足，就以原描述为主做很轻微的整理。\n\n\
 用户当前兴趣：\n{base_summary}\n\n\
 用户分学科偏好：\n{preferences}\n\n\
@@ -365,28 +377,33 @@ pub async fn generate_weekly_memory_refinement(
     Ok(truncate(&output, 160))
 }
 
-fn scoring_focus_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> &'static str {
-    match (module, bucket) {
-        ("technology", "research") | ("social_science", "academic_frontier") => {
+fn scoring_focus_for_source(
+    module: &str,
+    bucket: &str,
+    source_group: &str,
+    source_kind: &SourceKind,
+) -> &'static str {
+    match (module, bucket, source_group) {
+        ("technology", _, "research") | ("social_science", _, "frontier") => {
             "Prefer evidence-backed insights, research novelty, and practical implications."
         }
-        ("science", "physics") | ("science", "chemistry") | ("science", "biology") => {
+        ("science", _, _) => {
             "Prefer rigorous methodology, reproducibility clues, and true scientific value."
         }
-        ("medicine", "academic_frontier") => {
+        ("medicine", _, "clinical_trials") | ("medicine", _, "regulatory_science") => {
             "Prioritize clinical reliability, patient impact, and evidence hierarchy."
         }
-        ("news_opinion", "news") => "Prioritize factual density, timeliness, and low speculation.",
-        ("news_opinion", "community_opinion")
-        | ("news_opinion", "personal_opinion")
-        | ("news_opinion", "streaming_opinion") => {
-            "Reward viewpoint diversity but penalize noise, hype, and low-information opinions."
+        (_, _, "official") => {
+            "Prioritize official updates with concrete downstream impact and low ambiguity."
         }
-        ("technology", "official") => {
-            "Prioritize official updates with direct product or ecosystem impact."
+        (_, _, "opinion") => {
+            "Reward sharp judgment and perspective shifts, but penalize noise, hype, and low-information opinions."
         }
-        ("entertainment", "lite_pool") => {
-            "Keep high signal-to-noise and prefer durable quality over clickbait."
+        (_, _, "community") | (_, _, "news") => {
+            "Prefer high signal density, timeliness, and actionable takeaways over chatter."
+        }
+        (_, _, "blogs") => {
+            "Prefer practical depth, distinctive thinking, and reusable mental models."
         }
         _ => match source_kind {
             SourceKind::AcademicJournal => {

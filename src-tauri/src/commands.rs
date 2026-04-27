@@ -215,6 +215,7 @@ pub fn add_custom_rss_source(
     url: String,
     module: String,
     bucket: String,
+    group: String,
 ) -> Result<Snapshot, String> {
     let trimmed_name = name.trim();
     let trimmed_url = url.trim();
@@ -223,7 +224,8 @@ pub fn add_custom_rss_source(
     }
 
     let module = policy::normalize_module(&module);
-    let bucket = policy::normalize_bucket(&module, &bucket);
+    let bucket = policy::normalize_bucket(&bucket);
+    let source_group = policy::normalize_group(&group);
     let canonical_url = db::canonicalize_source_url(trimmed_url);
     let source = RssSource {
         id: db::build_custom_source_id(trimmed_name, &canonical_url),
@@ -231,8 +233,9 @@ pub fn add_custom_rss_source(
         url: canonical_url,
         module: module.clone(),
         bucket: bucket.clone(),
+        group: source_group.clone(),
         discipline: map_module_to_discipline(&module),
-        source_kind: map_bucket_to_source_kind(&bucket),
+        source_kind: map_group_to_source_kind(&source_group),
         resource_type: ResourceType::Article,
         language: None,
         enabled: true,
@@ -295,21 +298,24 @@ fn map_module_to_discipline(module: &str) -> Discipline {
         "technology" => Discipline::Technology,
         "social_science" => Discipline::SocialScience,
         "business" => Discipline::Other,
-        "growth" => Discipline::Life,
-        "news_opinion" => Discipline::News,
-        "entertainment" => Discipline::Humanities,
+        "design" => Discipline::Humanities,
         "science" => Discipline::Science,
         "medicine" => Discipline::Medicine,
         _ => Discipline::Other,
     }
 }
 
-fn map_bucket_to_source_kind(bucket: &str) -> SourceKind {
-    match bucket {
-        "research" | "academic_frontier" | "physics" | "chemistry" | "biology" => {
+fn map_group_to_source_kind(source_group: &str) -> SourceKind {
+    match source_group {
+        "frontier" | "research" | "academic" | "clinical_trials" | "genomics"
+        | "biostatistics" | "biomaterials" | "biomechanics" | "computational_biology"
+        | "bioinformatics" | "systems_biology" | "pharmacogenomics" | "drug_discovery"
+        | "pharmacology" | "toxicology" => {
             SourceKind::AcademicJournal
         }
-        "official" => SourceKind::OfficialAnnouncement,
+        "official" | "regulatory_science" | "clinical_safety" => {
+            SourceKind::OfficialAnnouncement
+        }
         "blogs" => SourceKind::TechnicalBlog,
         _ => SourceKind::CommunityHotspot,
     }

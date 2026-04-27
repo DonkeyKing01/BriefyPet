@@ -23,7 +23,7 @@ const MAX_CONCURRENT_SCORE_BATCHES: usize = 20;
 const MAX_SOURCES_PER_CYCLE: usize = 150;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
 const POLLING_PEEK_SECONDS: u64 = 2;
-const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 7;
+const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 2;
 const PUSH_MAX_AGE_DAYS: i64 = 2;
 const PUSH_MIN_FIT_SCORE: i64 = 60;
 const PENDING_BACKLOG_BATCH_SIZE: usize = 180;
@@ -560,7 +560,10 @@ pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Resu
     let modules_for_refresh = fetch_plan.modules_for_refresh.clone();
     let module_source_count = fetch_plan.module_source_count;
     let retry_source_count = fetch_plan.retry_source_count;
-    if !modules_for_refresh.is_empty() {
+    // Only stamp the module clock when there are actually sources to fetch.
+    // If module_sources=0 (all sources fetched recently), updating the clock here
+    // would push the next scheduled refresh far into the future unnecessarily.
+    if module_source_count > 0 {
         db::update_module_fetch_states(&conn, &modules_for_refresh, plan_now)?;
     }
     append_fetch_debug_log(
@@ -697,6 +700,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Resu
                     == FetchReason::ModuleRefresh;
                 let is_initial_fetch =
                     !db::source_has_successful_fetch(&conn, &result.source.id)?;
+                let incremental_cutoff = db::source_last_success_at(&conn, &result.source.id)?;
                 if let Some(error) = result.error {
                     db::update_fetch_state(
                         &conn,
@@ -714,7 +718,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Resu
                     result.articles,
                     is_initial_fetch,
                     fetch_timestamp,
-                    None,
+                    incremental_cutoff,
                 )?;
                 for article in filtered {
                     let article_key = build_article_key(&article);
@@ -788,10 +792,10 @@ pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Resu
             for result in score_outcome.results {
                 if let Some(analysis) = result.analysis {
                     let module = policy::normalize_module(&result.article.module);
-                    let bucket = policy::normalize_bucket(&module, &result.article.bucket);
+                    let bucket = policy::normalize_bucket(&result.article.bucket);
                     let calibrated_fit_level = policy::fit_level_for_score(
                         &module,
-                        &bucket,
+                        &result.article.group,
                         &result.article.source_kind,
                         analysis.fit_score,
                     );
@@ -1206,10 +1210,16 @@ async fn score_articles_in_batches(
 
 fn build_interest_context(settings: &SettingsPayload) -> String {
     let mut sections = Vec::new();
-    for item in settings.disciplines.iter().filter(|item| item.enabled) {
+    for item in settings.module_preferences.iter().filter(|item| item.enabled) {
+        let selected_buckets = if item.selected_buckets.is_empty() {
+            "未限定二级学科".to_string()
+        } else {
+            item.selected_buckets.join(" / ")
+        };
         sections.push(format!(
-            "- {}: {}",
-            item.discipline.display_name(),
+            "- {}（二级学科：{}）: {}",
+            item.module,
+            selected_buckets,
             item.preference.trim()
         ));
     }
@@ -1242,14 +1252,16 @@ fn effective_guid(article: &FeedArticle, article_key: &str) -> String {
 
 fn is_settings_complete(settings: &SettingsPayload) -> bool {
     let selected = settings
-        .disciplines
+        .module_preferences
         .iter()
         .filter(|item| item.enabled)
         .collect::<Vec<_>>();
     !selected.is_empty()
         && selected
             .iter()
-            .all(|item| !item.preference.trim().is_empty())
+            .all(|item| {
+                !item.preference.trim().is_empty() && !item.selected_buckets.is_empty()
+            })
         && llm_settings_complete(settings)
 }
 
@@ -1571,7 +1583,7 @@ async fn maybe_generate_weekly_memory_review(
         Some(&settings.llm_model),
         &settings.api_key,
         &base_summary,
-        &settings.disciplines,
+        &settings.module_preferences,
         &signals,
     )
     .await?;
@@ -1638,10 +1650,16 @@ fn current_base_memory(settings: &SettingsPayload) -> String {
     }
 
     let merged = settings
-        .disciplines
+        .module_preferences
         .iter()
         .filter(|item| item.enabled)
-        .map(|item| item.preference.trim())
+        .map(|item| {
+            if item.selected_buckets.is_empty() {
+                item.preference.trim().to_string()
+            } else {
+                format!("{}（{}）", item.preference.trim(), item.selected_buckets.join(" / "))
+            }
+        })
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>()
         .join("；");
@@ -1821,7 +1839,9 @@ fn build_fetch_plan(
     } else {
         db::list_due_modules(conn, now)?
     };
-    let module_sources = db::list_module_refresh_sources(conn, &modules_for_refresh, now)?;
+    // When force_module_refresh is true (e.g. on app startup), bypass per-source
+    // timing so every source in enabled modules is fetched regardless of last_success_at.
+    let module_sources = db::list_module_refresh_sources(conn, &modules_for_refresh, now, force_module_refresh)?;
     let retry_sources = db::list_retry_due_sources(conn, now, &modules_for_refresh)?;
 
     let module_source_count = module_sources.len();
@@ -1865,6 +1885,7 @@ mod tests {
     };
     use crate::models::{
         Discipline, PetStatus, RssSource, SettingsPayload, SourceKind, UserDisciplinePreference,
+        UserModulePreference,
     };
 
     fn sample_settings() -> SettingsPayload {
@@ -1880,6 +1901,12 @@ mod tests {
             module_fetch_intervals: crate::policy::default_module_fetch_intervals(),
             module_push_top_n: crate::policy::default_module_push_top_n_map(),
             auto_start: false,
+            module_preferences: vec![UserModulePreference {
+                module: "technology".into(),
+                enabled: true,
+                preference: "关注 AI 工具和工程实践".into(),
+                selected_buckets: vec!["ai_and_cs".into()],
+            }],
             disciplines: vec![UserDisciplinePreference {
                 discipline: Discipline::Technology,
                 enabled: true,
@@ -1892,7 +1919,8 @@ mod tests {
                 name: "Demo".into(),
                 url: "https://example.com/feed.xml".into(),
                 module: "technology".into(),
-                bucket: "blogs".into(),
+                bucket: "ai_and_cs".into(),
+                group: "blogs".into(),
                 discipline: Discipline::Technology,
                 source_kind: SourceKind::TechnicalBlog,
                 resource_type: crate::models::ResourceType::Article,
@@ -1909,7 +1937,10 @@ mod tests {
     fn settings_need_selected_disciplines_and_preference() {
         let mut settings = sample_settings();
         assert!(is_settings_complete(&settings));
-        settings.disciplines[0].preference.clear();
+        settings.module_preferences[0].preference.clear();
+        assert!(!is_settings_complete(&settings));
+        settings.module_preferences[0].preference = "关注 AI 工具和工程实践".into();
+        settings.module_preferences[0].selected_buckets.clear();
         assert!(!is_settings_complete(&settings));
     }
 
