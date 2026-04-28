@@ -11,7 +11,7 @@ mod tray;
 
 use std::sync::Mutex;
 
-use tauri::{LogicalPosition, LogicalSize, Manager, WindowBuilder, WindowEvent, WindowUrl};
+use tauri::{LogicalPosition, LogicalSize, Manager, RunEvent, WindowBuilder, WindowEvent, WindowUrl};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 use crate::models::AppView;
@@ -119,6 +119,18 @@ fn position_overlay_windows(app: &tauri::App) -> tauri::Result<()> {
         window.set_position(LogicalPosition::new(bubble_x, bubble_y))?;
     }
     Ok(())
+}
+
+fn reopen_primary_window(app: &tauri::AppHandle) {
+    if let Err(err) = service::handle_pet_double_click(app) {
+        eprintln!("failed to reopen primary window: {err}");
+        if let Some(window) = app.get_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+    let _ = service::sync_windows(app, service::current_scanning(app));
+    let _ = service::publish_snapshot(app, service::current_scanning(app));
 }
 
 fn main() {
@@ -280,5 +292,24 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_, _| {});
+        .run({
+            let mut saw_initial_resume = false;
+            move |app, event| {
+                if let RunEvent::Resumed = event {
+                    if !saw_initial_resume {
+                        saw_initial_resume = true;
+                        return;
+                    }
+
+                    let main_hidden = app
+                        .get_window("main")
+                        .and_then(|window| window.is_visible().ok())
+                        .map(|visible| !visible)
+                        .unwrap_or(true);
+                    if main_hidden {
+                        reopen_primary_window(app);
+                    }
+                }
+            }
+        });
 }

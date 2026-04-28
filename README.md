@@ -1,94 +1,95 @@
-# BriefyPet (mac branch)
+# BriefyPet
 
-BriefyPet 是一个基于 Tauri + React + Rust + SQLite 的桌宠信息雷达应用。
+BriefyPet 是一个基于 Tauri + React + Rust + SQLite 的桌面信息雷达。它不是传统 RSS 阅读器，而是以桌宠常驻、提醒汇总、主窗口深读为核心的信息陪伴应用。
 
-目标不是做纯阅读器，而是做低打扰的信息提醒伙伴：
+当前默认交付分支是 `mac`，目标产物为可直接安装的 macOS `.app` 与 `.dmg`。
 
-1. 桌宠常驻桌面。
-2. 有高价值内容时做汇总提醒。
-3. 需要深读时进入主窗口统一处理。
+## 产品定位
 
----
+- 平时以桌宠形态常驻桌面，低存在感陪伴。
+- 当高契合内容到达时，以汇总气泡进行低打扰提醒。
+- 用户需要深入处理时，再进入主窗口统一查看、收藏、记录和配置。
+- 所有核心数据本地落库，LLM 仅用于摘要、契合度判断、推荐理由和记忆提炼。
 
-## 1. 当前分支状态
+## 当前核心能力
 
-当前分支：`mac`
+### 桌宠与提醒
 
-当前主要交付目标：
+- 桌宠窗口支持透明、置顶、拖拽、托盘联动。
+- 气泡窗口提供 `立即查看 / 稍后提醒 / 忽略本次`。
+- 应用包含独立的帮助窗口与每周记忆回顾窗口。
+- 托盘支持隐藏、显示、打开主界面与退出。
 
-1. 以 macOS 可安装应用（`.app` / `.dmg`）为主交付形态。
-2. 保持一套源码，支持 mac 与 windows 两套打包脚本。
+### 主窗口
 
-文档入口：
+- 当前主窗口左栏信息结构为 `Unread / Today / Favorites / History`。
+- 中栏按时间倒序展示推送流。
+- 右栏展示标题、摘要、来源、契合度、推荐理由、收藏状态与笔记。
+- `Unread` 中首次点击只选中，二次点击会归档到 `Today`。
 
-1. `AGENTS.md`：产品边界与状态规则（单一真相源）。
-2. `Ver2.md`：Ver2 全量合并文档（架构、迭代、验收）。
+### 设置与偏好
 
----
+- LLM 提供商、协议、Base URL、模型和 API Key 配置。
+- RSS 源启用状态管理。
+- 记忆模式开关与相关设置。
+- 高级设置和数据重置入口。
 
-## 2. 核心能力
+### RSS 与本地数据
 
-1. 桌宠常驻、置顶、托盘管理。
-2. RSS 抓取 + LLM 摘要/契合度/推荐理由。
-3. 仅高契合内容触发提醒批次。
-4. 主窗口阅读、收藏、笔记与设置统一管理。
-5. 本地 SQLite 存储（文章、设置、提醒批次、记忆）。
+- 内置 RSS 目录来自 `src-tauri/resources/rss_catalog_0425.opml`。
+- 当前信源语义已升级为 `一级学科 / 二级学科 / group` 三级结构。
+- Rust 后端负责抓取、去重、评分、提醒批次、历史沉淀与本地 SQLite 存储。
+- 仅高契合内容进入推送链路。
 
----
+## 技术栈
 
-## 3. 最新前端信息架构
+- 前端：React 18 + TypeScript + Vite
+- 桌面壳：Tauri 1.x
+- 后端：Rust
+- 本地数据库：SQLite
+- 打包目标：macOS `.app` / `.dmg`，保留 Windows 打包脚本
 
-主窗口左栏固定为：
-
-1. `Unread`
-2. `Today`
-3. `Favorites`
-4. `History`
-
-语义说明：
-
-1. `Unread`：当前推送批次未归档内容。
-2. `Today`：Unread 归档后的当天推送聚合。
-3. `Favorites`：收藏或有笔记内容。
-4. `History`：除 Today 外的历史推送沉淀。
-
-交互规则：
-
-1. Unread 中同一条首次点击仅选中，第二次点击归档到 Today。
-2. 分组统一按 `Module/Bucket` 展开。
-3. 中栏时间线按倒序展示并显示时间。
-4. 右栏支持 CHECK 信息块（MOD/BKT/SRC/PUB/PUSH/FIT/FAV/NOTE）。
-
----
-
-## 4. 目录结构
+## 目录结构
 
 ```text
-src/                      # React 前端
-src-tauri/                # Rust 后端 + Tauri 壳层
-public/                   # 静态资源（含桌宠素材）
-scripts/                  # 打包脚本（mac/windows）
-reference/                # 本地参考资料（默认忽略，不进入 Git）
+src/                         React 前端
+src-tauri/                   Tauri / Rust 后端
+src-tauri/resources/         内置 RSS 目录等资源
+src-tauri/icons/             应用打包图标
+public/                      前端静态资源与桌宠素材
+scripts/                     打包脚本
+reference/                   本地参考项目与素材
+Landing page/                独立落地页原型
+AGENTS.md                    产品与交互规则主文档
+Ver2.md                      合并后的版本说明
 ```
 
----
+## 环境要求
 
-## 5. 环境要求
+- Node.js 18+
+- npm 9+
+- Rust stable
+- macOS 本机环境
+- 项目内已包含 `@tauri-apps/cli`
 
-1. Node.js 18+
-2. npm 9+
-3. Rust stable
-4. Tauri CLI（项目 devDependencies 已含 `@tauri-apps/cli`）
-5. macOS（进行 mac 打包时）
-
----
-
-## 6. 快速开始
+## 本地开发
 
 安装依赖：
 
 ```bash
 npm install
+```
+
+启动前端开发环境：
+
+```bash
+npm run dev
+```
+
+启动 Tauri 开发模式：
+
+```bash
+npm run tauri -- dev
 ```
 
 前端构建：
@@ -97,84 +98,63 @@ npm install
 npm run build
 ```
 
-后端测试：
+如需运行 Rust 侧测试：
 
 ```bash
 cd src-tauri && cargo test
 ```
 
-Tauri 开发运行：
+## 打包
+
+### macOS debug
+
+生成 debug `.app` 并通过 sandbox-safe 方式生成 `.dmg`：
 
 ```bash
-npm run tauri -- dev
+bash scripts/build-macos-debug-sandbox-dmg.sh
 ```
 
----
+### macOS release
 
-## 7. 打包命令
-
-### 7.1 macOS
-
-debug app + sandbox-safe dmg：
+生成 release `.app`，再通过 sandbox-safe 方式生成 `.dmg`：
 
 ```bash
-npm run tauri:build:debug:sandbox-dmg
+bash scripts/build-macos-release-dmg.sh
 ```
 
-release dmg：
+### Windows release
+
+保留 Windows 打包脚本：
 
 ```bash
-npm run tauri:build:mac:release-dmg
+bash scripts/build-windows-release-bundle.sh
 ```
 
-### 7.2 Windows
+## 常见产物路径
 
-release bundle（msi + nsis）：
+macOS release：
 
-```bash
-npm run tauri:build:windows:release
+```text
+src-tauri/target/release/bundle/macos/Briefy-pet.app
+src-tauri/target/release/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg
 ```
 
----
-
-## 8. 常见产物路径
-
-debug：
+macOS debug：
 
 ```text
 src-tauri/target/debug/bundle/macos/Briefy-pet.app
 src-tauri/target/debug/bundle/macos/Briefy-pet_0.1.0_aarch64.dmg
 ```
 
-release：
+## 文档约定
 
-```text
-src-tauri/target/release/bundle/macos/Briefy-pet.app
-src-tauri/target/release/bundle/dmg/Briefy-pet_0.1.0_aarch64.dmg
-```
+- 产品规则和交互状态以 `AGENTS.md` 为准。
+- 版本演进说明统一收敛到 `Ver2.md`。
+- `reference/` 主要用于本地参考，不作为正式运行依赖。
+- 需要提交的改动应同时同步代码、README 和版本文档。
 
----
+## 当前分支说明
 
-## 9. 开发约定
-
-1. `reference/` 仅作本地参考，不进入 Git。
-2. `tmp_*` 调试产物不入库。
-3. 文档更新统一写入 `Ver2.md`，不再拆分 `Ver2-*.md`。
-4. 重大功能变更需同时更新：代码 + `Ver2.md` + `README.md`。
-
----
-
-## 10. 质量基线
-
-每次准备提交前，建议至少执行：
-
-```bash
-npm run build
-cd src-tauri && cargo test
-```
-
-如涉及安装包验证，再执行：
-
-```bash
-npm run tauri:build:debug:sandbox-dmg
-```
+- 当前分支：`mac`
+- 当前远端：`origin/mac`
+- 当前交付目标：优先保证 macOS 可安装包可用
