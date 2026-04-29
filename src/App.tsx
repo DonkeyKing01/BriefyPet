@@ -1,19 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { appWindow } from "@tauri-apps/api/window";
+import { open as shellOpen } from "@tauri-apps/api/shell";
 import {
   addCustomRssSource,
   bootstrap,
   bootstrapOverlay,
   bubbleAction,
   getArticleRawContent,
+  dismissHelpWindow,
   listHistoryArticlesPage,
+  openHelpWindow,
   openArticle,
   petDoubleClick,
   resetRuntimeData,
   saveArticleNote,
   saveSettings,
   setActiveView,
+  submitMemoryReview,
   toggleFavorite
 } from "./api";
 import type {
@@ -22,20 +26,25 @@ import type {
   Discipline,
   FitLevel,
   HistoryItem,
+  LlmProtocol,
   LlmProvider,
+  MemoryReviewProposal,
   OverlaySnapshot,
   RssSource,
   SettingsPayload,
   Snapshot,
   SourceBucket,
+  SourceGroup,
   SourceKind,
   SourceModule,
-  UserDisciplinePreference
+  UserDisciplinePreference,
+  UserModulePreference
 } from "./types";
 
 const PET_STATUS_LABELS = {
   loading: "加载中",
   "needs-config": "待配置",
+  polling: "轮询中",
   scanning: "扫描中",
   idle: "待命中",
   "new-info": "新提醒"
@@ -44,6 +53,7 @@ const PET_STATUS_LABELS = {
 const PET_STATUS_HINTS = {
   loading: "",
   "needs-config": "先去完善配置",
+  polling: "轮询中",
   scanning: "按学科与子分类抓取中",
   idle: "当前没有高优提醒",
   "new-info": "双击或点气泡查看"
@@ -51,29 +61,34 @@ const PET_STATUS_HINTS = {
 
 const PET_ASSET_BY_STATUS = {
   loading: {
-    src: "/pets/clawd/clawd-typing.gif",
-    alt: "Clawd loading",
-    size: 164
+    src: "/pets/briefy-ip/gifs/loading.gif",
+    alt: "Briefy loading",
+    size: 154
   },
   "needs-config": {
-    src: "/pets/clawd/clawd-mini-peek.gif",
-    alt: "Clawd needs config",
-    size: 154
+    src: "/pets/briefy-ip/gifs/needs-config.gif",
+    alt: "Briefy needs config",
+    size: 146
+  },
+  polling: {
+    src: "/pets/briefy-ip/gifs/polling.gif",
+    alt: "Briefy polling",
+    size: 148
   },
   scanning: {
-    src: "/pets/clawd/clawd-thinking.gif",
-    alt: "Clawd scanning",
-    size: 164
-  },
-  idle: {
-    src: "/pets/clawd/clawd-mini-idle.gif",
-    alt: "Clawd idle",
+    src: "/pets/briefy-ip/gifs/scanning.gif",
+    alt: "Briefy scanning",
     size: 154
   },
+  idle: {
+    src: "/pets/briefy-ip/gifs/idle.gif",
+    alt: "Briefy idle",
+    size: 146
+  },
   "new-info": {
-    src: "/pets/clawd/clawd-mini-alert.gif",
-    alt: "Clawd new info",
-    size: 160
+    src: "/pets/briefy-ip/gifs/new-info.gif",
+    alt: "Briefy new info",
+    size: 150
   }
 } as const;
 
@@ -81,31 +96,94 @@ const MODULE_LABELS: Record<SourceModule, string> = {
   technology: "科技",
   social_science: "社科",
   business: "商业",
-  growth: "成长",
-  news_opinion: "新闻观点",
-  entertainment: "娱乐",
+  design: "设计",
   science: "科学",
   medicine: "医学",
   other: "其他"
 };
 
-const BUCKET_LABELS: Record<SourceBucket, string> = {
+const BUCKET_LABELS: Record<string, string> = {
   research: "研究",
-  academic_frontier: "学术前沿",
+  frontier: "前沿",
   official: "官方",
   blogs: "博客",
   community: "社区",
-  streaming: "流媒体",
   news: "新闻",
-  personal_opinion: "个人观点",
-  streaming_opinion: "流媒体观点",
-  community_opinion: "社区观点",
-  media_opinion: "媒体观点",
-  lite_pool: "轻量池",
+  opinion: "观点",
   physics: "物理",
   chemistry: "化学",
   biology: "生物",
-  unspecified: "未分类"
+  economics: "经济学",
+  sociology: "社会学",
+  politics: "政治学",
+  ai_and_cs: "AI 与计算机",
+  embodied_ai_and_robotics: "具身智能与机器人",
+  hci_research: "HCI 研究",
+  product_and_ux_design: "产品与 UX 设计",
+  engineering_design: "工程设计",
+  design_methods: "设计方法",
+  creative_design: "创意设计",
+  bioinformatics_and_computational_biology: "生物信息与计算生物",
+  chemistry_and_materials: "化学与材料",
+  environmental_science: "环境科学",
+  mathematics: "数学",
+  clinical_medicine: "临床医学",
+  public_health_and_population_medicine: "公共卫生",
+  pharmacology_and_drug_development: "药理与药物开发",
+  regulatory_ethics_and_safety: "监管、伦理与安全",
+  biomedical_engineering: "生物医学工程",
+  media_coverage: "媒体报道",
+  general: "未分类"
+};
+
+const GROUP_LABELS: Record<string, string> = {
+  frontier: "前沿",
+  academic: "学术",
+  research: "研究",
+  opinion: "观点",
+  official: "官方",
+  blogs: "博客",
+  community: "社区",
+  news: "新闻",
+  industry: "行业",
+  china: "中国",
+  us: "美国",
+  english: "英文",
+  chinese: "中文",
+  product_engineering: "产品工程",
+  cad_and_cae: "CAD/CAE",
+  systems_engineering: "系统工程",
+  bioinformatics: "生信",
+  computational_biology: "计算生物",
+  genomics: "基因组学",
+  proteomics: "蛋白组学",
+  systems_biology: "系统生物学",
+  biomaterials: "生物材料",
+  biomechanics: "生物力学",
+  biostatistics: "生物统计",
+  biomedical_engineering: "生物医学工程",
+  clinical_trials: "临床试验",
+  clinical_medicine: "临床",
+  cardiology: "心血管",
+  oncology: "肿瘤",
+  neurology: "神经",
+  pediatrics: "儿科",
+  infectious_diseases: "传染病",
+  global_health: "全球健康",
+  public_health: "公共卫生",
+  environmental_health: "环境健康",
+  health_policy: "卫生政策",
+  medical_devices: "医疗器械",
+  medical_imaging: "医学影像",
+  drug_discovery: "药物发现",
+  pharmacology: "药理",
+  pharmacogenomics: "药物基因组",
+  drug_safety: "药物安全",
+  toxicology: "毒理",
+  regulatory_science: "监管科学",
+  medical_ethics: "医学伦理",
+  clinical_safety: "临床安全",
+  general: "未分类"
 };
 
 const DISCIPLINE_LABELS: Record<Discipline, string> = {
@@ -138,32 +216,13 @@ const MODULE_ORDER: SourceModule[] = [
   "technology",
   "social_science",
   "business",
-  "growth",
-  "news_opinion",
-  "entertainment",
+  "design",
   "science",
   "medicine",
   "other"
 ];
 
-const BUCKET_ORDER: SourceBucket[] = [
-  "research",
-  "academic_frontier",
-  "official",
-  "blogs",
-  "community",
-  "streaming",
-  "news",
-  "personal_opinion",
-  "streaming_opinion",
-  "community_opinion",
-  "media_opinion",
-  "lite_pool",
-  "physics",
-  "chemistry",
-  "biology",
-  "unspecified"
-];
+const BUCKET_ORDER: SourceBucket[] = ["economics", "sociology", "politics", "ai_and_cs", "general"];
 
 const DISCIPLINE_ORDER: Discipline[] = [
   "technology",
@@ -178,13 +237,184 @@ const DISCIPLINE_ORDER: Discipline[] = [
 
 const PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
   { value: "deepseek", label: "DeepSeek" },
+  { value: "qwen", label: "Qwen" },
+  { value: "minimax", label: "MiniMax" },
   { value: "glm", label: "GLM" },
   { value: "kimi", label: "Kimi" },
   { value: "openai", label: "OpenAI" },
-  { value: "siliconflow", label: "SiliconFlow" }
+  { value: "gemini", label: "Gemini" },
+  { value: "anthropic", label: "Anthropic" },
+  { value: "custom", label: "自定义" }
 ];
 
+type ProviderModelOption = {
+  id: string;
+  name: string;
+};
+
+type ProviderDefinition = {
+  label: string;
+  protocol: LlmProtocol;
+  baseUrl: string;
+  models: ProviderModelOption[];
+  apiKeyHint: string;
+};
+
+const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
+  deepseek: {
+    label: "DeepSeek",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.deepseek.com",
+    models: [
+      { id: "deepseek-chat", name: "DeepSeek Chat" },
+      { id: "deepseek-reasoner", name: "DeepSeek Reasoner" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  qwen: {
+    label: "Qwen",
+    protocol: "openai-compatible",
+    baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    models: [
+      { id: "qwen3.5-flash", name: "Qwen 3.5 Flash" },
+      { id: "qwen3.5-plus", name: "Qwen 3.5 Plus" },
+      { id: "qwen3-max", name: "Qwen 3 Max" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  minimax: {
+    label: "MiniMax",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.minimaxi.com/v1",
+    models: [
+      { id: "MiniMax-M2.5-highspeed", name: "MiniMax M2.5 Highspeed" },
+      { id: "MiniMax-M2.5", name: "MiniMax M2.5" },
+      { id: "MiniMax-M2.7-highspeed", name: "MiniMax M2.7 Highspeed" },
+      { id: "MiniMax-M2.7", name: "MiniMax M2.7" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  glm: {
+    label: "GLM",
+    protocol: "openai-compatible",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    models: [
+      { id: "glm-4.7-flashx", name: "GLM 4.7 FlashX" },
+      { id: "glm-5-turbo", name: "GLM 5 Turbo" },
+      { id: "glm-4.7", name: "GLM 4.7" },
+      { id: "glm-5.1", name: "GLM 5.1" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  kimi: {
+    label: "Kimi",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.moonshot.cn/v1",
+    models: [
+      { id: "kimi-k2.5", name: "Kimi K2.5" },
+      { id: "kimi-k2-thinking", name: "Kimi K2 Thinking" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  openai: {
+    label: "OpenAI",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.openai.com/v1",
+    models: [
+      { id: "gpt-5.4-nano", name: "GPT-5.4 Nano" },
+      { id: "gpt-5.4-mini", name: "GPT-5.4 Mini" },
+      { id: "gpt-5.4", name: "GPT-5.4" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  gemini: {
+    label: "Gemini",
+    protocol: "gemini-native",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    models: [
+      { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash-Lite" },
+      { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+      { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  anthropic: {
+    label: "Anthropic",
+    protocol: "anthropic-native",
+    baseUrl: "https://api.anthropic.com",
+    models: [
+      { id: "claude-3-5-haiku-latest", name: "Claude Haiku 3.5" },
+      { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
+      { id: "claude-opus-4-1-20250805", name: "Claude Opus 4.1" }
+    ],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  custom: {
+    label: "自定义",
+    protocol: "openai-compatible",
+    baseUrl: "",
+    models: [],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  },
+  siliconflow: {
+    label: "SiliconFlow",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    models: [{ id: "Qwen/Qwen2.5-72B-Instruct", name: "Qwen 2.5 72B Instruct" }],
+    apiKeyHint: "这里填写当前所选服务商的 API Key"
+  }
+};
+
+const PROTOCOL_OPTIONS: Array<{ value: LlmProtocol; label: string }> = [
+  { value: "openai-compatible", label: "OpenAI Compatible" },
+  { value: "anthropic-native", label: "Anthropic Native" },
+  { value: "gemini-native", label: "Gemini Native" }
+];
+
+const DISCIPLINE_PLACEHOLDERS: Record<Discipline, string> = {
+  technology:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：AI Agent、编程工具、大模型产品更新；优先教程、测评和重要发布",
+  "social-science":
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：社会心理、青年文化、科技与社会；优先研究解读、案例分析和关键观点",
+  other:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：AI 创业、产品策略、行业趋势；优先深度分析、公司动态和市场变化",
+  life:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：学习方法、时间管理、表达沟通；优先可执行建议、经验总结和高质量书单",
+  news:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：全球科技新闻、热点事件评论、产业政策变化；优先背景解读和多角度观点总结",
+  humanities:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：电影、动画、游戏和流行文化；优先高质量推荐、口碑评价和新作信息",
+  science:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：AI、认知科学、物理和前沿研究；优先通俗解读、重要论文和新发现",
+  medicine:
+    "写下你关注的主题、想看的内容类型和优先条件\n例如：睡眠、营养、运动健康和心理健康；优先循证研究、科普解读和实用建议"
+};
+
+const MODULE_BUCKET_MAP: Record<SourceModule, SourceBucket[]> = {
+  technology: ["ai_and_cs", "embodied_ai_and_robotics", "hci_research"],
+  social_science: ["economics", "sociology", "politics"],
+  business: ["media_coverage"],
+  design: ["product_and_ux_design", "engineering_design", "creative_design"],
+  science: ["biology", "physics", "chemistry_and_materials"],
+  medicine: ["clinical_medicine", "public_health_and_population_medicine"],
+  other: ["general"]
+};
+
+const MODULE_CONFIG_ORDER = MODULE_ORDER;
+
 const MODULE_OPTIONS = MODULE_ORDER.filter((module) => module !== "other");
+
+function getProviderDefinition(provider: LlmProvider): ProviderDefinition {
+  return PROVIDER_DEFINITIONS[provider] ?? PROVIDER_DEFINITIONS.deepseek;
+}
+
+function activeProviderApiKeyKey(provider: LlmProvider, customProviderName: string) {
+  if (provider !== "custom") {
+    return provider;
+  }
+  const name = customProviderName.trim();
+  return name ? `custom:${name}` : "custom";
+}
 
 const DEMO_SOURCES: RssSource[] = [
   {
@@ -192,7 +422,8 @@ const DEMO_SOURCES: RssSource[] = [
     name: "Social Science Frontier",
     url: "https://example.com/social-frontier.xml",
     module: "social_science",
-    bucket: "academic_frontier",
+    bucket: "economics",
+    group: "frontier",
     discipline: "social-science",
     sourceKind: "academic-journal",
     resourceType: "article",
@@ -207,7 +438,8 @@ const DEMO_SOURCES: RssSource[] = [
     name: "Apple Developer News",
     url: "https://developer.apple.com/news/rss/news.rss",
     module: "technology",
-    bucket: "official",
+    bucket: "ai_and_cs",
+    group: "official",
     discipline: "technology",
     sourceKind: "official-announcement",
     resourceType: "article",
@@ -222,7 +454,8 @@ const DEMO_SOURCES: RssSource[] = [
     name: "Stratechery",
     url: "https://stratechery.com/feed/",
     module: "business",
-    bucket: "blogs",
+    bucket: "media_coverage",
+    group: "blogs",
     discipline: "other",
     sourceKind: "technical-blog",
     resourceType: "article",
@@ -237,7 +470,8 @@ const DEMO_SOURCES: RssSource[] = [
     name: "Hacker News",
     url: "https://hnrss.org/frontpage",
     module: "technology",
-    bucket: "community",
+    bucket: "ai_and_cs",
+    group: "community",
     discipline: "technology",
     sourceKind: "community-hotspot",
     resourceType: "article",
@@ -253,6 +487,7 @@ const DEMO_SOURCES: RssSource[] = [
     url: "https://www.sciencedaily.com/rss/top/science.xml",
     module: "science",
     bucket: "biology",
+    group: "research",
     discipline: "science",
     sourceKind: "academic-journal",
     resourceType: "article",
@@ -388,6 +623,7 @@ type FeedSelection =
 type ArticleMeta = {
   module: string;
   bucket: string;
+  group: string;
   sourceName: string;
   pushedAt: string | null;
 };
@@ -425,7 +661,10 @@ function snapshotFingerprint(snapshot: Snapshot) {
     .slice(0, 24)
     .map((item) => `${item.id}:${item.batchId}:${item.fitScore}`)
     .join(",");
-  const enabledDisciplineCount = snapshot.settings.disciplines.filter((item) => item.enabled).length;
+  const enabledDisciplineCount = snapshot.settings.modulePreferences.filter((item) => item.enabled).length;
+  const memoryReviewKey = snapshot.memoryReview
+    ? `${snapshot.memoryReview.id}:${snapshot.memoryReview.status}:${snapshot.memoryReview.createdAt}`
+    : "none";
 
   return [
     snapshot.petStatus,
@@ -440,6 +679,7 @@ function snapshotFingerprint(snapshot: Snapshot) {
     snapshot.articles.length,
     snapshot.historyArticles.length,
     snapshot.memory?.updatedAt ?? "",
+    memoryReviewKey,
     snapshot.sourceSummary.dueSources,
     articleEdge,
     historyEdge
@@ -655,6 +895,22 @@ function compareWithPresetOrder(left: string, right: string, order: readonly str
   return left.localeCompare(right);
 }
 
+function titleizeSlug(value: string) {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function bucketLabel(value: string) {
+  return BUCKET_LABELS[value] ?? titleizeSlug(value);
+}
+
+function groupLabel(value: string) {
+  return GROUP_LABELS[value] ?? titleizeSlug(value);
+}
+
 function orderedTreeEntries(tree: Map<string, Map<string, number>>) {
   return [...tree.keys()]
     .sort((left, right) => compareWithPresetOrder(left, right, MODULE_ORDER))
@@ -759,6 +1015,7 @@ function resolveArticleMeta(
     return {
       module: source.module,
       bucket: source.bucket,
+      group: source.group,
       sourceName: source.name,
       pushedAt: historyByArticleId.get(article.id)?.batchCreatedAt ?? null
     };
@@ -768,7 +1025,8 @@ function resolveArticleMeta(
   if (history) {
     return {
       module: history.module || "other",
-      bucket: history.bucket || "unspecified",
+      bucket: history.bucket || "general",
+      group: history.group || "general",
       sourceName: history.sourceName,
       pushedAt: history.batchCreatedAt ?? null
     };
@@ -776,7 +1034,8 @@ function resolveArticleMeta(
 
   return {
     module: "other",
-    bucket: "unspecified",
+    bucket: "general",
+    group: "general",
     sourceName: article.sourceName,
     pushedAt: null
   };
@@ -789,27 +1048,42 @@ function sortDisciplinePrefs(items: UserDisciplinePreference[]) {
   );
 }
 
+function sortModulePrefs(items: UserModulePreference[]) {
+  return [...items].sort(
+    (left, right) =>
+      MODULE_ORDER.indexOf((left.module as SourceModule) ?? "other") -
+      MODULE_ORDER.indexOf((right.module as SourceModule) ?? "other")
+  );
+}
+
 function groupSources(sources: RssSource[]) {
-  const grouped = new Map<SourceModule, Map<SourceBucket, RssSource[]>>();
+  const grouped = new Map<SourceModule, Map<SourceBucket, Map<SourceGroup, RssSource[]>>>();
   for (const source of sources) {
     if (!grouped.has(source.module)) {
       grouped.set(source.module, new Map());
     }
     const moduleGroup = grouped.get(source.module)!;
     if (!moduleGroup.has(source.bucket)) {
-      moduleGroup.set(source.bucket, []);
+      moduleGroup.set(source.bucket, new Map());
     }
-    moduleGroup.get(source.bucket)!.push(source);
+    const bucketGroup = moduleGroup.get(source.bucket)!;
+    if (!bucketGroup.has(source.group)) {
+      bucketGroup.set(source.group, []);
+    }
+    bucketGroup.get(source.group)!.push(source);
   }
 
   for (const module of grouped.keys()) {
     const bucketMap = grouped.get(module)!;
-    const sortedBuckets = new Map<SourceBucket, RssSource[]>();
-    for (const bucket of BUCKET_ORDER) {
-      if (bucketMap.has(bucket)) {
-        const list = [...bucketMap.get(bucket)!].sort((a, b) => a.name.localeCompare(b.name));
-        sortedBuckets.set(bucket, list);
+    const sortedBuckets = new Map<SourceBucket, Map<SourceGroup, RssSource[]>>();
+    for (const bucket of [...bucketMap.keys()].sort((left, right) => compareWithPresetOrder(left, right, BUCKET_ORDER))) {
+      const groups = bucketMap.get(bucket)!;
+      const sortedGroups = new Map<SourceGroup, RssSource[]>();
+      for (const group of [...groups.keys()].sort((left, right) => left.localeCompare(right))) {
+        const list = [...groups.get(group)!].sort((a, b) => a.name.localeCompare(b.name));
+        sortedGroups.set(group, list);
       }
+      sortedBuckets.set(bucket, sortedGroups);
     }
     grouped.set(module, sortedBuckets);
   }
@@ -817,31 +1091,15 @@ function groupSources(sources: RssSource[]) {
   return grouped;
 }
 
-function moduleToDiscipline(module: SourceModule): Discipline {
-  switch (module) {
-    case "technology":
-      return "technology";
-    case "social_science":
-      return "social-science";
-    case "growth":
-      return "life";
-    case "news_opinion":
-      return "news";
-    case "entertainment":
-      return "humanities";
-    case "science":
-      return "science";
-    case "medicine":
-      return "medicine";
-    case "business":
-    case "other":
-    default:
-      return "other";
+function sourceMatchesModulePreferences(
+  source: RssSource,
+  selectedModules: Map<string, Set<string>>
+) {
+  const selectedBuckets = selectedModules.get(source.module);
+  if (!selectedBuckets) {
+    return false;
   }
-}
-
-function sourceMatchesDisciplines(source: RssSource, selected: Set<Discipline>) {
-  return selected.has(source.discipline) || selected.has(moduleToDiscipline(source.module));
+  return selectedBuckets.size === 0 || selectedBuckets.has(source.bucket);
 }
 
 function rssRawToText(value: string) {
@@ -1113,6 +1371,228 @@ function BubbleWindow({ snapshot }: { snapshot: OverlaySnapshot | null }) {
   );
 }
 
+function HelpWindow() {
+  const pointerState = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+  const steps = [
+    {
+      title: "欢迎使用 BriefyPet",
+      body: "BriefyPet 会常驻桌面，帮你从订阅内容中挑出更值得优先阅读的信息，减轻信息焦虑。"
+    },
+    {
+      title: "它能帮你做什么",
+      body: "你可以按兴趣选择内容来源。\nBriefyPet 会自动检查更新、提炼重点，并把更相关的内容推送到桌面。\n你也可以在应用内阅读、收藏、标记未读和查看历史。"
+    },
+    {
+      title: "为什么要配置 API Key",
+      body: "BriefyPet 需要调用模型能力来理解内容、生成摘要和推荐结果。\n未配置或校验失败时，应用将无法正常分析内容。"
+    },
+    {
+      title: "为什么要填写兴趣偏好",
+      body: "你的兴趣偏好会影响内容推荐结果。\n写得越具体，推送、摘要和排序通常越准确。"
+    },
+    {
+      title: "首次抓取说明",
+      body: "首次启动后，BriefyPet 会先进行一次历史内容抓取与分析。\n为了保证信息质量，耗时较长属于正常现象，请耐心等待。"
+    },
+    {
+      title: "项目与联系",
+      body:
+        "项目源码：\nhttps://github.com/DonkeyKing01/BriefyPet\n开发者邮箱：\nQingyang Jin: jinqingyang01@sjtu.edu.cn\nYuecheng He: 24300680058@m.fudan.edu.cn\n欢迎提交 PR 和联系我们。"
+    },
+    {
+      title: "之后如何再次查看",
+      body: "可点击主界面右上角的“帮助”重新打开本页。"
+    }
+  ] as const;
+  const [stepIndex, setStepIndex] = useState(0);
+  const isLastStep = stepIndex === steps.length - 1;
+
+  useEffect(() => {
+    const unlistenPromise = listen("briefy://help-opened", () => {
+      setStepIndex(0);
+    });
+
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, a")) {
+      pointerState.current = null;
+      return;
+    }
+
+    pointerState.current = {
+      x: event.clientX,
+      y: event.clientY,
+      dragging: false
+    };
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const state = pointerState.current;
+    if (!state || state.dragging) {
+      return;
+    }
+
+    const movedX = Math.abs(event.clientX - state.x);
+    const movedY = Math.abs(event.clientY - state.y);
+    if (movedX + movedY < 4) {
+      return;
+    }
+
+    state.dragging = true;
+    void appWindow.startDragging();
+  }
+
+  function handlePointerEnd() {
+    pointerState.current = null;
+  }
+
+  async function handleClose(complete: boolean) {
+    await dismissHelpWindow(complete);
+  }
+
+  return (
+    <div className="help-window">
+      <div className="help-card">
+        <div
+          className="help-card-top"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          onPointerLeave={handlePointerEnd}
+        >
+          <span className="help-eyebrow">Guide</span>
+          <button className="help-close" onClick={() => void handleClose(true)}>
+            跳过引导
+          </button>
+        </div>
+        <div className="help-progress">
+          {steps.map((_, index) => (
+            <span
+              key={index}
+              className={`help-progress-dot${index === stepIndex ? " active" : ""}`}
+            />
+          ))}
+        </div>
+        <div className="help-body">
+          <h1>{steps[stepIndex].title}</h1>
+          <p>{steps[stepIndex].body}</p>
+        </div>
+        <div className="help-actions">
+          {stepIndex > 0 && (
+            <button className="help-secondary" onClick={() => setStepIndex((prev) => prev - 1)}>
+              上一步
+            </button>
+          )}
+          {isLastStep ? (
+            <button className="help-primary" onClick={() => void handleClose(true)}>
+              完成
+            </button>
+          ) : (
+            <button className="help-primary" onClick={() => setStepIndex((prev) => prev + 1)}>
+              下一步
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MemoryReviewWindow({ proposal }: { proposal: MemoryReviewProposal | null | undefined }) {
+  const [draft, setDraft] = useState(proposal?.proposedSummary ?? "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraft(proposal?.proposedSummary ?? "");
+    setError(null);
+  }, [proposal?.id, proposal?.proposedSummary]);
+
+  async function handleSubmit(action: "accept" | "modify" | "reject") {
+    if (!proposal) {
+      return;
+    }
+    if (action === "modify" && !draft.trim()) {
+      setError("修改后的兴趣记忆不能为空。");
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      await submitMemoryReview(action, action === "modify" ? draft.trim() : undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交记忆确认失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="memory-review-window">
+      <div className="memory-review-card">
+        <div className="memory-review-head">
+          <span className="help-eyebrow">Weekly Memory Review</span>
+          <strong>本周兴趣记忆更新</strong>
+        </div>
+        {proposal ? (
+          <>
+            <p className="memory-review-copy">
+              系统已根据你本周的收藏内容、笔记和原始兴趣描述，生成一条更细的兴趣记忆。此窗口不能直接关闭，请选择接受、修改或拒绝。
+            </p>
+            <div className="memory-review-panel">
+              <h3>当前基线</h3>
+              <p>{proposal.baseSummary || "暂无已确认兴趣记忆，将以你当前填写的兴趣偏好为主。"}</p>
+            </div>
+            <div className="memory-review-panel">
+              <h3>候选更新</h3>
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="在这里修改本周候选兴趣记忆"
+              />
+            </div>
+            {error && <div className="error-banner">{error}</div>}
+            <div className="memory-review-actions">
+              <button
+                className="ghost"
+                disabled={saving}
+                onClick={() => void handleSubmit("reject")}
+              >
+                拒绝
+              </button>
+              <button
+                className="ghost"
+                disabled={saving}
+                onClick={() => void handleSubmit("modify")}
+              >
+                {saving ? "提交中..." : "修改后接受"}
+              </button>
+              <button disabled={saving} onClick={() => void handleSubmit("accept")}>
+                {saving ? "提交中..." : "直接接受"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="memory-review-panel">
+            <p>当前没有待确认的周度兴趣记忆。</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsView({
   snapshot,
   forceDisciplineSelection,
@@ -1123,17 +1603,32 @@ function SettingsView({
   setSnapshot: React.Dispatch<React.SetStateAction<Snapshot | null>>;
 }) {
   const [saving, setSaving] = useState(false);
+  const [activeSection, setActiveSection] = useState<"llm" | "radar" | "memory" | "sources" | "advanced" | "reset">(
+    forceDisciplineSelection ? "radar" : "llm"
+  );
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [addingSource, setAddingSource] = useState(false);
   const [addSourceError, setAddSourceError] = useState<string | null>(null);
   const [customName, setCustomName] = useState("");
   const [customUrl, setCustomUrl] = useState("");
   const [customModule, setCustomModule] = useState<SourceModule>("technology");
-  const [customBucket, setCustomBucket] = useState<SourceBucket>("blogs");
+  const [customBucket, setCustomBucket] = useState<SourceBucket>("ai_and_cs");
+  const [customGroup, setCustomGroup] = useState<SourceGroup>("blogs");
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>(snapshot.settings.llmProvider);
+  const [llmProtocol, setLlmProtocol] = useState<LlmProtocol>(snapshot.settings.llmProtocol);
+  const [llmBaseUrl, setLlmBaseUrl] = useState(snapshot.settings.llmBaseUrl);
+  const [llmCustomProviderName, setLlmCustomProviderName] = useState(
+    snapshot.settings.llmCustomProviderName
+  );
+  const [llmModel, setLlmModel] = useState(snapshot.settings.llmModel);
+  const [llmModelName, setLlmModelName] = useState(snapshot.settings.llmModelName);
+  const [providerApiKeyDrafts, setProviderApiKeyDrafts] = useState<Record<string, string>>(
+    snapshot.settings.providerApiKeys
+  );
 
-  const disciplinePrefs = useMemo(
-    () => sortDisciplinePrefs(snapshot.settings.disciplines),
-    [snapshot.settings.disciplines]
+  const modulePrefs = useMemo(
+    () => sortModulePrefs(snapshot.settings.modulePreferences),
+    [snapshot.settings.modulePreferences]
   );
 
   const groupedSources = useMemo(
@@ -1142,28 +1637,146 @@ function SettingsView({
   );
 
   const sortedModules = MODULE_ORDER.filter((module) => groupedSources.has(module));
+  const providerDefinition = getProviderDefinition(llmProvider);
+  const availableModels = llmProvider === "custom" ? [] : providerDefinition.models;
+  const activeApiKeyKey = activeProviderApiKeyKey(llmProvider, llmCustomProviderName);
+  const activeApiKey = providerApiKeyDrafts[activeApiKeyKey] ?? "";
+  const customBucketOptions = useMemo(() => {
+    const fromCatalog = groupedSources.get(customModule);
+    const values = fromCatalog ? [...fromCatalog.keys()] : MODULE_BUCKET_MAP[customModule];
+    return values.length > 0 ? values : ["general"];
+  }, [customModule, groupedSources]);
+  const customGroupOptions = useMemo(() => {
+    const fromCatalog = groupedSources.get(customModule)?.get(customBucket);
+    const values = fromCatalog ? [...fromCatalog.keys()] : ["blogs", "official", "community", "frontier", "opinion"];
+    return values.length > 0 ? values : ["general"];
+  }, [customBucket, customModule, groupedSources]);
+
+  useEffect(() => {
+    setLlmProvider(snapshot.settings.llmProvider);
+    setLlmProtocol(snapshot.settings.llmProtocol);
+    setLlmBaseUrl(snapshot.settings.llmBaseUrl);
+    setLlmCustomProviderName(snapshot.settings.llmCustomProviderName);
+    setLlmModel(snapshot.settings.llmModel);
+    setLlmModelName(snapshot.settings.llmModelName);
+    setProviderApiKeyDrafts(snapshot.settings.providerApiKeys);
+  }, [
+    snapshot.settings.llmBaseUrl,
+    snapshot.settings.llmCustomProviderName,
+    snapshot.settings.llmModel,
+    snapshot.settings.llmModelName,
+    snapshot.settings.llmProtocol,
+    snapshot.settings.llmProvider,
+    snapshot.settings.providerApiKeys
+  ]);
+
+  useEffect(() => {
+    if (!customBucketOptions.includes(customBucket)) {
+      setCustomBucket(customBucketOptions[0]);
+    }
+  }, [customBucket, customBucketOptions]);
+
+  useEffect(() => {
+    if (!customGroupOptions.includes(customGroup)) {
+      setCustomGroup(customGroupOptions[0]);
+    }
+  }, [customGroup, customGroupOptions]);
+
+  useEffect(() => {
+    if (llmProvider === "custom" || availableModels.length === 0) {
+      return;
+    }
+    if (availableModels.some((item) => item.id === llmModel)) {
+      return;
+    }
+    setLlmModel(availableModels[0].id);
+    setLlmModelName(availableModels[0].name);
+  }, [availableModels, llmModel, llmProvider]);
+
+  function updateActiveApiKey(value: string) {
+    setProviderApiKeyDrafts((prev) => ({
+      ...prev,
+      [activeApiKeyKey]: value
+    }));
+  }
+
+  function applyProviderDefaults(nextProvider: LlmProvider) {
+    const nextDefinition = getProviderDefinition(nextProvider);
+    if (nextProvider === "custom") {
+      setLlmProtocol(snapshot.settings.llmProtocol || "openai-compatible");
+      setLlmBaseUrl(snapshot.settings.llmBaseUrl);
+      setLlmCustomProviderName(snapshot.settings.llmCustomProviderName);
+      setLlmModel(snapshot.settings.llmModel);
+      setLlmModelName(snapshot.settings.llmModelName);
+      return;
+    }
+
+    const nextModel = nextDefinition.models[0];
+    setLlmProtocol(nextDefinition.protocol);
+    setLlmBaseUrl(nextDefinition.baseUrl);
+    setLlmModel(nextModel?.id ?? "");
+    setLlmModelName(nextModel?.name ?? "");
+  }
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const formData = new FormData(event.currentTarget);
-    const llmProvider = String(formData.get("llmProvider") ?? "deepseek") as LlmProvider;
     const providerApiKeys = Object.fromEntries(
-      PROVIDER_OPTIONS.map((provider) => [
-        provider.value,
-        String(formData.get(`apiKey-${provider.value}`) ?? "").trim()
-      ])
+      Object.entries(providerApiKeyDrafts).map(([key, value]) => [key, value.trim()])
     );
+    providerApiKeys[activeApiKeyKey] = activeApiKey.trim();
 
-    const disciplines = disciplinePrefs.map((item) => ({
-      discipline: item.discipline,
-      enabled: formData.get(`discipline-enabled-${item.discipline}`) === "on",
-      preference: String(formData.get(`discipline-pref-${item.discipline}`) ?? "")
+    const modulePreferences = modulePrefs.map((item) => ({
+      module: item.module,
+      enabled: formData.get(`module-enabled-${item.module}`) === "on",
+      preference: String(formData.get(`module-pref-${item.module}`) ?? ""),
+      selectedBuckets: formData
+        .getAll(`module-bucket-${item.module}`)
+        .map((value) => String(value))
+        .filter(Boolean)
     }));
 
-    if (!disciplines.some((item) => item.enabled)) {
-      setSubmitError("请至少选择 1 个感兴趣学科，才能进入三栏阅读模式。");
+    if (!modulePreferences.some((item) => item.enabled)) {
+      setSubmitError("请至少启用 1 个一级学科，Briefy 才能开始为你抓取和筛选。");
       return;
+    }
+
+    const invalidModulePreference = modulePreferences.find(
+      (item) =>
+        item.enabled &&
+        (item.selectedBuckets.length === 0 || item.preference.trim().length === 0)
+    );
+    if (invalidModulePreference) {
+      setSubmitError(`请补全「${MODULE_LABELS[invalidModulePreference.module as SourceModule] ?? invalidModulePreference.module}」的二级学科选择和一句话兴趣。`);
+      return;
+    }
+
+    if (llmProvider === "custom") {
+      if (!llmCustomProviderName.trim()) {
+        setSubmitError("自定义服务请填写 Provider。");
+        return;
+      }
+      if (!llmProtocol.trim()) {
+        setSubmitError("自定义服务请选择 API 协议。");
+        return;
+      }
+      if (!llmBaseUrl.trim()) {
+        setSubmitError("自定义服务请填写 Base URL。");
+        return;
+      }
+      if (!llmModel.trim()) {
+        setSubmitError("自定义服务请填写 Model ID。");
+        return;
+      }
+      if (!llmModelName.trim()) {
+        setSubmitError("自定义服务请填写 Model Name。");
+        return;
+      }
+      if (!activeApiKey.trim()) {
+        setSubmitError("自定义服务请填写 API Key。");
+        return;
+      }
     }
 
     const rssSources = snapshot.settings.rssSources.map((source) => ({
@@ -1171,13 +1784,34 @@ function SettingsView({
       enabled: formData.get(`source-${source.id}`) === "on"
     }));
 
+    const moduleFetchIntervals = Object.fromEntries(
+      MODULE_ORDER.map((module) => {
+        const raw = Number(formData.get(`module-fetch-${module}`) ?? 12);
+        return [module, Number.isFinite(raw) ? Math.max(1, Math.min(168, raw)) : 12];
+      })
+    ) as Record<SourceModule, number>;
+
+    const modulePushTopN = Object.fromEntries(
+      MODULE_ORDER.map((module) => {
+        const raw = Number(formData.get(`module-push-topn-${module}`) ?? 6);
+        return [module, Number.isFinite(raw) ? Math.max(1, Math.min(24, raw)) : 6];
+      })
+    ) as Record<SourceModule, number>;
+
     const payload: SettingsPayload = {
-      apiKey: providerApiKeys[llmProvider] ?? "",
+      apiKey: activeApiKey.trim(),
       llmProvider,
-      llmModel: String(formData.get("llmModel") ?? "").trim(),
+      llmProtocol,
+      llmBaseUrl: llmBaseUrl.trim(),
+      llmCustomProviderName: llmCustomProviderName.trim(),
+      llmModelName: llmModelName.trim(),
+      llmModel: llmModel.trim(),
       providerApiKeys,
+      moduleFetchIntervals,
+      modulePushTopN,
       autoStart: formData.get("autoStart") === "on",
-      disciplines,
+      modulePreferences,
+      disciplines: snapshot.settings.disciplines,
       memoryModeEnabled: formData.get("memoryModeEnabled") === "on",
       memorySummary: snapshot.settings.memorySummary,
       rssSources
@@ -1205,11 +1839,18 @@ function SettingsView({
     setAddingSource(true);
     setAddSourceError(null);
     try {
-      const next = await addCustomRssSource(customName, customUrl, customModule, customBucket);
+      const next = await addCustomRssSource(
+        customName,
+        customUrl,
+        customModule,
+        customBucket,
+        customGroup
+      );
       setSnapshot(next);
       setCustomName("");
       setCustomUrl("");
-      setCustomBucket("blogs");
+      setCustomBucket(customBucketOptions[0]);
+      setCustomGroup(customGroupOptions[0]);
     } catch (err) {
       setAddSourceError(err instanceof Error ? err.message : "新增 RSS 失败");
     } finally {
@@ -1228,22 +1869,69 @@ function SettingsView({
   }
 
   return (
-    <form className="settings-view" onSubmit={handleSave}>
-      {submitError && <div className="error-banner">{submitError}</div>}
-      {forceDisciplineSelection && (
-        <div className="onboarding-hint">
-          首次进入请先选择感兴趣学科。保存后，左侧订阅池将只展示这些学科的订阅源。
+    <form className="settings-shell" onSubmit={handleSave}>
+      {/* ── Left Nav ───────────────────────────── */}
+      <nav className="settings-nav">
+        <span className="settings-nav-label">配置</span>
+        <button type="button" className={`settings-nav-item${activeSection === "llm" ? " active" : ""}`} onClick={() => setActiveSection("llm")}>
+          <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="9.5" r="3.5"/><path d="M9.2 6.8l4.3-4.3M12 2.5l2 2"/></svg>
+          启动配置
+        </button>
+        <button type="button" className={`settings-nav-item${activeSection === "radar" ? " active" : ""}`} onClick={() => setActiveSection("radar")}>
+          <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="8" r="2"/><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5V1M8 15v-1.5M1 8H2.5M13.5 8H15"/></svg>
+          兴趣雷达
+        </button>
+        <button type="button" className={`settings-nav-item${activeSection === "memory" ? " active" : ""}`} onClick={() => setActiveSection("memory")}>
+          <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M4 6h8M4 9h8M4 12h4"/></svg>
+          周度记忆
+        </button>
+        <span className="settings-nav-label">数据</span>
+        <button type="button" className={`settings-nav-item${activeSection === "sources" ? " active" : ""}`} onClick={() => setActiveSection("sources")}>
+          <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="8" cy="4.5" rx="5.5" ry="2"/><path d="M2.5 4.5v7c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2v-7"/><path d="M2.5 8c0 1.1 2.46 2 5.5 2s5.5-.9 5.5-2"/></svg>
+          信源管理
+        </button>
+        <button type="button" className={`settings-nav-item${activeSection === "advanced" ? " active" : ""}`} onClick={() => setActiveSection("advanced")}>
+          <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="M2 4h12M2 8h12M2 12h12"/><circle cx="5" cy="4" r="1.5" fill="currentColor" stroke="none"/><circle cx="11" cy="8" r="1.5" fill="currentColor" stroke="none"/><circle cx="7" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg>
+          高级设置
+        </button>
+        <div className="settings-nav-spacer" />
+        <div className="settings-nav-bottom">
+          <button type="button" className={`settings-nav-item danger-item${activeSection === "reset" ? " active" : ""}`} onClick={() => setActiveSection("reset")}>
+            <svg className="settings-nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="M13.5 8A5.5 5.5 0 112.5 5.5"/><path d="M2 2.5l1 3 3-1"/></svg>
+            全量重置
+          </button>
+          <button type="submit" className="settings-save-btn" disabled={saving}>
+            {saving ? "保存中..." : "保存设置"}
+          </button>
         </div>
-      )}
+      </nav>
 
-      <section className="settings-card">
+      {/* ── Right Content ───────────────────────── */}
+      <div className="settings-content">
+        {submitError && <div className="error-banner">{submitError}</div>}
+        {forceDisciplineSelection && (
+          <div className="onboarding-hint">
+            首次进入请先选择感兴趣学科。保存后，左侧订阅池将只展示这些学科的订阅源。
+          </div>
+        )}
+        {/* ── 启动配置 ── */}
+        <div className={activeSection === "llm" ? "" : "settings-section-hidden"}>
+        <section className="settings-card">
         <div className="settings-section-head">
           <h2>启动门槛</h2>
-          <p>选择模型服务商并填写对应 Key；只有当前服务商 Key 生效。</p>
+          <p>先选服务商，再选模型；只有当前服务商的 API Key 会参与抓取后的分析与评分。</p>
         </div>
         <label>
           <span>模型服务商</span>
-          <select name="llmProvider" defaultValue={snapshot.settings.llmProvider}>
+          <select
+            name="llmProvider"
+            value={llmProvider}
+            onChange={(event) => {
+              const nextProvider = event.target.value as LlmProvider;
+              setLlmProvider(nextProvider);
+              applyProviderDefaults(nextProvider);
+            }}
+          >
             {PROVIDER_OPTIONS.map((provider) => (
               <option key={provider.value} value={provider.value}>
                 {provider.label}
@@ -1251,28 +1939,107 @@ function SettingsView({
             ))}
           </select>
         </label>
+
+        {llmProvider === "custom" ? (
+          <div className="settings-stack">
+            <div className="discipline-grid">
+              <label>
+                <span>Provider</span>
+                <input
+                  type="text"
+                  value={llmCustomProviderName}
+                  onChange={(event) => setLlmCustomProviderName(event.target.value)}
+                  placeholder="例如：My Provider"
+                />
+              </label>
+              <label>
+                <span>API 协议</span>
+                <select
+                  value={llmProtocol}
+                  onChange={(event) => setLlmProtocol(event.target.value as LlmProtocol)}
+                >
+                  {PROTOCOL_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              <span>Base URL</span>
+              <input
+                type="text"
+                value={llmBaseUrl}
+                onChange={(event) => setLlmBaseUrl(event.target.value)}
+                placeholder="https://your-provider.example.com/v1"
+              />
+            </label>
+            <div className="discipline-grid">
+              <label>
+                <span>Model ID</span>
+                <input
+                  type="text"
+                  value={llmModel}
+                  onChange={(event) => setLlmModel(event.target.value)}
+                  placeholder="model_id"
+                />
+              </label>
+              <label>
+                <span>Model Name</span>
+                <input
+                  type="text"
+                  value={llmModelName}
+                  onChange={(event) => setLlmModelName(event.target.value)}
+                  placeholder="model_name"
+                />
+              </label>
+            </div>
+          </div>
+        ) : (
+          <div className="settings-stack">
+            <div className="discipline-grid">
+              <label>
+                <span>模型</span>
+                <select
+                  value={llmModel}
+                  onChange={(event) => {
+                    const nextModelId = event.target.value;
+                    const nextModel = availableModels.find((item) => item.id === nextModelId);
+                    setLlmModel(nextModelId);
+                    setLlmModelName(nextModel?.name ?? nextModelId);
+                  }}
+                >
+                  {availableModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>API 协议</span>
+                <input type="text" value={providerDefinition.protocol} readOnly />
+              </label>
+            </div>
+            <label>
+              <span>Base URL</span>
+              <input type="text" value={providerDefinition.baseUrl} readOnly />
+            </label>
+          </div>
+        )}
+
         <label>
-          <span>模型覆盖（可选）</span>
+          <span>API Key</span>
           <input
-            name="llmModel"
-            type="text"
-            defaultValue={snapshot.settings.llmModel}
-            placeholder="留空则使用服务商默认模型"
+            type="password"
+            value={activeApiKey}
+            onChange={(event) => updateActiveApiKey(event.target.value)}
+            placeholder={providerDefinition.apiKeyHint}
           />
         </label>
-        {PROVIDER_OPTIONS.map((provider) => (
-          <label key={provider.value}>
-            <span>{provider.label} API Key</span>
-            <input
-              name={`apiKey-${provider.value}`}
-              type="password"
-              defaultValue={snapshot.settings.providerApiKeys?.[provider.value] ?? ""}
-              placeholder={`输入 ${provider.label} 的 API Key`}
-            />
-          </label>
-        ))}
-        <div className="settings-hint">当前激活服务商：{snapshot.settings.llmProvider}</div>
-        <div className="settings-hint">当前激活 Key：{snapshot.settings.apiKey ? "已设置" : "未设置"}</div>
+        <div className="settings-hint">当前激活服务商：{llmProvider}</div>
+        <div className="settings-hint">当前激活 Key：{activeApiKey.trim() ? "已设置" : "未设置"}</div>
         <div className="settings-hint">
           保存后会自动校验并开始抓取。评分并发固定为 20，失败项会标记失败且不重复打分。
         </div>
@@ -1281,37 +2048,64 @@ function SettingsView({
           <span>开机启动</span>
         </label>
       </section>
+        </div>{/* end llm */}
 
-      <section className="settings-card">
+        {/* ── 兴趣雷达 ── */}
+        <div className={activeSection === "radar" ? "" : "settings-section-hidden"}>
+        <section className="settings-card">
         <div className="settings-section-head">
-          <h2>结构化兴趣</h2>
-          <p>为每个启用学科填写偏好，系统会据此完成摘要和推送判定。</p>
+          <h2>兴趣雷达</h2>
+          <p>先选一级学科，再勾选二级学科，最后写下一句你真正想看到什么。Briefy 会按这里的结构做抓取和评分。</p>
         </div>
         <div className="discipline-grid">
-          {disciplinePrefs.map((item) => (
-            <div key={item.discipline} className="discipline-card">
+          {modulePrefs.map((item) => {
+            const module = item.module as SourceModule;
+            const bucketOptions = groupedSources.get(module)
+              ? [...groupedSources.get(module)!.keys()]
+              : MODULE_BUCKET_MAP[module] ?? [];
+            return (
+            <div key={item.module} className="discipline-card">
               <label className="discipline-toggle">
                 <input
-                  name={`discipline-enabled-${item.discipline}`}
+                  name={`module-enabled-${item.module}`}
                   type="checkbox"
                   defaultChecked={item.enabled}
                 />
-                <span>{DISCIPLINE_LABELS[item.discipline]}</span>
+                <span>{MODULE_LABELS[module] ?? item.module}</span>
               </label>
+              <div className="module-bucket-grid">
+                {bucketOptions.map((bucket) => (
+                  <label key={`${item.module}-${bucket}`} className="module-bucket-chip">
+                    <input
+                      name={`module-bucket-${item.module}`}
+                      type="checkbox"
+                      value={bucket}
+                      defaultChecked={item.selectedBuckets.includes(bucket)}
+                    />
+                    <span>{bucketLabel(bucket)}</span>
+                  </label>
+                ))}
+              </div>
               <textarea
-                name={`discipline-pref-${item.discipline}`}
+                name={`module-pref-${item.module}`}
                 defaultValue={item.preference}
-                placeholder={`写下你在 ${DISCIPLINE_LABELS[item.discipline]} 方向最想收到的内容`}
+                placeholder={`例如：围绕${MODULE_LABELS[module] ?? item.module}，优先看${bucketOptions
+                  .slice(0, 3)
+                  .map((bucket) => bucketLabel(bucket))
+                  .join(" / ")}里的高信号内容，偏好有方法论和判断标准的文章。`}
               />
             </div>
-          ))}
+          );})}
         </div>
       </section>
+        </div>{/* end radar */}
 
-      <section className="settings-card">
+        {/* ── 周度记忆 ── */}
+        <div className={activeSection === "memory" ? "" : "settings-section-hidden"}>
+        <section className="settings-card">
         <div className="settings-section-head">
-          <h2>每日兴趣记忆</h2>
-          <p>系统会基于你的阅读、收藏与笔记行为自动更新，不在前台手动编辑。</p>
+          <h2>周度兴趣记忆</h2>
+          <p>系统会在每周五晚九点（北京时间）基于本周星标、摘要和批注，生成一条更细化的兴趣描述，供你确认或修改。</p>
         </div>
         <label className="checkbox-row">
           <input
@@ -1319,57 +2113,133 @@ function SettingsView({
             type="checkbox"
             defaultChecked={snapshot.settings.memoryModeEnabled}
           />
-          <span>启用每日兴趣记忆</span>
+          <span>启用周度兴趣记忆</span>
         </label>
       </section>
+        </div>{/* end memory */}
 
-      <section className="settings-card">
+        {/* ── 信源管理 ── */}
+        <div className={activeSection === "sources" ? "" : "settings-section-hidden"}>
+        <section className="settings-card">
         <div className="settings-section-head">
-          <h2>源池开关</h2>
-          <p>按 module / bucket 折叠管理信源；取消勾选将清除该源历史。</p>
+          <h2>信源管理</h2>
+          <p>按学科 / 子分类 / 分组折叠查看。关闭某个信源后，它的历史内容会一起清掉，保证池子干净。</p>
         </div>
         <div className="source-groups">
           {sortedModules.map((module) => (
             <details key={module} className="source-discipline-block">
               <summary className="source-discipline-head">
-                <h3>{MODULE_LABELS[module]}</h3>
+                <div className="source-summary-main">
+                  <span className="source-chevron" aria-hidden="true">
+                    ▸
+                  </span>
+                  <h3>{MODULE_LABELS[module]}</h3>
+                </div>
+                <span className="source-summary-meta">
+                  {Array.from(groupedSources.get(module)?.values() ?? []).reduce(
+                    (total, groups) =>
+                      total +
+                      Array.from(groups.values()).reduce((groupTotal, sources) => groupTotal + sources.length, 0),
+                    0
+                  )}{" "}
+                  个源
+                </span>
               </summary>
-              {Array.from(groupedSources.get(module)!.entries()).map(([bucket, sources]) => (
+              {Array.from(groupedSources.get(module)!.entries()).map(([bucket, groups]) => (
                 <details key={`${module}-${bucket}`} className="source-kind-block">
                   <summary className="source-kind-head">
-                    <strong>{BUCKET_LABELS[bucket]}</strong>
-                    <span>
-                      {SOURCE_KIND_LABELS[sources[0].sourceKind]} · {sources.length} 个
-                    </span>
+                    <div className="source-summary-main">
+                      <span className="source-chevron" aria-hidden="true">
+                        ▸
+                      </span>
+                      <strong>{bucketLabel(bucket)}</strong>
+                    </div>
+                    <span>{Array.from(groups.values()).reduce((total, sources) => total + sources.length, 0)} 个</span>
                   </summary>
-                  <div className="rss-list">
-                    {sources.map((source) => (
-                      <label key={source.id} className="rss-item">
-                        <input
-                          name={`source-${source.id}`}
-                          type="checkbox"
-                          defaultChecked={source.enabled}
-                        />
-                        <div>
-                          <strong>{source.name}</strong>
-                          <span>
-                            {RESOURCE_TYPE_LABELS[source.resourceType]} · {source.url}
+                  {Array.from(groups.entries()).map(([group, sources]) => (
+                    <details key={`${module}-${bucket}-${group}`} className="source-group-block">
+                      <summary className="source-kind-head">
+                        <div className="source-summary-main">
+                          <span className="source-chevron" aria-hidden="true">
+                            ▸
                           </span>
+                          <strong>{groupLabel(group)}</strong>
                         </div>
-                      </label>
-                    ))}
-                  </div>
+                        <span>
+                          {SOURCE_KIND_LABELS[sources[0].sourceKind]} · {sources.length} 个
+                        </span>
+                      </summary>
+                      <div className="rss-list">
+                        {sources.map((source) => (
+                          <label key={source.id} className="rss-item">
+                            <input
+                              name={`source-${source.id}`}
+                              type="checkbox"
+                              defaultChecked={source.enabled}
+                            />
+                            <div>
+                              <strong>{source.name}</strong>
+                              <span>
+                                {RESOURCE_TYPE_LABELS[source.resourceType]} · {source.url}
+                              </span>
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    </details>
+                  ))}
                 </details>
               ))}
             </details>
           ))}
         </div>
       </section>
+        </div>{/* end sources */}
 
-      <section className="settings-card">
+        {/* ── 高级设置 ── */}
+        <div className={activeSection === "advanced" ? "" : "settings-section-hidden"}>
+        <details className="settings-card settings-advanced" open>
+        <summary className="settings-section-head">
+          <div>
+            <h2>高级设置</h2>
+            <p>这里可以调整各学科的抓取频率、每日推送数量上限，以及添加自定义 RSS 源。</p>
+          </div>
+        </summary>
+
+        <div className="discipline-grid settings-advanced-grid">
+          {MODULE_CONFIG_ORDER.map((module) => (
+            <label key={`fetch-${module}`}>
+              <span>{MODULE_LABELS[module]} 抓取间隔（小时）</span>
+              <input
+                name={`module-fetch-${module}`}
+                type="number"
+                min={1}
+                max={168}
+                defaultValue={snapshot.settings.moduleFetchIntervals[module]}
+              />
+            </label>
+          ))}
+        </div>
+
+        <div className="discipline-grid settings-advanced-grid">
+          {MODULE_CONFIG_ORDER.map((module) => (
+            <label key={`push-${module}`}>
+              <span>{MODULE_LABELS[module]} 推送 Top N</span>
+              <input
+                name={`module-push-topn-${module}`}
+                type="number"
+                min={1}
+                max={24}
+                defaultValue={snapshot.settings.modulePushTopN[module]}
+              />
+            </label>
+          ))}
+        </div>
+
+        <section className="settings-subsection">
         <div className="settings-section-head">
           <h2>自定义 RSS</h2>
-          <p>新增自己的 RSS 源并指定 module / bucket。</p>
+          <p>新增自己的 RSS 源，并补齐学科、子分类和分组。这样它才能进入正确的抓取和推送池。</p>
         </div>
         {addSourceError && <div className="error-banner">{addSourceError}</div>}
         <label>
@@ -1392,7 +2262,7 @@ function SettingsView({
         </label>
         <div className="discipline-grid">
           <label>
-            <span>Module</span>
+            <span>学科</span>
             <select
               value={customModule}
               onChange={(event) => setCustomModule(event.target.value as SourceModule)}
@@ -1405,14 +2275,27 @@ function SettingsView({
             </select>
           </label>
           <label>
-            <span>Bucket</span>
+            <span>子分类</span>
             <select
               value={customBucket}
               onChange={(event) => setCustomBucket(event.target.value as SourceBucket)}
             >
-              {BUCKET_ORDER.map((bucket) => (
+              {customBucketOptions.map((bucket) => (
                 <option key={bucket} value={bucket}>
-                  {BUCKET_LABELS[bucket]}
+                  {bucketLabel(bucket)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>分组</span>
+            <select
+              value={customGroup}
+              onChange={(event) => setCustomGroup(event.target.value as SourceGroup)}
+            >
+              {customGroupOptions.map((group) => (
+                <option key={group} value={group}>
+                  {groupLabel(group)}
                 </option>
               ))}
             </select>
@@ -1427,9 +2310,13 @@ function SettingsView({
             {addingSource ? "添加中..." : "添加自定义 RSS"}
           </button>
         </div>
-      </section>
+        </section>
+      </details>
+        </div>{/* end advanced */}
 
-      <section className="settings-card">
+        {/* ── 全量重置 ── */}
+        <div className={activeSection === "reset" ? "" : "settings-section-hidden"}>
+        <section className="settings-card">
         <div className="settings-section-head">
           <h2>全量重置</h2>
           <p>清空全部数据库与配置缓存并重启应用，恢复为首次启动状态。</p>
@@ -1441,11 +2328,9 @@ function SettingsView({
         </div>
       </section>
 
-      <div className="settings-actions">
-        <button type="submit" disabled={saving}>
-          {saving ? "保存中..." : "保存设置"}
-        </button>
-      </div>
+        </div>{/* end reset */}
+
+      </div>{/* end settings-content */}
     </form>
   );
 }
@@ -1494,19 +2379,21 @@ function MainWindow({
   const [isCompact, setIsCompact] = useState(false);
 
   const layoutRef = useRef<HTMLDivElement | null>(null);
+  const readerScrollRef = useRef<HTMLDivElement | null>(null);
   const resizeTargetRef = useRef<ResizeTarget | null>(null);
 
-  const interestedDisciplines = useMemo(() => {
-    const selected = new Set<Discipline>();
-    for (const item of snapshot?.settings.disciplines ?? []) {
-      if (item.enabled) {
-        selected.add(item.discipline);
+  const selectedModules = useMemo(() => {
+    const selected = new Map<string, Set<string>>();
+    for (const item of snapshot?.settings.modulePreferences ?? []) {
+      if (!item.enabled) {
+        continue;
       }
+      selected.set(item.module, new Set(item.selectedBuckets));
     }
     return selected;
-  }, [snapshot?.settings.disciplines]);
+  }, [snapshot?.settings.modulePreferences]);
 
-  const hasInterestedDiscipline = interestedDisciplines.size > 0;
+  const hasInterestedDiscipline = selectedModules.size > 0;
 
   const isConfigurationComplete = useMemo(() => {
     if (!snapshot) {
@@ -1518,12 +2405,14 @@ function MainWindow({
       return false;
     }
 
-    const enabled = snapshot.settings.disciplines.filter((item) => item.enabled);
+    const enabled = snapshot.settings.modulePreferences.filter((item) => item.enabled);
     if (enabled.length === 0) {
       return false;
     }
 
-    return enabled.every((item) => item.preference.trim().length > 0);
+    return enabled.every(
+      (item) => item.preference.trim().length > 0 && item.selectedBuckets.length > 0
+    );
   }, [snapshot]);
 
   const usingDemoData = false;
@@ -1537,8 +2426,8 @@ function MainWindow({
       return [];
     }
 
-    return sourcePool.filter((source) => sourceMatchesDisciplines(source, interestedDisciplines));
-  }, [snapshot?.settings.rssSources, usingDemoData, hasInterestedDiscipline, interestedDisciplines]);
+    return sourcePool.filter((source) => sourceMatchesModulePreferences(source, selectedModules));
+  }, [snapshot?.settings.rssSources, usingDemoData, hasInterestedDiscipline, selectedModules]);
 
   const activeSourceIds = useMemo(() => new Set(activeSources.map((source) => source.id)), [activeSources]);
   const sourceById = useMemo(
@@ -1563,10 +2452,8 @@ function MainWindow({
       return [];
     }
 
-    return dedupeArticles(
-      all.filter((a) => activeSourceIds.has(a.sourceId) || interestedDisciplines.has(a.discipline))
-    );
-  }, [snapshot?.articles, hasInterestedDiscipline, activeSourceIds, interestedDisciplines]);
+    return dedupeArticles(all.filter((a) => activeSourceIds.has(a.sourceId)));
+  }, [snapshot?.articles, hasInterestedDiscipline, activeSourceIds]);
 
   const articleById = useMemo(() => new Map(allArticles.map((article) => [article.id, article])), [allArticles]);
 
@@ -1593,7 +2480,8 @@ function MainWindow({
     for (const item of historyItems) {
       map.set(item.id, {
         module: item.module || "other",
-        bucket: item.bucket || "unspecified",
+        bucket: item.bucket || "general",
+        group: item.group || "general",
         sourceName: item.sourceName,
         pushedAt: item.batchCreatedAt ?? null
       });
@@ -1608,13 +2496,14 @@ function MainWindow({
   );
 
   const unreadArticles = useMemo(() => {
-    const unread = reminderArticles.filter(
-      (article) =>
-        !archivedUnreadSet.has(article.id) &&
-        ((reminderArticleIds.has(article.id) && article.isNew) || manualUnreadSet.has(article.id))
+    const pushedUnread = reminderArticles.filter(
+      (article) => !archivedUnreadSet.has(article.id) && reminderArticleIds.has(article.id) && article.isNew
     );
-    return dedupeArticles(unread);
-  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet]);
+    const manualUnread = allArticles.filter(
+      (article) => !archivedUnreadSet.has(article.id) && manualUnreadSet.has(article.id)
+    );
+    return dedupeArticles([...pushedUnread, ...manualUnread]);
+  }, [reminderArticles, reminderArticleIds, archivedUnreadSet, manualUnreadSet, allArticles]);
 
   const unreadIdSet = useMemo(() => new Set(unreadArticles.map((article) => article.id)), [unreadArticles]);
 
@@ -1689,7 +2578,7 @@ function MainWindow({
       }
 
       const module = meta.module || "other";
-      const bucket = meta.bucket || "unspecified";
+      const bucket = meta.bucket || "general";
       if (!tree.has(module)) {
         tree.set(module, new Map());
       }
@@ -1843,6 +2732,10 @@ function MainWindow({
   useEffect(() => {
     setNoteDraft(selectedArticle?.note ?? "");
   }, [selectedArticle?.id, selectedArticle?.note]);
+
+  useEffect(() => {
+    readerScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [selectedArticle?.id]);
 
   useEffect(() => {
     if (!selectedArticle || usingDemoData) {
@@ -2100,11 +2993,15 @@ function MainWindow({
     setInteractionMessage("已标记为未读");
   }
 
-  function handleOpenBrowser() {
+  async function handleOpenBrowser() {
     if (!selectedArticle) {
       return;
     }
-    window.open(selectedArticle.link, "_blank", "noopener,noreferrer");
+    try {
+      await shellOpen(selectedArticle.link);
+    } catch {
+      window.open(selectedArticle.link, "_blank", "noopener,noreferrer");
+    }
   }
 
   async function handleShare() {
@@ -2124,7 +3021,7 @@ function MainWindow({
     if (selection.kind === "unread") return "Unread";
     const sectionLabel = { today: "Today", favorites: "Favorites", history: "History" }[selection.section];
     const modLabel = MODULE_LABELS[selection.module as SourceModule] ?? selection.module;
-    const bktLabel = BUCKET_LABELS[selection.bucket as SourceBucket] ?? selection.bucket;
+    const bktLabel = bucketLabel(selection.bucket);
     return `${sectionLabel} · ${modLabel} / ${bktLabel}`;
   }, [selection]);
 
@@ -2132,7 +3029,7 @@ function MainWindow({
     ? MODULE_LABELS[selectedArticleMeta.module as SourceModule] ?? selectedArticleMeta.module
     : "未分类";
   const selectedBucketLabel = selectedArticleMeta
-    ? BUCKET_LABELS[selectedArticleMeta.bucket as SourceBucket] ?? selectedArticleMeta.bucket
+    ? bucketLabel(selectedArticleMeta.bucket)
     : "未分类";
   const selectedSourceLabel = selectedArticleMeta?.sourceName ?? selectedArticle?.sourceName ?? "未知来源";
   const selectedPublishedTime = selectedArticle
@@ -2207,14 +3104,22 @@ function MainWindow({
           >
             设置
           </button>
+          <button onClick={() => void openHelpWindow()}>
+            帮助
+          </button>
         </div>
       </header>
 
       {snapshot.lastError && snapshot.lastError.toLowerCase().includes("api key") && (
         <div className="error-banner">{snapshot.lastError}</div>
       )}
-      {interactionMessage && <div className="interaction-banner">{interactionMessage}</div>}
+      {interactionMessage && (
+        <div className="interaction-banner interaction-banner-floating">{interactionMessage}</div>
+      )}
       {loading && <div className="loading-strip">正在同步最新快照...</div>}
+      {snapshot.petStatus === "polling" && (
+        <div className="loading-strip">正在轮询检查是否有到点信源或待提醒内容...</div>
+      )}
       {snapshot.petStatus === "scanning" && (
         <div className="loading-strip">正在后台抓取并评分，本批次完成后会更新列表与提醒。</div>
       )}
@@ -2288,7 +3193,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2323,7 +3228,7 @@ function MainWindow({
                                     >
                                       <span className="feed-row-left">
                                         <span className="feed-name">
-                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                          {bucketLabel(bkt)}
                                         </span>
                                       </span>
                                       <span className="count-badge">{cnt}</span>
@@ -2380,7 +3285,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2415,7 +3320,7 @@ function MainWindow({
                                     >
                                       <span className="feed-row-left">
                                         <span className="feed-name">
-                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                          {bucketLabel(bkt)}
                                         </span>
                                       </span>
                                       <span className="count-badge">{cnt}</span>
@@ -2457,7 +3362,7 @@ function MainWindow({
                           return (
                             <div key={fk} className="folder-block">
                               <button
-                                className="folder-row"
+                                className="folder-row module-row"
                                 onClick={() =>
                                   setCollapsedFolders((prev) => ({ ...prev, [fk]: !fc }))
                                 }
@@ -2492,7 +3397,7 @@ function MainWindow({
                                     >
                                       <span className="feed-row-left">
                                         <span className="feed-name">
-                                          {BUCKET_LABELS[bkt as SourceBucket] ?? bkt}
+                                          {bucketLabel(bkt)}
                                         </span>
                                       </span>
                                       <span className="count-badge">{cnt}</span>
@@ -2550,8 +3455,8 @@ function MainWindow({
                   const moduleLabel = meta
                     ? MODULE_LABELS[meta.module as SourceModule] ?? meta.module
                     : "未分类";
-                  const bucketLabel = meta
-                    ? BUCKET_LABELS[meta.bucket as SourceBucket] ?? meta.bucket
+                  const bucketDisplayLabel = meta
+                    ? bucketLabel(meta.bucket)
                     : "未分类";
                   const sourceLabel = meta?.sourceName ?? article.sourceName;
                   const timelineTime = formatArticleTime(
@@ -2575,7 +3480,7 @@ function MainWindow({
                         <h3>{article.title}</h3>
                       </div>
                       <p className="timeline-meta">
-                        MOD {moduleLabel} · BKT {bucketLabel} · PUB {timelineTime}
+                        MOD {moduleLabel} · BKT {bucketDisplayLabel} · PUB {timelineTime}
                         {article.fitScore > 0 && (
                           <span className="score-chip"> · {article.fitScore}分</span>
                         )}
@@ -2635,7 +3540,7 @@ function MainWindow({
                         <SymbolIcon name="star" className="toolbar-icon" />
                         {selectedArticle.isFavorite ? "取消星标" : "星标"}
                       </button>
-                      <button className="toolbar-button" onClick={handleOpenBrowser}>
+                      <button className="toolbar-button" onClick={() => void handleOpenBrowser()}>
                         <SymbolIcon name="open" className="toolbar-icon" />
                         浏览器打开
                       </button>
@@ -2646,43 +3551,43 @@ function MainWindow({
                     </div>
                   </header>
 
-                  <div className="reader-scroll">
+                  <div ref={readerScrollRef} className="reader-scroll">
                     <div className="reader-content-wrap">
                       <section className="reader-block">
-                        <h3>CHECK 简表</h3>
+                        <h3>信息简表</h3>
                         <div className="reader-check-grid">
                           <p>
-                            <strong>MOD</strong>
+                            <strong>学科</strong>
                             <span>{selectedModuleLabel}</span>
                           </p>
                           <p>
-                            <strong>BKT</strong>
+                            <strong>子分类</strong>
                             <span>{selectedBucketLabel}</span>
                           </p>
                           <p>
-                            <strong>SRC</strong>
+                            <strong>来源</strong>
                             <span>{selectedSourceLabel}</span>
                           </p>
                           <p>
-                            <strong>PUB</strong>
+                            <strong>发布时间</strong>
                             <span>{selectedPublishedTime}</span>
                           </p>
                           <p>
-                            <strong>PUSH</strong>
+                            <strong>推送时间</strong>
                             <span>{selectedPushedTime}</span>
                           </p>
                           <p>
-                            <strong>FIT</strong>
+                            <strong>匹配度</strong>
                             <span>
                               {fitLabel(selectedArticle.fitLevel)} / {selectedArticle.fitScore} 分
                             </span>
                           </p>
                           <p>
-                            <strong>FAV</strong>
+                            <strong>星标</strong>
                             <span>{selectedArticle.isFavorite ? "是" : "否"}</span>
                           </p>
                           <p>
-                            <strong>NOTE</strong>
+                            <strong>笔记</strong>
                             <span>{(selectedArticle.note ?? "").trim() ? "有" : "无"}</span>
                           </p>
                         </div>
@@ -2710,9 +3615,9 @@ function MainWindow({
                           onBlur={() => void handleSaveNote()}
                           placeholder="记录你的想法，失焦后自动保存"
                         />
-                        <p className="reader-score-line">
-                          {noteSaving ? "正在保存笔记..." : "提示：在 Unread 视图中双击同一条内容可归档"}
-                        </p>
+                        {noteSaving && (
+                          <p className="reader-score-line">正在保存笔记...</p>
+                        )}
                       </section>
 
                       <section className="reader-block">
@@ -2750,9 +3655,9 @@ function MainWindow({
 
 export default function App() {
   const [windowLabel, setWindowLabel] = useState(() => appWindow.label);
-  const isMainWindow = windowLabel === "main";
-  const { snapshot, setSnapshot, loading, error } = useSnapshotEvents(isMainWindow);
-  const overlaySnapshot = useOverlayEvents(!isMainWindow);
+  const usesSnapshotWindow = windowLabel === "main" || windowLabel === "memory-review";
+  const { snapshot, setSnapshot, loading, error } = useSnapshotEvents(usesSnapshotWindow);
+  const overlaySnapshot = useOverlayEvents(!usesSnapshotWindow);
 
   useEffect(() => {
     const label = appWindow.label;
@@ -2786,6 +3691,14 @@ export default function App() {
 
   if (windowLabel === "bubble") {
     return <BubbleWindow snapshot={overlaySnapshot} />;
+  }
+
+  if (windowLabel === "help") {
+    return <HelpWindow />;
+  }
+
+  if (windowLabel === "memory-review") {
+    return <MemoryReviewWindow proposal={snapshot?.memoryReview} />;
   }
 
   return (

@@ -40,7 +40,8 @@ pub async fn fetch_sources(sources: &[RssSource]) -> Result<FeedFetchOutcome> {
         .build()
         .context("failed to build rss client")?;
 
-    let mut results = fetch_sources_with_limit(&client, sources, MAX_CONCURRENT_SOURCE_FETCHES).await;
+    let mut results =
+        fetch_sources_with_limit(&client, sources, MAX_CONCURRENT_SOURCE_FETCHES).await;
     let retry_sources = results
         .iter()
         .filter_map(|result| {
@@ -84,13 +85,14 @@ async fn fetch_sources_with_limit(
     sources: &[RssSource],
     limit: usize,
 ) -> Vec<SourceFetchResult> {
-    let mut indexed_results = stream::iter(sources.iter().cloned().enumerate().map(|(idx, source)| {
-        let client = client.clone();
-        async move { (idx, fetch_single_source(client, source).await) }
-    }))
-    .buffer_unordered(limit.max(1))
-    .collect::<Vec<_>>()
-    .await;
+    let mut indexed_results =
+        stream::iter(sources.iter().cloned().enumerate().map(|(idx, source)| {
+            let client = client.clone();
+            async move { (idx, fetch_single_source(client, source).await) }
+        }))
+        .buffer_unordered(limit.max(1))
+        .collect::<Vec<_>>()
+        .await;
 
     indexed_results.sort_by_key(|(idx, _)| *idx);
     indexed_results
@@ -247,6 +249,7 @@ fn parse_rss_items(source: &RssSource, channel: &Channel) -> Vec<FeedArticle> {
             source_name: source.name.clone(),
             module: source.module.clone(),
             bucket: source.bucket.clone(),
+            group: source.group.clone(),
             discipline: source.discipline.clone(),
             source_kind: source.source_kind.clone(),
             resource_type: source.resource_type.clone(),
@@ -299,6 +302,7 @@ fn parse_atom_entries(source: &RssSource, feed: &Feed) -> Vec<FeedArticle> {
             source_name: source.name.clone(),
             module: source.module.clone(),
             bucket: source.bucket.clone(),
+            group: source.group.clone(),
             discipline: source.discipline.clone(),
             source_kind: source.source_kind.clone(),
             resource_type: source.resource_type.clone(),

@@ -1,4 +1,5 @@
 use chrono::Duration;
+use std::collections::BTreeMap;
 
 use crate::models::{FitLevel, SourceKind};
 
@@ -9,78 +10,143 @@ pub struct SourceRuntimePolicy {
     pub medium_cutoff: i64,
 }
 
+pub fn all_modules() -> &'static [&'static str] {
+    &[
+        "technology",
+        "social_science",
+        "business",
+        "design",
+        "science",
+        "medicine",
+        "other",
+    ]
+}
+
 pub fn normalize_module(raw: &str) -> String {
-    let value = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let value = slugify(raw);
     match value.as_str() {
         "technology" => "technology".to_string(),
-        "social_science" | "socialscience" => "social_science".to_string(),
-        "business" => "business".to_string(),
-        "personal_growth" | "growth" => "growth".to_string(),
-        "news_and_social_opinion" | "news_opinion" => "news_opinion".to_string(),
-        "entertainment" => "entertainment".to_string(),
+        "socialscience" | "social_science" | "social-science" => "social_science".to_string(),
+        "business" | "growth" | "life" => "business".to_string(),
+        "design" | "entertainment" | "humanities" => "design".to_string(),
         "science" => "science".to_string(),
         "medicine" => "medicine".to_string(),
+        "news" | "news_opinion" | "other" => "other".to_string(),
+        _ if value.is_empty() => "other".to_string(),
         _ => "other".to_string(),
     }
 }
 
-pub fn normalize_bucket(module: &str, raw: &str) -> String {
-    let module = normalize_module(module);
-    let value = raw.trim().to_ascii_lowercase().replace('-', "_");
-
-    if value.is_empty() {
-        return "unspecified".to_string();
-    }
-
-    match (module.as_str(), value.as_str()) {
-        // social_science 在部分目录中仍使用 research，这里统一到 academic_frontier。
-        ("social_science", "research") => "academic_frontier".to_string(),
+pub fn normalize_bucket(raw: &str) -> String {
+    let value = slugify(raw);
+    match value.as_str() {
+        "" => "general".to_string(),
+        "academic_frontier" => "frontier".to_string(),
+        "personal_opinion" | "media_opinion" | "streaming_opinion" | "community_opinion" => {
+            "opinion".to_string()
+        }
         _ => value,
     }
 }
 
-pub fn policy_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> SourceRuntimePolicy {
-    let module = normalize_module(module);
-    let bucket = normalize_bucket(&module, bucket);
-
-    let (high_cutoff, medium_cutoff) = match (module.as_str(), bucket.as_str(), source_kind) {
-        ("news_opinion", _, _) => (82, 64),
-        ("science", _, _) => (76, 58),
-        ("medicine", "academic_frontier", _) => (79, 61),
-        (_, _, SourceKind::AcademicJournal) => (78, 60),
-        (_, _, SourceKind::OfficialAnnouncement) => (74, 56),
-        (_, _, SourceKind::TechnicalBlog) => (72, 54),
-        (_, _, SourceKind::CommunityHotspot) => (80, 62),
-    };
-
-    let fetch_hours = match (module.as_str(), bucket.as_str()) {
-        ("technology", "research") => 24,
-        ("technology", _) => 6,
-        ("social_science", "academic_frontier") => 24,
-        ("social_science", _) => 6,
-        ("business", _) => 6,
-        ("news_opinion", _) => 6,
-        ("growth", _) => 24,
-        ("entertainment", _) => 24,
-        ("science", _) => 6,
-        ("medicine", "academic_frontier") => 24,
-        ("medicine", _) => 6,
-        _ => 6,
-    };
-
-    policy(fetch_hours, high_cutoff, medium_cutoff)
+pub fn normalize_group(raw: &str) -> String {
+    let value = slugify(raw);
+    match value.as_str() {
+        "" => "general".to_string(),
+        "academic_frontier" => "frontier".to_string(),
+        "personal_opinion" | "media_opinion" | "streaming_opinion" | "community_opinion" => {
+            "opinion".to_string()
+        }
+        _ => value,
+    }
 }
 
-pub fn fetch_interval_for_source(module: &str, bucket: &str, source_kind: &SourceKind) -> Duration {
-    policy_for_source(module, bucket, source_kind).fetch_interval
+pub fn default_module_fetch_interval_hours(module: &str) -> i64 {
+    match normalize_module(module).as_str() {
+        "technology" => 6,
+        _ => 12,
+    }
+}
+
+pub fn default_module_push_top_n(_module: &str) -> i64 {
+    6
+}
+
+pub fn default_module_fetch_intervals() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), default_module_fetch_interval_hours("technology")),
+        (
+            "social_science".to_string(),
+            default_module_fetch_interval_hours("social_science"),
+        ),
+        ("business".to_string(), default_module_fetch_interval_hours("business")),
+        ("design".to_string(), default_module_fetch_interval_hours("design")),
+        ("science".to_string(), default_module_fetch_interval_hours("science")),
+        ("medicine".to_string(), default_module_fetch_interval_hours("medicine")),
+        ("other".to_string(), default_module_fetch_interval_hours("other")),
+    ])
+}
+
+pub fn default_module_push_top_n_map() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), default_module_push_top_n("technology")),
+        (
+            "social_science".to_string(),
+            default_module_push_top_n("social_science"),
+        ),
+        ("business".to_string(), default_module_push_top_n("business")),
+        ("design".to_string(), default_module_push_top_n("design")),
+        ("science".to_string(), default_module_push_top_n("science")),
+        ("medicine".to_string(), default_module_push_top_n("medicine")),
+        ("other".to_string(), default_module_push_top_n("other")),
+    ])
+}
+
+pub fn policy_for_source(
+    module: &str,
+    source_group: &str,
+    source_kind: &SourceKind,
+) -> SourceRuntimePolicy {
+    let module = normalize_module(module);
+    let source_group = normalize_group(source_group);
+
+    let (high_cutoff, medium_cutoff) = match (module.as_str(), source_group.as_str(), source_kind) {
+        ("medicine", "clinical_trials", _) => (82, 66),
+        ("medicine", "regulatory_science", _) | ("medicine", "clinical_safety", _) => (80, 64),
+        ("science", _, SourceKind::AcademicJournal) => (79, 61),
+        (_, "official", SourceKind::OfficialAnnouncement) => (78, 60),
+        (_, "frontier", SourceKind::AcademicJournal) | (_, "academic", SourceKind::AcademicJournal) => {
+            (77, 59)
+        }
+        (_, "research", SourceKind::AcademicJournal) => (76, 58),
+        (_, "opinion", _) => (74, 56),
+        (_, "blogs", _) => (72, 54),
+        (_, "community", _) | (_, "news", _) => (75, 57),
+        _ => match source_kind {
+            SourceKind::AcademicJournal => (76, 58),
+            SourceKind::OfficialAnnouncement => (75, 57),
+            SourceKind::TechnicalBlog => (72, 54),
+            SourceKind::CommunityHotspot => (74, 56),
+        },
+    };
+
+    policy(
+        default_module_fetch_interval_hours(&module),
+        high_cutoff,
+        medium_cutoff,
+    )
+}
+
+pub fn fetch_interval_for_source(module: &str, source_group: &str, source_kind: &SourceKind) -> Duration {
+    policy_for_source(module, source_group, source_kind).fetch_interval
 }
 
 pub fn fetch_retry_interval_for_failed_source(
     module: &str,
-    bucket: &str,
+    source_group: &str,
     source_kind: &SourceKind,
 ) -> Duration {
-    let regular = fetch_interval_for_source(module, bucket, source_kind);
+    let regular = fetch_interval_for_source(module, source_group, source_kind);
     let half = regular / 2;
     let floor = Duration::minutes(30);
     let cap = Duration::hours(2);
@@ -95,11 +161,11 @@ pub fn fetch_retry_interval_for_failed_source(
 
 pub fn fit_level_for_score(
     module: &str,
-    bucket: &str,
+    source_group: &str,
     source_kind: &SourceKind,
     fit_score: i64,
 ) -> FitLevel {
-    let policy = policy_for_source(module, bucket, source_kind);
+    let policy = policy_for_source(module, source_group, source_kind);
     let score = fit_score.clamp(0, 100);
     if score >= policy.high_cutoff {
         FitLevel::High
@@ -118,34 +184,48 @@ fn policy(fetch_hours: i64, high_cutoff: i64, medium_cutoff: i64) -> SourceRunti
     }
 }
 
+fn slugify(raw: &str) -> String {
+    raw.trim()
+        .to_ascii_lowercase()
+        .replace('&', " and ")
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            _ => '_',
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_bucket, normalize_module, policy_for_source};
+    use super::{fit_level_for_score, normalize_bucket, normalize_group, normalize_module, policy_for_source};
     use crate::models::SourceKind;
 
     #[test]
-    fn normalizes_v3_module_aliases() {
-        assert_eq!(normalize_module("personal_growth"), "growth");
-        assert_eq!(normalize_module("news_and_social_opinion"), "news_opinion");
+    fn normalizes_modules_with_legacy_aliases() {
         assert_eq!(normalize_module("social-science"), "social_science");
+        assert_eq!(normalize_module("growth"), "business");
+        assert_eq!(normalize_module("entertainment"), "design");
     }
 
     #[test]
-    fn normalizes_social_science_research_bucket() {
-        assert_eq!(normalize_bucket("social_science", "research"), "academic_frontier");
+    fn normalizes_bucket_and_group_aliases() {
+        assert_eq!(normalize_bucket("academic_frontier"), "frontier");
+        assert_eq!(normalize_group("media_opinion"), "opinion");
     }
 
     #[test]
-    fn exposes_bucket_specific_policy() {
-        let tech_research = policy_for_source("technology", "research", &SourceKind::AcademicJournal);
-        let news_breaking = policy_for_source("news_opinion", "news", &SourceKind::CommunityHotspot);
-        let growth_blogs = policy_for_source("growth", "blogs", &SourceKind::TechnicalBlog);
-        let medicine_research =
-            policy_for_source("medicine", "academic_frontier", &SourceKind::AcademicJournal);
+    fn exposes_group_aware_policy() {
+        let official = policy_for_source("technology", "official", &SourceKind::OfficialAnnouncement);
+        let frontier = policy_for_source("social_science", "frontier", &SourceKind::AcademicJournal);
 
-        assert_eq!(tech_research.fetch_interval.num_hours(), 24);
-        assert_eq!(news_breaking.fetch_interval.num_hours(), 6);
-        assert_eq!(growth_blogs.fetch_interval.num_hours(), 24);
-        assert_eq!(medicine_research.fetch_interval.num_hours(), 24);
+        assert_eq!(official.fetch_interval.num_hours(), 6);
+        assert_eq!(frontier.fetch_interval.num_hours(), 12);
+        assert!(fit_level_for_score("technology", "official", &SourceKind::OfficialAnnouncement, 79)
+            == crate::models::FitLevel::High);
     }
 }

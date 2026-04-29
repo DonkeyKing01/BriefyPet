@@ -1,39 +1,83 @@
 # BriefyPet
 
-桌面上的信息雷达桌宠，用低打扰提醒帮用户筛出真正值得看的新内容。
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="BriefyPet icon" width="112" />
+</p>
 
-## 1. 项目简介 
+<p align="center">
+  <strong>静默守护你的桌面阅读助手</strong>
+</p>
 
-BriefyPet 不是传统 RSS 阅读器，而是一个常驻桌面的信息提醒伙伴。
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
+  <img alt="Tauri" src="https://img.shields.io/badge/Tauri-1.8-24C8DB">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-B7410E">
+</p>
 
-它要解决的问题是：
-- 信息源很多，但真正重要的内容很少
-- 用户不希望一直手动刷订阅、刷网页、刷社媒
-- 用户需要“被提醒”，但不希望被高频打扰
+## 什么是 BriefyPet
 
-它适合：
-- 需要持续跟踪科技、社科、医学、新闻等高价值信息的人
-- 想把 RSS、LLM 摘要、兴趣筛选和桌面提醒整合到一个应用里的人
-- 希望先被提醒、再决定是否深入阅读的人
+> 信息过载深感焦虑？
+>
+> 程源码部署复杂？
+>
+> 订阅信息滞留在邮箱和阅读器中懒得打开？
 
-典型使用场景：
-- 桌宠平时驻留桌面
-- 后端定时抓取 RSS 源
-- LLM 根据兴趣偏好做摘要、打分和推荐理由
-- 有高契合度内容时，用气泡提醒用户
-- 用户点击后进入主窗口统一阅读、收藏、记录笔记
+作为 AI Native 的一代大学生，我们深切体会到信息洪流下的极度兴奋和焦虑感；然而，我们总是辗转于二手中文信息平台，消费着被翻译乃至曲解的滞后转载信息；而一手优质信源由于语言、平台习惯等种种限制，难以快速获取和理解沉淀。
 
-## 2. 核心功能
+现有的阅读器和信息订阅网站始终没有解决的是：
 
-- 桌宠常驻桌面，支持托盘、置顶、主窗口联动
-- 内置 RSS 源池，支持按学科与模块筛选启用
-- LLM 生成摘要、契合度和推荐理由
-- 只对高价值内容触发汇总提醒，降低打扰
-- 主窗口支持 `Unread / Today / Favorites / History` 视图
-- 本地 SQLite 存储文章、提醒批次、用户偏好与运行状态
-- 支持 macOS 与 Windows 双平台构建
+1. 如何提高信息可达性，而非让信息滞留在专业软件和邮箱内
+2. 如何个性化定制用户需求，而不是让关注兴趣各异的用户收看相同推荐
+3. 如何尽可能降低非专业用户的使用门槛，避免复杂源码部署配置流程
+4. 如何形成长期记忆，便于用户进行知识沉淀以及介入兴趣校准
 
-## 3. 快速开始 
+BriefyPet，一个智能桌面阅读助手，正致力于从信源、个性化、记忆和可达性等全方位介入解决上述问题。
+
+它不是传统意义上的 RSS 阅读器，而是一个集收集、筛选与提醒于一体的智能桌面助手：先把控一手信源入口质量，再按用户兴趣偏好做摘要、契合度判断和推荐理由，最后只在真正值得优先阅读的内容出现时提醒你。
+
+## 功能
+
+- 可直接安装和运行的本地桌面应用，无需账号注册和源码安装；
+- 信息订阅通过 RSS 机制获取，无需爬虫和复杂 API 请求；
+- 桌宠仅在任务执行与提醒时出现，兼顾趣味性和低打扰、高可达性；
+- 个性化定制兴趣点，随使用过程持续校准；
+- LLM 自动生成中文摘要、契合度评分和推荐理由；
+- 支持文章阅读、原文打开、收藏、笔记、未读和历史记录；
+- 支持主流 LLM Provider 和自定义配置导入；
+- 数据本地保存，不依赖云端账号。
+
+## 快速开始
+
+### 下载安装包
+
+访问 [Release](https://github.com/DonkeyKing01/BriefyPet/releases) 或 [产品发布页](https://briefypet.netlify.app/) 下载安装包。首次启动后需要：
+
+1. 选择 LLM Provider；
+2. 填入对应供应商的 API Key；
+3. 选择关注模块与二级分类；
+4. 写下你的兴趣偏好。
+
+配置完成后，BriefyPet 会开始抓取 RSS、调用 LLM 摘要评分，并在高价值内容出现时提醒。
+
+常用 API Key 入口：
+
+- [OpenAI API Key](https://platform.openai.com/api-keys)
+- [Anthropic API Key](https://console.anthropic.com/settings/keys)
+- [Gemini API Key](https://aistudio.google.com/app/apikey)
+- [DeepSeek API Key](https://platform.deepseek.com/api_keys)
+- [Qwen API Key](https://help.aliyun.com/zh/dashscope/opening-service)
+- [MiniMax API Key](https://platform.minimax.io/docs/guides/quickstart)
+- [GLM API Key](https://docs.bigmodel.cn/)
+- [Kimi API Key](https://platform.moonshot.ai/console/api-keys)
+
+### 本地编译运行
+
+环境要求：
+
+- Node.js 18+
+- npm
+- Rust stable
+- Tauri 1.x 所需系统依赖
 
 安装依赖：
 
@@ -41,209 +85,153 @@ BriefyPet 不是传统 RSS 阅读器，而是一个常驻桌面的信息提醒�
 npm install
 ```
 
-前端开发：
+启动开发模式：
+
+```bash
+npm run tauri dev
+```
+
+只启动前端：
 
 ```bash
 npm run dev
 ```
 
-桌面应用开发模式：
+构建前端：
 
 ```bash
-npm run tauri -- dev
-```
-
-Windows 打包：
-
-```bash
-npm run tauri:build:windows:release
-```
-
-macOS 打包：
-
-```bash
-npm run tauri:build:mac:release-dmg
-```
-
-首次启动后的最小使用路径：
-
-1. 打开应用
-2. 在设置页填写可用的 LLM API Key
-3. 勾选感兴趣学科并填写兴趣偏好
-4. 保存设置，应用进入扫描
-5. 有高契合度内容时通过桌宠和气泡提醒进入主窗口查看
-
-## 4. 安装说明
-
-环境要求：
-
-- Node.js 18+
-- npm 9+
-- Rust stable
-- Tauri CLI
-
-平台说明：
-
-- macOS：用于产出 `.app` / `.dmg`
-- Windows：用于产出 `.msi` / `.exe`
-
-Windows 打包依赖：
-
-- WiX Toolset
-- NSIS
-- PowerShell 可执行环境
-
-macOS 打包依赖：
-
-- macOS 主机
-- shell/bash 环境
-- 对应架构的 Rust target
-
-说明：
-
-- 当前仓库是私有仓库
-- `reference/` 作为本地参考目录，不进入版本控制
-- 运行和打包都不依赖 `.env` 才能启动项目本体
-
-## 5. 使用方法 
-
-常用命令：
-
-```bash
-npm run dev
 npm run build
-npm run preview
-npm run tauri -- dev
 ```
 
-macOS 构建命令：
+macOS release DMG：
 
 ```bash
-npm run tauri:build:debug:sandbox-dmg
 npm run tauri:build:mac:release-dmg
 ```
 
-Windows 构建命令：
+Windows debug bundle：
 
-```bash
+```powershell
 npm run tauri:build:windows:debug
+```
+
+Windows release bundle：
+
+```powershell
 npm run tauri:build:windows:release
 ```
 
-当前已验证的 Windows 产物目录：
+打包产物默认位于：
 
 ```text
-src-tauri/target/debug/bundle/msi
-src-tauri/target/debug/bundle/nsis
-src-tauri/target/release/bundle/msi
-src-tauri/target/release/bundle/nsis
+src-tauri/target/release/bundle
 ```
 
-当前已保留的 macOS 产物目录：
+## 项目结构
 
 ```text
-src-tauri/target/debug/bundle/macos
-src-tauri/target/debug/bundle/dmg
-src-tauri/target/release/bundle/macos
-src-tauri/target/release/bundle/dmg
+BriefyPet/
+├── src/                         # React 前端
+│   ├── App.tsx                   # 主窗口、桌宠、气泡、帮助、记忆确认窗口
+│   ├── api.ts                    # Tauri command 调用封装
+│   ├── styles.css                # 前端样式
+│   └── types.ts                  # 前后端共享类型定义
+├── src-tauri/                    # Tauri/Rust 后端
+│   ├── src/
+│   │   ├── main.rs               # 应用入口、窗口、托盘和插件初始化
+│   │   ├── commands.rs           # 前端可调用命令
+│   │   ├── db.rs                 # SQLite 存储、迁移、快照、信源目录
+│   │   ├── rss.rs                # RSS/Atom 抓取与解析
+│   │   ├── llm.rs                # LLM 请求、摘要评分、记忆提炼
+│   │   ├── service.rs            # 调度、状态同步、提醒和记忆流程
+│   │   ├── policy.rs             # 模块、分类、抓取频率和评分策略
+│   │   ├── tray.rs               # 系统托盘
+│   │   └── models.rs             # Rust 数据模型
+│   ├── resources/
+│   │   └── rss-catalog.opml      # 内置信源目录
+│   ├── icons/                    # 应用图标
+│   └── tauri.conf.json           # Tauri 配置
+├── public/
+│   └── pets/briefy-ip/           # 桌宠主图和各状态动图
+├── docs/                         # README 截图素材
+├── scripts/                      # macOS/Windows 打包脚本
+├── package.json                  # 前端依赖和脚本
+└── vite.config.ts                # Vite 配置
 ```
 
-应用内配置方式：
+## 信源
 
-1. 在设置页选择 LLM 提供商
-2. 填写 API Key
-3. 勾选学科并填写兴趣偏好
-4. 调整 RSS 源启用状态
-5. 按需开启自动启动与记忆模式
+当前信源目录位于 `src-tauri/resources/rss-catalog.opml`，覆盖 6 个一级大类领域、24 个二级下属学科、47 个细分分类，总计 760+ 条订阅入口。重点关注科技、医学、基础科学、社会科学、设计和商业中的高质量来源。
 
-运行结果示例：
+| 一级领域 | 示例二级分类 | 典型来源 |
+| --- | --- | --- |
+| 科技与 AI | AI 与计算机、具身智能与机器人、HCI 研究 | 官方账号、研究团队、工程博客和高密度创作者观点 |
+| 社会科学 | 经济学、社会学、政治学 | 经济学、社会学、政治学前沿，以及严肃评论来源 |
+| 医学 | 临床医学、公共卫生、药物研发、生物医学工程 | 临床、公共卫生、生物工程和药物研发信号 |
+| 基础科学 | 生物、物理、化学与材料、环境科学、数学 | 物理、化学、生物与交叉前沿来源 |
+| 设计 | 产品与 UX、工程设计、创意设计、设计方法 | 产品与 UX 设计、HCI 研究和工程设计 |
+| 商业 | 媒体报道、行业观察、长期观点 | 商业媒体、行业观察和长期观点来源 |
 
-- RSS 抓取后，文章进入本地库
-- 高契合度内容进入提醒批次
-- 主窗口中可在 `Unread / Today / Favorites / History` 之间切换
+用户也可以在设置页新增自定义 RSS 源。新增信源会被归入对应模块与分类，并进入后续抓取、摘要和评分流程。
 
-## 6. 项目结构 
+## IP 形象
 
-```text
-src/                         React 前端界面
-src-tauri/                   Tauri + Rust 后端
-src-tauri/src/               窗口、抓取、数据库、调度、命令逻辑
-src-tauri/resources/         打包资源与 RSS 主目录
-public/                      桌宠素材与静态资源
-scripts/                     macOS / Windows 打包脚本
-config/                      预留配置目录
-reference/                   本地参考项目目录（默认不进 Git）
-Claude_DESIGN.md             设计参考文档
-Notion_DESIGN.md             设计参考文档
-```
+我们选用有着中华田园企鹅之称的夜鹭夜师傅作为我们的桌宠形象，它是安静、机敏又睿智的，默默筛选高价值信息，守护用户宝贵的注意力。
 
-关键代码定位：
+期待你在使用过程中触发夜鹭的以下状态：
 
-- 桌宠 / 气泡 / 主窗口前端：`src/App.tsx`
-- Tauri 启动与窗口创建：`src-tauri/src/main.rs`
-- Tauri 命令入口：`src-tauri/src/commands.rs`
-- 数据库与目录加载：`src-tauri/src/db.rs`
-- 调度与抓取流程：`src-tauri/src/service.rs`
-- RSS 抓取解析：`src-tauri/src/rss.rs`
-- LLM 调用：`src-tauri/src/llm.rs`
-- 策略与分桶：`src-tauri/src/policy.rs`
+| 状态 | 含义 | 预览 |
+| --- | --- | --- |
+| loading | 应用启动或加载中 | <img src="public/pets/briefy-ip/gifs/loading.gif" alt="loading" width="96" /><br>`public/pets/briefy-ip/gifs/loading.gif` |
+| needs-config | 尚未完成必要配置 | <img src="public/pets/briefy-ip/gifs/needs-config.gif" alt="needs-config" width="96" /><br>`public/pets/briefy-ip/gifs/needs-config.gif` |
+| polling | 定时轮询信源 | <img src="public/pets/briefy-ip/gifs/polling.gif" alt="polling" width="96" /><br>`public/pets/briefy-ip/gifs/polling.gif` |
+| scanning | 正在抓取、摘要和筛选 | <img src="public/pets/briefy-ip/gifs/scanning.gif" alt="scanning" width="96" /><br>`public/pets/briefy-ip/gifs/scanning.gif` |
+| idle | 当前无高优先级提醒 | <img src="public/pets/briefy-ip/gifs/idle.gif" alt="idle" width="96" /><br>`public/pets/briefy-ip/gifs/idle.gif` |
+| new-info | 有新内容值得阅读 | <img src="public/pets/briefy-ip/gifs/new-info.gif" alt="new-info" width="96" /><br>`public/pets/briefy-ip/gifs/new-info.gif` |
 
-## 7. 配置说明 
+## 运行效果
 
-当前项目主要通过应用内设置和本地数据库配置
+### 设置页
 
-应用内主要配置项：
+![BriefyPet settings view](docs/setting.png)
 
-- `apiKey`
-- `llmProvider`
-- `llmModel`
-- `providerApiKeys`
-- `autoStart`
-- `disciplines`
-- `memoryModeEnabled`
-- `memorySummary`
-- `rssSources`
+### 阅读页
 
-主要数据与状态存储：
+![BriefyPet reading view](docs/reading.png)
 
-- 主数据库：应用数据目录下的 `briefy-pet.db`
-- 推送/提醒数据库：应用数据目录下的 `briefy-pet-push.db`
+## 数据与隐私
 
-Windows 常用本地排障位置：
+BriefyPet 不要求注册云账号。文章、收藏、笔记、提醒队列、兴趣记忆和运行状态默认存储在本地 SQLite 数据库中。
 
-```text
-C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\briefy-pet.db
-C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\briefy-pet-push.db
-C:\Users\<User>\AppData\Roaming\com.briefypet.desktop\fetch-diagnostic.log
-```
+需要注意的是，摘要、评分和记忆提炼会调用用户配置的 LLM Provider。也就是说，发送给模型供应商的内容取决于你选择的接口和模型服务条款。项目本身不提供云端账号体系，也不会把本地数据库同步到项目服务器。
 
-默认行为说明：
+## Q&A
 
-- 没有有效 API Key 时，应用停留在待配置状态
-- 至少需要启用一个学科，且该学科偏好不能为空
-- 抓取频率由 `module + bucket` 策略控制
-- Windows `debug/release` 与 macOS `debug/release` 分别使用独立脚本
+### BriefyPet 是传统 RSS 阅读器吗？
 
-## 8. 开发日志
+不是。它更像一个“信源入口 + LLM 初筛 + 桌面提醒 + 阅读沉淀”的组合。你不需要不断手动打开信息流，BriefyPet 会筛除低质量噪音，把真正高契合的内容呈现给你。
 
-### Version1.0
+### 为什么强调一手优质信源？
 
-第一版完成了桌宠产品的基础闭环：
+学术前沿、官方发布和 Creator 观点更靠近信号源头，信息密度与价值更高，也更适合进入长期知识沉淀，而不是停留在二次包装后的热点消费。
 
-- 桌宠、气泡、主窗口三层结构打通
-- RSS 抓取、去重、本地 SQLite 存储接入
-- API Key、兴趣偏好、RSS 源管理、自动启动等设置页能力落地
-- LLM 摘要、契合度、推荐理由链路落地
-- 高契合度内容进入提醒批次
-- Windows & macOS 基础打包链路建立
+### 没有 API Key 可以使用吗？
 
-### Version2.0
+当前版本不支持无 Key 模式。没有可用 API Key 时，桌宠会停留在待配置状态，无法进入后续的摘要、契合度判断和推荐流程。
 
-第二版在结构、策略和交付上做了收敛和增强：
+## 致谢
 
-- RSS 源治理升级，按 `module + bucket` 组织
-- 学科和信源策略更明确，支持更稳定的抓取频率与提醒配额
-- 主窗口演进为 `Unread / Today / Favorites / History` 阅读结构
-- 引入本地推送池、历史流转和更清晰的文章归档逻辑
-- 支持笔记、收藏、原文查看等阅读增强能力
-- Windows & macOS 打包链路补齐
+感谢合作者 [Reed2006](https://github.com/Reed2006)
+
+感谢启发思路并一直支持我的 [Journeylzx](https://github.com/Journeylzx)
+
+以及感谢开发过程中提出宝贵意见的各位同仁们
+
+此外我们还受以下项目启发：
+
+- [BestBlogs](https://github.com/ginobefun/BestBlogs)
+- [clawd-on-desk](https://github.com/rullerzhou-afk/clawd-on-desk)
+
+## 许可证
+
+MIT

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum PetStatus {
     Loading,
     NeedsConfig,
+    Polling,
     Scanning,
     Idle,
     NewInfo,
@@ -109,6 +110,16 @@ pub struct UserDisciplinePreference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UserModulePreference {
+    pub module: String,
+    pub enabled: bool,
+    pub preference: String,
+    #[serde(default)]
+    pub selected_buckets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RssSource {
     pub id: String,
     pub name: String,
@@ -117,6 +128,8 @@ pub struct RssSource {
     pub module: String,
     #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
+    pub group: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,
@@ -133,11 +146,26 @@ pub struct SettingsPayload {
     pub api_key: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
+    #[serde(default = "default_llm_protocol")]
+    pub llm_protocol: String,
+    #[serde(default)]
+    pub llm_base_url: String,
+    #[serde(default)]
+    pub llm_custom_provider_name: String,
+    #[serde(default)]
+    pub llm_model_name: String,
     #[serde(default)]
     pub llm_model: String,
     #[serde(default)]
     pub provider_api_keys: BTreeMap<String, String>,
+    #[serde(default = "default_module_fetch_intervals")]
+    pub module_fetch_intervals: BTreeMap<String, i64>,
+    #[serde(default = "default_module_push_top_n")]
+    pub module_push_top_n: BTreeMap<String, i64>,
     pub auto_start: bool,
+    #[serde(default)]
+    pub module_preferences: Vec<UserModulePreference>,
+    #[serde(default)]
     pub disciplines: Vec<UserDisciplinePreference>,
     pub memory_mode_enabled: bool,
     pub memory_summary: String,
@@ -187,6 +215,7 @@ pub struct HistoryItem {
     pub source_name: String,
     pub module: String,
     pub bucket: String,
+    pub group: String,
     pub published_at: Option<String>,
     pub summary: String,
     pub fit_score: i64,
@@ -220,6 +249,17 @@ pub struct InterestMemoryRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryReviewProposal {
+    pub id: String,
+    pub week_key: String,
+    pub base_summary: String,
+    pub proposed_summary: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceCatalogSummary {
     pub total_sources: usize,
     pub enabled_sources: usize,
@@ -243,6 +283,7 @@ pub struct Snapshot {
     pub last_scan_at: Option<DateTime<Utc>>,
     pub content_pool_stats: Vec<ContentPoolStat>,
     pub memory: Option<InterestMemoryRecord>,
+    pub memory_review: Option<MemoryReviewProposal>,
     pub source_summary: SourceCatalogSummary,
 }
 
@@ -259,6 +300,7 @@ pub struct FeedArticle {
     pub source_name: String,
     pub module: String,
     pub bucket: String,
+    pub group: String,
     pub discipline: Discipline,
     pub source_kind: SourceKind,
     pub resource_type: ResourceType,
@@ -288,6 +330,34 @@ pub struct LlmResult {
 
 pub fn default_llm_provider() -> String {
     "deepseek".to_string()
+}
+
+pub fn default_llm_protocol() -> String {
+    "openai-compatible".to_string()
+}
+
+pub fn default_module_fetch_intervals() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), 6),
+        ("social_science".to_string(), 12),
+        ("business".to_string(), 12),
+        ("design".to_string(), 12),
+        ("science".to_string(), 12),
+        ("medicine".to_string(), 12),
+        ("other".to_string(), 12),
+    ])
+}
+
+pub fn default_module_push_top_n() -> BTreeMap<String, i64> {
+    BTreeMap::from([
+        ("technology".to_string(), 6),
+        ("social_science".to_string(), 6),
+        ("business".to_string(), 6),
+        ("design".to_string(), 6),
+        ("science".to_string(), 6),
+        ("medicine".to_string(), 6),
+        ("other".to_string(), 6),
+    ])
 }
 
 pub fn all_disciplines() -> Vec<Discipline> {

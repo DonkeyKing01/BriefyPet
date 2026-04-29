@@ -29,6 +29,21 @@ export async function bubbleAction(action: "view" | "snooze" | "ignore"): Promis
   return invoke("bubble_action", { action });
 }
 
+export async function openHelpWindow(): Promise<void> {
+  return invoke("open_help_window");
+}
+
+export async function dismissHelpWindow(completeOnboarding: boolean): Promise<void> {
+  return invoke("dismiss_help_window", { completeOnboarding });
+}
+
+export async function submitMemoryReview(
+  action: "accept" | "modify" | "reject",
+  summary?: string,
+): Promise<Snapshot> {
+  return invoke("submit_memory_review", { action, summary });
+}
+
 export async function setActiveView(view: AppView): Promise<Snapshot> {
   return invoke("set_active_view", { view });
 }
@@ -53,8 +68,9 @@ export async function addCustomRssSource(
   url: string,
   module: string,
   bucket: string,
+  group: string,
 ): Promise<Snapshot> {
-  return invoke("add_custom_rss_source", { name, url, module, bucket });
+  return invoke("add_custom_rss_source", { name, url, module, bucket, group });
 }
 
 export async function resetRuntimeData(): Promise<void> {

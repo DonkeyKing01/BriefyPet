@@ -24,12 +24,13 @@ pub struct AppState {
     last_scan_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     loading_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     pet_visible_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    polling_until: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "pet", WindowUrl::App("index.html".into()))
         .title("Briefy Pet")
-        .inner_size(188.0, 196.0)
+        .inner_size(188.0, 214.0)
         .transparent(true)
         .decorations(false)
         .always_on_top(true)
@@ -56,6 +57,70 @@ fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+fn build_help_window(app: &tauri::App) -> tauri::Result<()> {
+    WindowBuilder::new(app, "help", WindowUrl::App("index.html".into()))
+        .title("Briefy Pet Help")
+        .transparent(true)
+        .decorations(false)
+        .inner_size(560.0, 520.0)
+        .min_inner_size(520.0, 480.0)
+        .resizable(false)
+        .visible(false)
+        .always_on_top(true)
+        .center()
+        .build()?;
+    Ok(())
+}
+
+fn build_memory_review_window(app: &tauri::App) -> tauri::Result<()> {
+    WindowBuilder::new(app, "memory-review", WindowUrl::App("index.html".into()))
+        .title("Briefy Pet Memory Review")
+        .transparent(true)
+        .decorations(false)
+        .inner_size(740.0, 620.0)
+        .min_inner_size(680.0, 560.0)
+        .resizable(false)
+        .visible(false)
+        .always_on_top(true)
+        .center()
+        .build()?;
+    Ok(())
+}
+
+fn position_overlay_windows(app: &tauri::App) -> tauri::Result<()> {
+    let monitor_window = app
+        .get_window("pet")
+        .or_else(|| app.get_window("main"))
+        .or_else(|| app.get_window("bubble"));
+    let Some(window) = monitor_window else {
+        return Ok(());
+    };
+    let Some(monitor) = window.primary_monitor()? else {
+        return Ok(());
+    };
+    let scale = monitor.scale_factor();
+    let logical_size = monitor.size().to_logical::<f64>(scale);
+    let right_margin = 32.0;
+    let bottom_margin = 36.0;
+    let pet_width = 188.0;
+    let pet_height = 214.0;
+    let bubble_width = 420.0;
+    let bubble_height = 300.0;
+
+    let pet_x = (logical_size.width - pet_width - right_margin).max(0.0);
+    let pet_y = (logical_size.height - pet_height - bottom_margin).max(0.0);
+    let bubble_x = (pet_x + pet_width - bubble_width - 12.0).max(0.0);
+    let bubble_y = (pet_y - bubble_height - 12.0).max(0.0);
+
+    if let Some(window) = app.get_window("pet") {
+        window.set_position(LogicalPosition::new(pet_x, pet_y))?;
+    }
+    if let Some(window) = app.get_window("bubble") {
+        window.set_position(LogicalPosition::new(bubble_x, bubble_y))?;
+    }
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState {
@@ -66,11 +131,20 @@ fn main() {
             last_scan_at: Mutex::new(None),
             loading_until: Mutex::new(None),
             pet_visible_until: Mutex::new(None),
+            polling_until: Mutex::new(None),
         })
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None::<Vec<&str>>,
         ))
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            } else if let Some(window) = app.get_window("pet") {
+                let _ = window.show();
+            }
+        }))
         .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             if let Some(main_window) = app.get_window("main") {
                 main_window.set_size(LogicalSize::new(1260.0, 780.0))?;
@@ -85,6 +159,7 @@ fn main() {
             }
 
             let conn = db::connect(&app.handle())?;
+            let _ = db::reject_pending_memory_reviews(&conn)?;
             let settings = db::read_settings(&conn)?;
             let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
             if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
@@ -92,6 +167,7 @@ fn main() {
             }
             let should_force_settings =
                 service::requires_configuration(&settings, Some(persisted_api_key_valid));
+            let onboarding_completed = db::read_onboarding_completed(&conn)?;
             if should_force_settings {
                 db::write_active_view(&conn, &AppView::Settings)?;
             }
@@ -104,7 +180,7 @@ fn main() {
             if !should_scan {
                 if settings.api_key.trim().is_empty() || !persisted_api_key_valid {
                     if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
-                    *api_key_valid = Some(false);
+                        *api_key_valid = Some(false);
                     }
                 }
             }
@@ -127,9 +203,44 @@ fn main() {
 
             build_pet_window(app)?;
             build_bubble_window(app)?;
+            build_help_window(app)?;
+            build_memory_review_window(app)?;
+            position_overlay_windows(app)?;
+
+            if let Some(help_window) = app.get_window("help") {
+                let help_window_handle = help_window.clone();
+                help_window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = help_window_handle.hide();
+                    }
+                });
+            }
+
+            if let Some(memory_window) = app.get_window("memory-review") {
+                let app_handle = app.handle();
+                let memory_window_handle = memory_window.clone();
+                memory_window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Ok(conn) = db::connect(&app_handle) {
+                            if let Ok(Some(proposal)) = db::read_pending_memory_review(&conn) {
+                                let _ = db::resolve_memory_review_proposal(
+                                    &conn,
+                                    &proposal.id,
+                                    "rejected",
+                                    Some("closed without confirmation"),
+                                );
+                            }
+                        }
+                        let _ = memory_window_handle.hide();
+                        let _ = service::sync_windows(&app_handle, service::current_scanning(&app_handle));
+                    }
+                });
+            }
 
             if should_scan {
-                service::reveal_pet_for_polling(&app.handle());
+                service::reveal_pet_on_launch(&app.handle(), 6)?;
                 service::ensure_scheduler(&app.handle());
                 service::trigger_fetch_now(
                     &app.handle(),
@@ -137,7 +248,12 @@ fn main() {
                     true,
                 );
             } else {
+                service::reveal_pet_on_launch(&app.handle(), 6)?;
                 service::sync_windows(&app.handle(), false)?;
+            }
+
+            if !onboarding_completed {
+                service::show_help_window(&app.handle())?;
             }
 
             Ok(())
@@ -152,6 +268,9 @@ fn main() {
             commands::toggle_favorite,
             commands::pet_double_click,
             commands::bubble_action,
+            commands::open_help_window,
+            commands::dismiss_help_window,
+            commands::submit_memory_review,
             commands::set_active_view,
             commands::save_article_note,
             commands::get_article_raw_content,

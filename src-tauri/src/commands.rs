@@ -7,18 +7,22 @@ use crate::{
         AppView, Discipline, HistoryItem, OverlaySnapshot, ResourceType, RssSource,
         SettingsPayload, Snapshot, SourceKind,
     },
-    policy,
-    service, AppState,
+    policy, service, AppState,
 };
 
 #[tauri::command]
 pub fn bootstrap(app: AppHandle, state: State<AppState>) -> Result<Snapshot, String> {
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
     service::snapshot(&app, is_scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn bootstrap_overlay(app: AppHandle, state: State<AppState>) -> Result<OverlaySnapshot, String> {
+pub fn bootstrap_overlay(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<OverlaySnapshot, String> {
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let is_scanning = *state.is_scanning.lock().map_err(|err| err.to_string())?;
     service::snapshot_overlay(&app, is_scanning).map_err(|err| err.to_string())
 }
@@ -63,15 +67,10 @@ pub async fn save_settings(
         app.autolaunch().disable().map_err(|err| err.to_string())?;
     }
 
-    {
-        let mut scanning = state.is_scanning.lock().map_err(|err| err.to_string())?;
-        *scanning = true;
-    }
-
-    service::ensure_scheduler(&app);
-    service::trigger_fetch_now(&app, None, false);
-    service::sync_windows(&app, true).map_err(|err| err.to_string())?;
-    service::publish_snapshot(&app, true).map_err(|err| err.to_string())
+    service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
+    let scanning = service::current_scanning(&app);
+    service::sync_windows(&app, scanning).map_err(|err| err.to_string())?;
+    service::publish_snapshot(&app, scanning).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -135,6 +134,29 @@ pub fn bubble_action(app: AppHandle, action: String) -> Result<Snapshot, String>
 }
 
 #[tauri::command]
+pub fn open_help_window(app: AppHandle) -> Result<(), String> {
+    service::show_help_window(&app).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn dismiss_help_window(app: AppHandle, complete_onboarding: bool) -> Result<(), String> {
+    let conn = db::connect(&app).map_err(|err| err.to_string())?;
+    if complete_onboarding {
+        db::write_onboarding_completed(&conn, true).map_err(|err| err.to_string())?;
+    }
+    service::hide_help_window(&app).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn submit_memory_review(
+    app: AppHandle,
+    action: String,
+    summary: Option<String>,
+) -> Result<Snapshot, String> {
+    service::respond_memory_review(&app, &action, summary.as_deref()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn set_active_view(app: AppHandle, view: AppView) -> Result<Snapshot, String> {
     let resolved = service::resolve_requested_view(&app, view).map_err(|err| err.to_string())?;
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
@@ -148,7 +170,11 @@ pub fn set_active_view(app: AppHandle, view: AppView) -> Result<Snapshot, String
 }
 
 #[tauri::command]
-pub fn save_article_note(app: AppHandle, article_id: i64, note: String) -> Result<Snapshot, String> {
+pub fn save_article_note(
+    app: AppHandle,
+    article_id: i64,
+    note: String,
+) -> Result<Snapshot, String> {
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::update_article_note(&conn, article_id, &note).map_err(|err| err.to_string())?;
     let source_id = db::article_source_id(&conn, article_id).map_err(|err| err.to_string())?;
@@ -189,6 +215,7 @@ pub fn add_custom_rss_source(
     url: String,
     module: String,
     bucket: String,
+    group: String,
 ) -> Result<Snapshot, String> {
     let trimmed_name = name.trim();
     let trimmed_url = url.trim();
@@ -197,7 +224,8 @@ pub fn add_custom_rss_source(
     }
 
     let module = policy::normalize_module(&module);
-    let bucket = policy::normalize_bucket(&module, &bucket);
+    let bucket = policy::normalize_bucket(&bucket);
+    let source_group = policy::normalize_group(&group);
     let canonical_url = db::canonicalize_source_url(trimmed_url);
     let source = RssSource {
         id: db::build_custom_source_id(trimmed_name, &canonical_url),
@@ -205,8 +233,9 @@ pub fn add_custom_rss_source(
         url: canonical_url,
         module: module.clone(),
         bucket: bucket.clone(),
+        group: source_group.clone(),
         discipline: map_module_to_discipline(&module),
-        source_kind: map_bucket_to_source_kind(&bucket),
+        source_kind: map_group_to_source_kind(&source_group),
         resource_type: ResourceType::Article,
         language: None,
         enabled: true,
@@ -218,6 +247,7 @@ pub fn add_custom_rss_source(
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::upsert_source(&conn, &source, true).map_err(|err| err.to_string())?;
     db::reset_source_fetch_state(&conn, &source.id).map_err(|err| err.to_string())?;
+    db::reset_module_fetch_state(&conn, &module).map_err(|err| err.to_string())?;
 
     let settings = db::read_settings(&conn).map_err(|err| err.to_string())?;
     let api_key_valid = db::read_api_key_valid(&conn).map_err(|err| err.to_string())?;
@@ -256,6 +286,9 @@ pub fn reset_runtime_data(app: AppHandle, state: State<'_, AppState>) -> Result<
     if let Ok(mut pet_visible_until) = state.pet_visible_until.lock() {
         *pet_visible_until = None;
     }
+    if let Ok(mut polling_until) = state.polling_until.lock() {
+        *polling_until = None;
+    }
     process::restart(&app.env());
     Ok(())
 }
@@ -265,21 +298,24 @@ fn map_module_to_discipline(module: &str) -> Discipline {
         "technology" => Discipline::Technology,
         "social_science" => Discipline::SocialScience,
         "business" => Discipline::Other,
-        "growth" => Discipline::Life,
-        "news_opinion" => Discipline::News,
-        "entertainment" => Discipline::Humanities,
+        "design" => Discipline::Humanities,
         "science" => Discipline::Science,
         "medicine" => Discipline::Medicine,
         _ => Discipline::Other,
     }
 }
 
-fn map_bucket_to_source_kind(bucket: &str) -> SourceKind {
-    match bucket {
-        "research" | "academic_frontier" | "physics" | "chemistry" | "biology" => {
+fn map_group_to_source_kind(source_group: &str) -> SourceKind {
+    match source_group {
+        "frontier" | "research" | "academic" | "clinical_trials" | "genomics"
+        | "biostatistics" | "biomaterials" | "biomechanics" | "computational_biology"
+        | "bioinformatics" | "systems_biology" | "pharmacogenomics" | "drug_discovery"
+        | "pharmacology" | "toxicology" => {
             SourceKind::AcademicJournal
         }
-        "official" => SourceKind::OfficialAnnouncement,
+        "official" | "regulatory_science" | "clinical_safety" => {
+            SourceKind::OfficialAnnouncement
+        }
         "blogs" => SourceKind::TechnicalBlog,
         _ => SourceKind::CommunityHotspot,
     }
@@ -302,6 +338,9 @@ pub fn reset_app_data(app: AppHandle, state: State<'_, AppState>) -> Result<Snap
     }
     if let Ok(mut scanning) = state.is_scanning.lock() {
         *scanning = false;
+    }
+    if let Ok(mut polling_until) = state.polling_until.lock() {
+        *polling_until = None;
     }
     app.autolaunch().disable().map_err(|err| err.to_string())?;
     service::sync_windows(&app, false).map_err(|err| err.to_string())?;
