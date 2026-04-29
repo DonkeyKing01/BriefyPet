@@ -50,7 +50,7 @@ BriefyPet，一个智能桌面阅读助手，正致力于从信源、个性化�
 
 ### 下载安装包
 
-访问 Release 或 landingpage 下载安装包。首次启动后需要：
+访问 [Release](https://github.com/DonkeyKing01/BriefyPet/releases) 或 [产品发布页](https://briefypet.netlify.app/) 下载安装包。首次启动后需要：
 
 1. 选择 LLM Provider；
 2. 填入对应供应商的 API Key；
