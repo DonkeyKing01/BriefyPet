@@ -72,6 +72,21 @@ fn build_help_window(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+fn build_memory_review_window(app: &tauri::App) -> tauri::Result<()> {
+    WindowBuilder::new(app, "memory-review", WindowUrl::App("index.html".into()))
+        .title("Briefy Pet Memory Review")
+        .transparent(true)
+        .decorations(false)
+        .inner_size(740.0, 620.0)
+        .min_inner_size(680.0, 560.0)
+        .resizable(false)
+        .visible(false)
+        .always_on_top(true)
+        .center()
+        .build()?;
+    Ok(())
+}
+
 fn position_overlay_windows(app: &tauri::App) -> tauri::Result<()> {
     let monitor_window = app
         .get_window("pet")
@@ -144,6 +159,7 @@ fn main() {
             }
 
             let conn = db::connect(&app.handle())?;
+            let _ = db::reject_pending_memory_reviews(&conn)?;
             let settings = db::read_settings(&conn)?;
             let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
             if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
@@ -188,6 +204,7 @@ fn main() {
             build_pet_window(app)?;
             build_bubble_window(app)?;
             build_help_window(app)?;
+            build_memory_review_window(app)?;
             position_overlay_windows(app)?;
 
             if let Some(help_window) = app.get_window("help") {
@@ -196,6 +213,28 @@ fn main() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = help_window_handle.hide();
+                    }
+                });
+            }
+
+            if let Some(memory_window) = app.get_window("memory-review") {
+                let app_handle = app.handle();
+                let memory_window_handle = memory_window.clone();
+                memory_window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Ok(conn) = db::connect(&app_handle) {
+                            if let Ok(Some(proposal)) = db::read_pending_memory_review(&conn) {
+                                let _ = db::resolve_memory_review_proposal(
+                                    &conn,
+                                    &proposal.id,
+                                    "rejected",
+                                    Some("closed without confirmation"),
+                                );
+                            }
+                        }
+                        let _ = memory_window_handle.hide();
+                        let _ = service::sync_windows(&app_handle, service::current_scanning(&app_handle));
                     }
                 });
             }
@@ -231,6 +270,7 @@ fn main() {
             commands::bubble_action,
             commands::open_help_window,
             commands::dismiss_help_window,
+            commands::submit_memory_review,
             commands::set_active_view,
             commands::save_article_note,
             commands::get_article_raw_content,

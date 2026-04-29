@@ -38,30 +38,14 @@ export type SourceModule =
   | "technology"
   | "social_science"
   | "business"
-  | "growth"
-  | "news_opinion"
-  | "entertainment"
+  | "design"
   | "science"
   | "medicine"
   | "other";
 
-export type SourceBucket =
-  | "research"
-  | "academic_frontier"
-  | "official"
-  | "blogs"
-  | "community"
-  | "streaming"
-  | "news"
-  | "personal_opinion"
-  | "streaming_opinion"
-  | "community_opinion"
-  | "media_opinion"
-  | "lite_pool"
-  | "physics"
-  | "chemistry"
-  | "biology"
-  | "unspecified";
+export type SourceBucket = string;
+
+export type SourceGroup = string;
 
 export type ResourceType = "article" | "podcast" | "video" | "twitter" | "other";
 
@@ -71,12 +55,20 @@ export type UserDisciplinePreference = {
   preference: string;
 };
 
+export type UserModulePreference = {
+  module: SourceModule | string;
+  enabled: boolean;
+  preference: string;
+  selectedBuckets: SourceBucket[];
+};
+
 export type RssSource = {
   id: string;
   name: string;
   url: string;
   module: SourceModule;
   bucket: SourceBucket;
+  group: SourceGroup;
   discipline: Discipline;
   sourceKind: SourceKind;
   resourceType: ResourceType;
@@ -96,7 +88,10 @@ export type SettingsPayload = {
   llmModelName: string;
   llmModel: string;
   providerApiKeys: Record<string, string>;
+  moduleFetchIntervals: Record<SourceModule, number>;
+  modulePushTopN: Record<SourceModule, number>;
   autoStart: boolean;
+  modulePreferences: UserModulePreference[];
   disciplines: UserDisciplinePreference[];
   memoryModeEnabled: boolean;
   memorySummary: string;
@@ -140,6 +135,7 @@ export type HistoryItem = {
   sourceName: string;
   module: string;
   bucket: string;
+  group: string;
   publishedAt: string | null;
   summary: string;
   fitScore: number;
@@ -167,6 +163,15 @@ export type InterestMemoryRecord = {
   updatedAt: string | null;
 };
 
+export type MemoryReviewProposal = {
+  id: string;
+  weekKey: string;
+  baseSummary: string;
+  proposedSummary: string;
+  status: string;
+  createdAt: string;
+};
+
 export type SourceCatalogSummary = {
   totalSources: number;
   enabledSources: number;
@@ -188,6 +193,7 @@ export type Snapshot = {
   lastScanAt: string | null;
   contentPoolStats: ContentPoolStat[];
   memory: InterestMemoryRecord | null;
+  memoryReview: MemoryReviewProposal | null;
   sourceSummary: SourceCatalogSummary;
 };
 

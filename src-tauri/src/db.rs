@@ -13,17 +13,18 @@ use tauri::AppHandle;
 
 use crate::models::{
     all_disciplines, default_llm_protocol, default_llm_provider, AppView, ArticleRecord,
-    ContentPoolStat, Discipline, FeedArticle, FitLevel, InterestMemoryRecord, PendingArticleRecord,
-    ReminderBatchSnapshot, ResourceType, RssSource, SettingsPayload, Snapshot,
-    SourceCatalogSummary, SourceKind, UserDisciplinePreference,
+    ContentPoolStat, Discipline, FeedArticle, FitLevel, InterestMemoryRecord,
+    MemoryReviewProposal, PendingArticleRecord, ReminderBatchSnapshot, ResourceType, RssSource,
+    SettingsPayload, Snapshot, SourceCatalogSummary, SourceKind, UserDisciplinePreference,
+    UserModulePreference,
 };
 use crate::policy;
 
-const MAX_POOL_SIZE_PER_BUCKET: usize = 1000;
+const MAX_POOL_SIZE_PER_BUCKET: usize = 300;
 #[allow(dead_code)]
 const SNAPSHOT_HISTORY_LIMIT: usize = 200;
 const PUSH_DB_FILE: &str = "briefy-pet-push.db";
-const PUSH_BUCKET_MAX_SIZE: usize = 1000;
+const PUSH_BUCKET_MAX_SIZE: usize = 300;
 const PUSH_SNOOZE_UNTIL_KEY: &str = "push_snooze_until";
 
 pub fn db_path(app: &AppHandle) -> Result<PathBuf> {
@@ -58,8 +59,9 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           source_id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
           rss_url TEXT NOT NULL,
-                    module TEXT NOT NULL DEFAULT 'other',
-                    bucket TEXT NOT NULL DEFAULT 'unspecified',
+          module TEXT NOT NULL DEFAULT 'other',
+          bucket TEXT NOT NULL DEFAULT 'general',
+          source_group TEXT NOT NULL DEFAULT 'general',
           discipline TEXT NOT NULL,
           source_kind TEXT NOT NULL,
           resource_type TEXT NOT NULL,
@@ -73,6 +75,12 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           enabled INTEGER NOT NULL DEFAULT 0,
           preference TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS user_module_preferences (
+          module TEXT PRIMARY KEY,
+          enabled INTEGER NOT NULL DEFAULT 0,
+          preference TEXT NOT NULL DEFAULT '',
+          selected_buckets TEXT NOT NULL DEFAULT '[]'
+        );
         CREATE TABLE IF NOT EXISTS user_source_pool (
           source_id TEXT PRIMARY KEY,
           enabled INTEGER NOT NULL DEFAULT 1,
@@ -83,6 +91,10 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           last_fetched_at TEXT,
           last_success_at TEXT,
           last_error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS module_fetch_state (
+          module TEXT PRIMARY KEY,
+          last_module_run_at TEXT
         );
         CREATE TABLE IF NOT EXISTS articles (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,20 +134,30 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
         );
         CREATE TABLE IF NOT EXISTS ranked_content_pool (
           article_id INTEGER PRIMARY KEY,
-                    module TEXT NOT NULL DEFAULT 'other',
-                    bucket TEXT NOT NULL DEFAULT 'unspecified',
+          module TEXT NOT NULL DEFAULT 'other',
+          bucket TEXT NOT NULL DEFAULT 'general',
           source_kind TEXT NOT NULL,
           fit_score INTEGER NOT NULL,
           published_at TEXT,
           inserted_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS daily_interest_memory (
+                CREATE TABLE IF NOT EXISTS daily_interest_memory (
           day_key TEXT PRIMARY KEY,
           generated_summary TEXT NOT NULL DEFAULT '',
           confirmed_summary TEXT,
           memory_enabled INTEGER NOT NULL DEFAULT 1,
           event_count INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_review_proposals (
+          id TEXT PRIMARY KEY,
+          week_key TEXT NOT NULL UNIQUE,
+          base_summary TEXT NOT NULL DEFAULT '',
+          proposed_summary TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending',
+          user_response TEXT,
+          created_at TEXT NOT NULL,
+          decided_at TEXT
         );
                 CREATE TABLE IF NOT EXISTS crawl_cycle_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,6 +221,10 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE source_catalog ADD COLUMN source_group TEXT NOT NULL DEFAULT 'general'",
+        [],
+    );
+    let _ = conn.execute(
         "UPDATE articles SET fetched_at = published_at WHERE fetched_at IS NULL AND published_at IS NOT NULL",
         [],
     );
@@ -208,6 +234,14 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
     );
     let _ = conn.execute(
         "ALTER TABLE ranked_content_pool ADD COLUMN bucket TEXT NOT NULL DEFAULT 'unspecified'",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE source_catalog SET bucket = 'general' WHERE TRIM(bucket) = '' OR bucket = 'unspecified'",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE ranked_content_pool SET bucket = 'general' WHERE TRIM(bucket) = '' OR bucket = 'unspecified'",
         [],
     );
     let _ = conn.execute(
@@ -266,7 +300,7 @@ pub fn push_connect(app: &AppHandle) -> Result<Connection> {
                 CREATE TABLE IF NOT EXISTS push_items (
                     article_id INTEGER PRIMARY KEY,
                     module TEXT NOT NULL DEFAULT 'other',
-                    bucket TEXT NOT NULL DEFAULT 'unspecified',
+                    bucket TEXT NOT NULL DEFAULT 'general',
                     fit_score INTEGER NOT NULL DEFAULT 0,
                     push_status TEXT NOT NULL DEFAULT 'waiting',
                     queued_at TEXT NOT NULL,
@@ -306,6 +340,16 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         write_setting(conn, "llm_model_name", "")?;
         write_setting(conn, "llm_model", "")?;
         write_setting(conn, "provider_api_keys", "{}")?;
+        write_setting(
+            conn,
+            "module_fetch_intervals",
+            &serde_json::to_string(&policy::default_module_fetch_intervals())?,
+        )?;
+        write_setting(
+            conn,
+            "module_push_top_n",
+            &serde_json::to_string(&policy::default_module_push_top_n_map())?,
+        )?;
         write_setting(conn, "auto_start", "false")?;
         write_setting(conn, "active_view", "\"settings\"")?;
         write_setting(conn, "selected_article_id", "null")?;
@@ -323,6 +367,16 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         ensure_setting(conn, "llm_model_name", "")?;
         ensure_setting(conn, "llm_model", "")?;
         ensure_setting(conn, "provider_api_keys", "{}")?;
+        ensure_setting(
+            conn,
+            "module_fetch_intervals",
+            &serde_json::to_string(&policy::default_module_fetch_intervals())?,
+        )?;
+        ensure_setting(
+            conn,
+            "module_push_top_n",
+            &serde_json::to_string(&policy::default_module_push_top_n_map())?,
+        )?;
         ensure_setting(conn, "auto_start", "false")?;
         ensure_setting(conn, "active_view", "\"settings\"")?;
         ensure_setting(conn, "selected_article_id", "null")?;
@@ -336,8 +390,10 @@ fn seed_defaults(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
 
     sync_source_catalog(conn, catalog)?;
     sync_discipline_preferences(conn)?;
+    sync_module_preferences(conn, catalog)?;
     sync_user_source_pool(conn, catalog)?;
     sync_source_fetch_state(conn, catalog)?;
+    sync_module_fetch_state(conn)?;
 
     let cleanup_done = read_setting(conn, "pool_cleanup_v1_done")?
         .unwrap_or_else(|| "false".to_string())
@@ -386,14 +442,15 @@ fn sync_source_catalog(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
         conn.execute(
             r#"
             INSERT INTO source_catalog (
-                            source_id, name, rss_url, module, bucket, discipline, source_kind, resource_type,
-                            language, enabled_by_default, postponed, origin_files
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+              source_id, name, rss_url, module, bucket, source_group, discipline, source_kind,
+              resource_type, language, enabled_by_default, postponed, origin_files
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(source_id) DO UPDATE SET
               name = excluded.name,
               rss_url = excluded.rss_url,
-                            module = excluded.module,
-                            bucket = excluded.bucket,
+              module = excluded.module,
+              bucket = excluded.bucket,
+              source_group = excluded.source_group,
               discipline = excluded.discipline,
               source_kind = excluded.source_kind,
               resource_type = excluded.resource_type,
@@ -408,6 +465,7 @@ fn sync_source_catalog(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
                 source.url,
                 source.module.as_str(),
                 source.bucket.as_str(),
+                source.group.as_str(),
                 discipline_to_raw(&source.discipline),
                 source_kind_to_raw(&source.source_kind),
                 resource_type_to_raw(&source.resource_type),
@@ -430,6 +488,32 @@ fn sync_discipline_preferences(conn: &Connection) -> Result<()> {
             ON CONFLICT(discipline) DO NOTHING
             "#,
             params![discipline_to_raw(&discipline)],
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_module_preferences(conn: &Connection, catalog: &[RssSource]) -> Result<()> {
+    let mut bucket_by_module = BTreeMap::<String, BTreeSet<String>>::new();
+    for source in catalog {
+        bucket_by_module
+            .entry(policy::normalize_module(&source.module))
+            .or_default()
+            .insert(policy::normalize_bucket(&source.bucket));
+    }
+
+    for module in policy::all_modules() {
+        let default_buckets = bucket_by_module
+            .get(*module)
+            .map(|items| items.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        conn.execute(
+            r#"
+            INSERT INTO user_module_preferences (module, enabled, preference, selected_buckets)
+            VALUES (?1, 0, '', ?2)
+            ON CONFLICT(module) DO NOTHING
+            "#,
+            params![module, serde_json::to_string(&default_buckets)?],
         )?;
     }
     Ok(())
@@ -493,13 +577,28 @@ fn sync_source_fetch_state(conn: &Connection, catalog: &[RssSource]) -> Result<(
     Ok(())
 }
 
+fn sync_module_fetch_state(conn: &Connection) -> Result<()> {
+    for module in policy::all_modules() {
+        conn.execute(
+            r#"
+            INSERT INTO module_fetch_state (module, last_module_run_at)
+            VALUES (?1, NULL)
+            ON CONFLICT(module) DO NOTHING
+            "#,
+            params![module],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn upsert_source(
     conn: &Connection,
     source: &RssSource,
     mark_custom_origin: bool,
 ) -> Result<()> {
     let module = policy::normalize_module(&source.module);
-    let bucket = policy::normalize_bucket(&module, &source.bucket);
+    let bucket = policy::normalize_bucket(&source.bucket);
+    let source_group = policy::normalize_group(&source.group);
     let mut origins = source.origin_files.clone();
     if mark_custom_origin
         && !origins
@@ -512,14 +611,15 @@ pub fn upsert_source(
     conn.execute(
         r#"
         INSERT INTO source_catalog (
-          source_id, name, rss_url, module, bucket, discipline, source_kind, resource_type,
-          language, enabled_by_default, postponed, origin_files
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+          source_id, name, rss_url, module, bucket, source_group, discipline, source_kind,
+          resource_type, language, enabled_by_default, postponed, origin_files
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(source_id) DO UPDATE SET
           name = excluded.name,
           rss_url = excluded.rss_url,
           module = excluded.module,
           bucket = excluded.bucket,
+          source_group = excluded.source_group,
           discipline = excluded.discipline,
           source_kind = excluded.source_kind,
           resource_type = excluded.resource_type,
@@ -534,6 +634,7 @@ pub fn upsert_source(
             source.url,
             module,
             bucket,
+            source_group,
             discipline_to_raw(&source.discipline),
             source_kind_to_raw(&source.source_kind),
             resource_type_to_raw(&source.resource_type),
@@ -582,6 +683,24 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
         read_setting(conn, "llm_custom_provider_name")?.unwrap_or_default();
     let llm_model_name = read_setting(conn, "llm_model_name")?.unwrap_or_default();
     let llm_model = read_setting(conn, "llm_model")?.unwrap_or_default();
+    let mut module_fetch_intervals = policy::default_module_fetch_intervals();
+    if let Some(raw) = read_setting(conn, "module_fetch_intervals")? {
+        if let Ok(overrides) = serde_json::from_str::<BTreeMap<String, i64>>(&raw) {
+            for (module, hours) in overrides {
+                let normalized = policy::normalize_module(&module);
+                module_fetch_intervals.insert(normalized, hours.clamp(1, 168));
+            }
+        }
+    }
+    let mut module_push_top_n = policy::default_module_push_top_n_map();
+    if let Some(raw) = read_setting(conn, "module_push_top_n")? {
+        if let Ok(overrides) = serde_json::from_str::<BTreeMap<String, i64>>(&raw) {
+            for (module, count) in overrides {
+                let normalized = policy::normalize_module(&module);
+                module_push_top_n.insert(normalized, count.clamp(1, 24));
+            }
+        }
+    }
     let legacy_api_key = read_setting(conn, "api_key")?.unwrap_or_default();
     let mut provider_api_keys = read_setting(conn, "provider_api_keys")?
         .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
@@ -614,7 +733,10 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
         llm_model_name,
         llm_model,
         provider_api_keys,
+        module_fetch_intervals,
+        module_push_top_n,
         auto_start: read_setting(conn, "auto_start")?.unwrap_or_else(|| "false".into()) == "true",
+        module_preferences: list_module_preferences(conn)?,
         disciplines: list_discipline_preferences(conn)?,
         memory_mode_enabled: read_setting(conn, "memory_mode_enabled")?
             .unwrap_or_else(|| "true".into())
@@ -633,6 +755,16 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
     let llm_custom_provider_name = settings.llm_custom_provider_name.trim().to_string();
     let llm_model_name = settings.llm_model_name.trim().to_string();
     let llm_model = settings.llm_model.trim().to_string();
+    let mut module_fetch_intervals = policy::default_module_fetch_intervals();
+    for (module, hours) in &settings.module_fetch_intervals {
+        let normalized = policy::normalize_module(module);
+        module_fetch_intervals.insert(normalized, (*hours).clamp(1, 168));
+    }
+    let mut module_push_top_n = policy::default_module_push_top_n_map();
+    for (module, count) in &settings.module_push_top_n {
+        let normalized = policy::normalize_module(module);
+        module_push_top_n.insert(normalized, (*count).clamp(1, 24));
+    }
     let mut provider_api_keys = settings.provider_api_keys.clone();
     for value in provider_api_keys.values_mut() {
         *value = value.trim().to_string();
@@ -659,6 +791,16 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
     write_setting(conn, "llm_model", &llm_model)?;
     write_setting(
         conn,
+        "module_fetch_intervals",
+        &serde_json::to_string(&module_fetch_intervals)?,
+    )?;
+    write_setting(
+        conn,
+        "module_push_top_n",
+        &serde_json::to_string(&module_push_top_n)?,
+    )?;
+    write_setting(
+        conn,
         "provider_api_keys",
         &serde_json::to_string(&provider_api_keys)?,
     )?;
@@ -677,6 +819,10 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
         },
     )?;
 
+    let previous_modules = list_module_preferences(conn)?
+        .into_iter()
+        .map(|item| (item.module.clone(), item))
+        .collect::<BTreeMap<_, _>>();
     let previous_disciplines = list_discipline_preferences(conn)?
         .into_iter()
         .map(|item| (item.discipline, item.enabled))
@@ -699,6 +845,36 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
         .iter()
         .map(|item| (item.discipline.clone(), item.clone()))
         .collect::<BTreeMap<_, _>>();
+    let available_buckets = module_bucket_index(&settings.rss_sources);
+    let known_modules = settings
+        .module_preferences
+        .iter()
+        .map(|item| {
+            let module = policy::normalize_module(&item.module);
+            let mut selected_buckets = if item.selected_buckets.is_empty() {
+                available_buckets
+                    .get(&module)
+                    .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            } else {
+                item.selected_buckets
+                    .iter()
+                    .map(|bucket| policy::normalize_bucket(bucket))
+                    .collect::<Vec<_>>()
+            };
+            selected_buckets.sort();
+            selected_buckets.dedup();
+            (
+                module.clone(),
+                UserModulePreference {
+                    module,
+                    enabled: item.enabled,
+                    preference: item.preference.trim().to_string(),
+                    selected_buckets,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for discipline in all_disciplines() {
         let item = known_disciplines.get(&discipline);
         conn.execute(
@@ -713,6 +889,33 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
                 discipline_to_raw(&discipline),
                 bool_to_int(item.map(|value| value.enabled).unwrap_or(false)),
                 item.map(|value| value.preference.trim()).unwrap_or(""),
+            ],
+        )?;
+    }
+    for module in policy::all_modules() {
+        let item = known_modules.get(*module);
+        let selected_buckets = item
+            .map(|value| value.selected_buckets.clone())
+            .unwrap_or_else(|| {
+                available_buckets
+                    .get(*module)
+                    .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            });
+        conn.execute(
+            r#"
+            INSERT INTO user_module_preferences (module, enabled, preference, selected_buckets)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(module) DO UPDATE SET
+              enabled = excluded.enabled,
+              preference = excluded.preference,
+              selected_buckets = excluded.selected_buckets
+            "#,
+            params![
+                module,
+                bool_to_int(item.map(|value| value.enabled).unwrap_or(false)),
+                item.map(|value| value.preference.as_str()).unwrap_or(""),
+                serde_json::to_string(&selected_buckets)?,
             ],
         )?;
     }
@@ -766,6 +969,21 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
             for module in discipline_modules(&discipline) {
                 reset_fetch_state_for_module(conn, module)?;
             }
+        }
+    }
+    for module in policy::all_modules() {
+        let previous = previous_modules.get(*module);
+        let current = known_modules.get(*module);
+        let was_enabled = previous.map(|value| value.enabled).unwrap_or(false);
+        let is_enabled = current.map(|value| value.enabled).unwrap_or(false);
+        let buckets_changed = previous
+            .map(|value| value.selected_buckets.clone())
+            .unwrap_or_default()
+            != current
+                .map(|value| value.selected_buckets.clone())
+                .unwrap_or_default();
+        if (!was_enabled && is_enabled) || (is_enabled && buckets_changed) {
+            reset_fetch_state_for_module(conn, module)?;
         }
     }
 
@@ -1282,7 +1500,8 @@ pub fn list_history_articles_page(
             a.source_id,
             COALESCE(a.source_name, '') AS source_name,
             COALESCE(sc.module, 'other') AS module,
-            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            COALESCE(sc.bucket, 'general') AS bucket,
+            COALESCE(sc.source_group, 'general') AS source_group,
             a.published_at,
             COALESCE(a.summary, '') AS summary,
             a.fit_score,
@@ -1311,15 +1530,16 @@ pub fn list_history_articles_page(
             source_name: row.get::<_, String>(4)?,
             module: row.get::<_, String>(5)?,
             bucket: row.get::<_, String>(6)?,
-            published_at: row.get::<_, Option<String>>(7)?,
-            summary: row.get::<_, String>(8)?,
-            fit_score: row.get::<_, i64>(9)?,
-            fit_level: row.get::<_, String>(10)?,
-            recommendation_reason: row.get::<_, String>(11)?,
-            note: row.get::<_, String>(12)?,
-            is_favorite: row.get::<_, bool>(13)?,
-            batch_id: row.get::<_, String>(14)?,
-            batch_created_at: row.get::<_, String>(15)?,
+            group: row.get::<_, String>(7)?,
+            published_at: row.get::<_, Option<String>>(8)?,
+            summary: row.get::<_, String>(9)?,
+            fit_score: row.get::<_, i64>(10)?,
+            fit_level: row.get::<_, String>(11)?,
+            recommendation_reason: row.get::<_, String>(12)?,
+            note: row.get::<_, String>(13)?,
+            is_favorite: row.get::<_, bool>(14)?,
+            batch_id: row.get::<_, String>(15)?,
+            batch_created_at: row.get::<_, String>(16)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1344,7 +1564,7 @@ pub fn queue_push_articles(
         SELECT
             a.id,
             COALESCE(sc.module, 'other') AS module,
-            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            COALESCE(sc.bucket, 'general') AS bucket,
             a.fit_score
         FROM articles a
         LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
@@ -1560,6 +1780,7 @@ pub fn list_push_history_articles_page(
                     source_name: article_row.get::<_, String>(4)?,
                     module: module.clone(),
                     bucket: bucket.clone(),
+                    group: "general".to_string(),
                     published_at: article_row.get::<_, Option<String>>(5)?,
                     summary: article_row.get::<_, String>(6)?,
                     fit_score: article_row.get::<_, i64>(7)?,
@@ -1715,7 +1936,7 @@ fn migrate_legacy_reminders_to_push_db(
         SELECT
             a.id,
             COALESCE(sc.module, 'other') AS module,
-            COALESCE(sc.bucket, 'unspecified') AS bucket,
+            COALESCE(sc.bucket, 'general') AS bucket,
             a.fit_score,
             CASE
                 WHEN rb.status = 'active' THEN 'waiting'
@@ -1838,6 +2059,61 @@ pub fn update_fetch_state(
     Ok(())
 }
 
+pub fn read_module_last_run_at(conn: &Connection, module: &str) -> Result<Option<DateTime<Utc>>> {
+    let module = policy::normalize_module(module);
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT last_module_run_at FROM module_fetch_state WHERE module = ?1 LIMIT 1",
+            params![module],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().as_deref().and_then(parse_datetime))
+}
+
+pub fn update_module_fetch_state(
+    conn: &Connection,
+    module: &str,
+    last_module_run_at: DateTime<Utc>,
+) -> Result<()> {
+    let module = policy::normalize_module(module);
+    conn.execute(
+        r#"
+        INSERT INTO module_fetch_state (module, last_module_run_at)
+        VALUES (?1, ?2)
+        ON CONFLICT(module) DO UPDATE SET
+          last_module_run_at = excluded.last_module_run_at
+        "#,
+        params![module, last_module_run_at.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn update_module_fetch_states(
+    conn: &Connection,
+    modules: &BTreeSet<String>,
+    last_module_run_at: DateTime<Utc>,
+) -> Result<()> {
+    for module in modules {
+        update_module_fetch_state(conn, module, last_module_run_at)?;
+    }
+    Ok(())
+}
+
+pub fn reset_module_fetch_state(conn: &Connection, module: &str) -> Result<()> {
+    let module = policy::normalize_module(module);
+    conn.execute(
+        r#"
+        INSERT INTO module_fetch_state (module, last_module_run_at)
+        VALUES (?1, NULL)
+        ON CONFLICT(module) DO UPDATE SET
+          last_module_run_at = NULL
+        "#,
+        params![module],
+    )?;
+    Ok(())
+}
+
 pub fn purge_source_history(conn: &Connection, source_id: &str) -> Result<()> {
     conn.execute(
         r#"
@@ -1881,6 +2157,7 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM daily_interest_memory", [])?;
     conn.execute("DELETE FROM articles", [])?;
     conn.execute("DELETE FROM source_fetch_state", [])?;
+    conn.execute("DELETE FROM module_fetch_state", [])?;
 
     let mut stmt = conn.prepare("SELECT source_id FROM source_catalog")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1893,6 +2170,7 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
             params![row?],
         )?;
     }
+    sync_module_fetch_state(conn)?;
 
     write_setting(conn, "selected_article_id", "null")?;
     write_setting(conn, "last_scan_at", "null")?;
@@ -1952,6 +2230,17 @@ pub fn source_last_fetched_at(conn: &Connection, source_id: &str) -> Result<Opti
     Ok(raw.flatten().as_deref().and_then(parse_datetime))
 }
 
+pub fn source_last_success_at(conn: &Connection, source_id: &str) -> Result<Option<DateTime<Utc>>> {
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT last_success_at FROM source_fetch_state WHERE source_id = ?1 LIMIT 1",
+            params![source_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().as_deref().and_then(parse_datetime))
+}
+
 pub fn reset_source_fetch_state(conn: &Connection, source_id: &str) -> Result<()> {
     conn.execute(
         r#"
@@ -1982,6 +2271,7 @@ pub fn reset_fetch_state_for_module(conn: &Connection, module: &str) -> Result<(
     for row in rows {
         reset_source_fetch_state(conn, &row?)?;
     }
+    reset_module_fetch_state(conn, &module)?;
     Ok(())
 }
 
@@ -2006,7 +2296,8 @@ pub fn list_pending_article_backlog(
             a.published_at,
             a.raw_content,
             COALESCE(sc.module, 'other') AS module,
-            COALESCE(sc.bucket, 'unspecified') AS bucket
+            COALESCE(sc.bucket, 'general') AS bucket,
+            COALESCE(sc.source_group, 'general') AS source_group
         FROM articles a
         LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
         WHERE a.score_status = 'pending'
@@ -2036,6 +2327,7 @@ pub fn list_pending_article_backlog(
                 content: row.get(11)?,
                 module: row.get(12)?,
                 bucket: row.get(13)?,
+                group: row.get(14)?,
                 normalized_link: canonicalize_source_url(&link),
                 guid: row.get::<_, String>(1)?,
             },
@@ -2049,21 +2341,35 @@ pub fn list_pending_article_backlog(
     Ok(output)
 }
 
-pub fn list_due_sources(
-    conn: &Connection,
-    now: DateTime<Utc>,
-    force_all: bool,
-) -> Result<Vec<RssSource>> {
-    let selected = list_selected_effective_disciplines(conn)?
+#[derive(Clone)]
+struct SourceFetchStateRow {
+    source: RssSource,
+    last_fetched_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    has_error: bool,
+}
+
+fn list_selected_source_fetch_rows(conn: &Connection) -> Result<Vec<SourceFetchStateRow>> {
+    let module_preferences = list_module_preferences(conn)?
         .into_iter()
-        .collect::<BTreeSet<_>>();
+        .filter(|item| item.enabled)
+        .map(|item| {
+            (
+                policy::normalize_module(&item.module),
+                item.selected_buckets
+                    .into_iter()
+                    .map(|bucket| policy::normalize_bucket(&bucket))
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut stmt = conn.prepare_cached(
         r#"
         SELECT
-                    sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.discipline,
-                    sc.source_kind, sc.resource_type, sc.language, sc.enabled_by_default,
-                    sc.postponed, sc.origin_files, usp.enabled,
-                    sfs.last_fetched_at, sfs.last_success_at, sfs.last_error
+          sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.source_group, sc.discipline,
+          sc.source_kind, sc.resource_type, sc.language, sc.enabled_by_default,
+          sc.postponed, sc.origin_files, usp.enabled,
+          sfs.last_fetched_at, sfs.last_success_at, sfs.last_error
         FROM source_catalog sc
         JOIN user_source_pool usp ON usp.source_id = sc.source_id
         LEFT JOIN source_fetch_state sfs ON sfs.source_id = sc.source_id
@@ -2074,15 +2380,16 @@ pub fn list_due_sources(
     let rows = stmt.query_map([], |row| {
         let module: String = row.get(3)?;
         let bucket: String = row.get(4)?;
-        let discipline = parse_discipline(&row.get::<_, String>(5)?);
-        let source_kind = parse_source_kind(&row.get::<_, String>(6)?);
-        let resource_type = parse_resource_type(&row.get::<_, String>(7)?);
-        let origin_files_json: String = row.get(11)?;
+        let source_group: String = row.get(5)?;
+        let discipline = parse_discipline(&row.get::<_, String>(6)?);
+        let source_kind = parse_source_kind(&row.get::<_, String>(7)?);
+        let resource_type = parse_resource_type(&row.get::<_, String>(8)?);
+        let origin_files_json: String = row.get(12)?;
         let origin_files =
             serde_json::from_str::<Vec<String>>(&origin_files_json).unwrap_or_default();
-        let last_fetched_raw: Option<String> = row.get(13)?;
-        let last_success_raw: Option<String> = row.get(14)?;
-        let last_error_raw: Option<String> = row.get(15)?;
+        let last_fetched_raw: Option<String> = row.get(14)?;
+        let last_success_raw: Option<String> = row.get(15)?;
+        let last_error_raw: Option<String> = row.get(16)?;
         Ok((
             RssSource {
                 id: row.get(0)?,
@@ -2090,13 +2397,14 @@ pub fn list_due_sources(
                 url: row.get(2)?,
                 module,
                 bucket,
+                group: source_group,
                 discipline: discipline.clone(),
                 source_kind: source_kind.clone(),
                 resource_type,
-                language: row.get(8)?,
-                enabled: row.get::<_, i64>(12)? == 1,
-                enabled_by_default: row.get::<_, i64>(9)? == 1,
-                postponed: row.get::<_, i64>(10)? == 1,
+                language: row.get(9)?,
+                enabled: row.get::<_, i64>(13)? == 1,
+                enabled_by_default: row.get::<_, i64>(10)? == 1,
+                postponed: row.get::<_, i64>(11)? == 1,
                 origin_files,
             },
             last_fetched_raw,
@@ -2108,43 +2416,171 @@ pub fn list_due_sources(
     let mut sources = Vec::new();
     for row in rows {
         let (source, last_fetched_raw, last_success_raw, last_error_raw) = row?;
-        if !source.enabled || !selected.contains(&source.discipline) {
+        if !source.enabled {
             continue;
         }
-        let regular_interval =
-            policy::fetch_interval_for_source(&source.module, &source.bucket, &source.source_kind);
-        let failed_retry_interval = policy::fetch_retry_interval_for_failed_source(
-            &source.module,
-            &source.bucket,
-            &source.source_kind,
-        );
-        let last_fetched = last_fetched_raw.as_deref().and_then(parse_datetime);
-        let last_success = last_success_raw.as_deref().and_then(parse_datetime);
-        let has_error = last_error_raw
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
-
-        let due = match last_fetched {
-            None => true,
-            Some(last_fetched_at) => {
-                let last_cycle_failed = has_error
-                    && last_success
-                        .map(|last_success_at| last_success_at < last_fetched_at)
-                        .unwrap_or(true);
-                let required_interval = if last_cycle_failed {
-                    failed_retry_interval
-                } else {
-                    regular_interval
-                };
-                now - last_fetched_at >= required_interval
-            }
+        let module = policy::normalize_module(&source.module);
+        let bucket = policy::normalize_bucket(&source.bucket);
+        let Some(selected_buckets) = module_preferences.get(&module) else {
+            continue;
         };
-        if force_all || due {
-            sources.push(source);
+        if !selected_buckets.is_empty() && !selected_buckets.contains(&bucket) {
+            continue;
+        }
+        sources.push(SourceFetchStateRow {
+            source,
+            last_fetched_at: last_fetched_raw.as_deref().and_then(parse_datetime),
+            last_success_at: last_success_raw.as_deref().and_then(parse_datetime),
+            has_error: last_error_raw
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        });
+    }
+    Ok(sources)
+}
+
+fn module_fetch_interval(settings: &SettingsPayload, module: &str) -> chrono::Duration {
+    let module = policy::normalize_module(module);
+    chrono::Duration::hours(
+        settings
+            .module_fetch_intervals
+            .get(&module)
+            .copied()
+            .unwrap_or_else(|| policy::default_module_fetch_interval_hours(&module))
+            .clamp(1, 168),
+    )
+}
+
+fn module_refresh_due(
+    last_module_run_at: Option<DateTime<Utc>>,
+    interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    match last_module_run_at {
+        None => true,
+        Some(last_run_at) => now - last_run_at >= interval,
+    }
+}
+
+fn source_due_for_module_refresh(
+    last_success_at: Option<DateTime<Utc>>,
+    interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    match last_success_at {
+        None => true,
+        Some(last_success_at) => now - last_success_at >= interval,
+    }
+}
+
+fn source_due_for_retry(
+    last_fetched_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    has_error: bool,
+    retry_interval: chrono::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    if !has_error {
+        return false;
+    }
+    let Some(last_fetched_at) = last_fetched_at else {
+        return false;
+    };
+    let last_cycle_failed = last_success_at
+        .map(|last_success_at| last_success_at < last_fetched_at)
+        .unwrap_or(true);
+    last_cycle_failed && now - last_fetched_at >= retry_interval
+}
+
+pub fn list_enabled_modules(conn: &Connection) -> Result<BTreeSet<String>> {
+    let rows = list_selected_source_fetch_rows(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| policy::normalize_module(&row.source.module))
+        .collect())
+}
+
+pub fn list_due_modules(conn: &Connection, now: DateTime<Utc>) -> Result<BTreeSet<String>> {
+    let settings = read_settings(conn)?;
+    let enabled_modules = list_enabled_modules(conn)?;
+    let mut due_modules = BTreeSet::new();
+    for module in enabled_modules {
+        if module_refresh_due(
+            read_module_last_run_at(conn, &module)?,
+            module_fetch_interval(&settings, &module),
+            now,
+        ) {
+            due_modules.insert(module);
+        }
+    }
+    Ok(due_modules)
+}
+
+pub fn list_module_refresh_sources(
+    conn: &Connection,
+    modules: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    force_all_sources: bool,
+) -> Result<Vec<RssSource>> {
+    if modules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let settings = read_settings(conn)?;
+    let rows = list_selected_source_fetch_rows(conn)?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let module = policy::normalize_module(&row.source.module);
+        if !modules.contains(&module) {
+            continue;
+        }
+        if force_all_sources
+            || source_due_for_module_refresh(
+                row.last_success_at,
+                module_fetch_interval(&settings, &module),
+                now,
+            )
+        {
+            sources.push(row.source);
         }
     }
     Ok(sources)
+}
+
+pub fn list_retry_due_sources(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    excluded_modules: &BTreeSet<String>,
+) -> Result<Vec<RssSource>> {
+    let rows = list_selected_source_fetch_rows(conn)?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let module = policy::normalize_module(&row.source.module);
+        if excluded_modules.contains(&module) {
+            continue;
+        }
+        if source_due_for_retry(
+            row.last_fetched_at,
+            row.last_success_at,
+            row.has_error,
+            policy::fetch_retry_interval_for_failed_source(
+                &row.source.module,
+                &row.source.group,
+                &row.source.source_kind,
+            ),
+            now,
+        ) {
+            sources.push(row.source);
+        }
+    }
+    Ok(sources)
+}
+
+pub fn count_due_sources(conn: &Connection, now: DateTime<Utc>) -> Result<usize> {
+    let due_modules = list_due_modules(conn, now)?;
+    Ok(list_module_refresh_sources(conn, &due_modules, now, false)?.len()
+        + list_retry_due_sources(conn, now, &due_modules)?.len())
 }
 
 pub fn upsert_content_pool_entry(
@@ -2157,7 +2593,7 @@ pub fn upsert_content_pool_entry(
     published_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let module = policy::normalize_module(module);
-    let bucket = policy::normalize_bucket(&module, bucket);
+    let bucket = policy::normalize_bucket(bucket);
     conn.execute(
         r#"
         INSERT INTO ranked_content_pool (article_id, module, bucket, source_kind, fit_score, published_at, inserted_at)
@@ -2281,38 +2717,46 @@ pub fn content_pool_stats(conn: &Connection) -> Result<Vec<ContentPoolStat>> {
     Ok(stats)
 }
 
-pub fn list_top_bucket_candidates(
+pub fn list_top_module_candidates(
     conn: &Connection,
-    buckets: &BTreeSet<(String, String)>,
-    max_per_bucket: usize,
+    modules: &BTreeSet<String>,
+    module_push_top_n: &BTreeMap<String, i64>,
     max_age_days: i64,
     min_fit_score: i64,
 ) -> Result<Vec<i64>> {
-    if buckets.is_empty() || max_per_bucket == 0 {
+    if modules.is_empty() {
         return Ok(Vec::new());
     }
 
     let cutoff = (Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
     let mut selected = Vec::<(i64, i64, Option<DateTime<Utc>>)>::new();
 
-    for (module, bucket) in buckets {
+    for module in modules {
+        let max_per_module = module_push_top_n
+            .get(module)
+            .copied()
+            .unwrap_or_else(|| policy::default_module_push_top_n(module))
+            .clamp(1, 24) as usize;
+        if max_per_module == 0 {
+            continue;
+        }
+
         let mut stmt = conn.prepare(
             r#"
             SELECT rcp.article_id, rcp.fit_score, a.published_at, a.fetched_at
             FROM ranked_content_pool rcp
             JOIN articles a ON a.id = rcp.article_id
             WHERE rcp.module = ?1
-              AND rcp.bucket = ?2
               AND a.score_status = 'success'
               AND COALESCE(a.published_at, a.fetched_at, '1970-01-01T00:00:00Z') >= ?3
-              AND rcp.fit_score >= ?4
+              AND rcp.fit_score >= ?2
             ORDER BY rcp.fit_score DESC, COALESCE(a.published_at, a.fetched_at) DESC, rcp.article_id DESC
-            LIMIT ?5
+            LIMIT ?4
             "#,
         )?;
 
         let rows = stmt.query_map(
-            params![module, bucket, cutoff, min_fit_score, max_per_bucket as i64],
+            params![module, min_fit_score, cutoff, max_per_module as i64],
             |row| {
                 let published_at_raw: Option<String> = row.get(2)?;
                 let fetched_at_raw: Option<String> = row.get(3)?;
@@ -2413,161 +2857,149 @@ pub fn log_user_event(
 
 pub fn refresh_daily_memory(
     conn: &Connection,
-    memory_enabled: bool,
+    _memory_enabled: bool,
 ) -> Result<Option<InterestMemoryRecord>> {
-    if !memory_enabled {
-        return read_latest_memory(conn);
-    }
+    read_latest_memory(conn)
+}
 
-    let day_key = Utc::now().format("%Y-%m-%d").to_string();
-    let like_prefix = format!("{day_key}%");
-    let opened_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'open-article' AND created_at LIKE ?1",
-        params![like_prefix],
-        |row| row.get(0),
-    )?;
-    let favorite_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'favorite-added' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-    let reminder_view_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'bubble-view' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-    let reminder_ignore_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM user_behavior_events WHERE event_type = 'bubble-ignore' AND created_at LIKE ?1",
-        params![format!("{day_key}%")],
-        |row| row.get(0),
-    )?;
-
-    let mut top_disciplines_stmt = conn.prepare(
+pub fn list_weekly_memory_signals(
+    conn: &Connection,
+    start_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Result<Vec<(String, String, String, String)>> {
+    let mut stmt = conn.prepare(
         r#"
-        SELECT a.discipline, COUNT(*)
-        FROM user_behavior_events ube
-        JOIN articles a ON a.id = ube.article_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY a.discipline
-        ORDER BY COUNT(*) DESC, a.discipline ASC
-        LIMIT 2
-        "#,
-    )?;
-    let top_discipline_rows = top_disciplines_stmt
-        .query_map(params![format!("{day_key}%")], |row| {
-            Ok(parse_discipline(&row.get::<_, String>(0)?))
-        })?;
-    let mut top_disciplines = Vec::new();
-    for row in top_discipline_rows {
-        top_disciplines.push(row?);
-    }
-
-    let mut top_kind_stmt = conn.prepare(
-        r#"
-        SELECT a.source_kind, COUNT(*)
-        FROM user_behavior_events ube
-        JOIN articles a ON a.id = ube.article_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY a.source_kind
-        ORDER BY COUNT(*) DESC, a.source_kind ASC
-        LIMIT 1
-        "#,
-    )?;
-    let top_source_kind = top_kind_stmt
-        .query_row(params![format!("{day_key}%")], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?
-        .map(|value| parse_source_kind(&value));
-
-    let mut top_bucket_stmt = conn.prepare(
-        r#"
-        SELECT sc.module, sc.bucket, COUNT(*)
+        SELECT DISTINCT
+          a.title,
+          COALESCE(a.summary, ''),
+          COALESCE(a.note, ''),
+          COALESCE(sc.module, 'other') || '/' || COALESCE(sc.bucket, 'general') || '/' || COALESCE(sc.source_group, 'general') AS source_path
         FROM user_behavior_events ube
         JOIN articles a ON a.id = ube.article_id
         LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
-        WHERE ube.created_at LIKE ?1
-          AND ube.event_type IN ('open-article', 'favorite-added')
-        GROUP BY sc.module, sc.bucket
-        ORDER BY COUNT(*) DESC, sc.module ASC, sc.bucket ASC
-        LIMIT 2
+        WHERE ube.created_at >= ?1
+          AND ube.created_at < ?2
+          AND (
+            ube.event_type = 'favorite-added'
+            OR ube.event_type = 'note-updated'
+          )
+        ORDER BY ube.created_at DESC, a.id DESC
+        LIMIT 24
         "#,
     )?;
-    let top_bucket_rows = top_bucket_stmt.query_map(params![format!("{day_key}%")], |row| {
-        let module = row
-            .get::<_, Option<String>>(0)?
-            .unwrap_or_else(|| "other".to_string());
-        let bucket = row
-            .get::<_, Option<String>>(1)?
-            .unwrap_or_else(|| "unspecified".to_string());
-        Ok((module, bucket))
-    })?;
-    let mut top_buckets = Vec::new();
-    for row in top_bucket_rows {
-        top_buckets.push(row?);
+    let rows = stmt.query_map(
+        params![start_at.to_rfc3339(), end_at.to_rfc3339()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row?);
     }
+    Ok(output)
+}
 
-    let discipline_summary = if top_disciplines.is_empty() {
-        "你今天的行为还不够多，系统暂时沿用当前已配置的兴趣方向。".to_string()
-    } else {
-        format!(
-            "你今天更关注 {} 方向的内容，说明这些主题仍然最值得优先推送。",
-            top_disciplines
-                .iter()
-                .map(Discipline::display_name)
-                .collect::<Vec<_>>()
-                .join("、")
-        )
-    };
-    let action_summary = format!(
-        "今天共打开 {} 篇、收藏 {} 篇、主动查看提醒 {} 次、忽略提醒 {} 次{}。",
-        opened_count,
-        favorite_count,
-        reminder_view_count,
-        reminder_ignore_count,
-        top_source_kind
-            .map(|kind| format!("，你对 {} 的响应更积极", source_kind_label(&kind)))
-            .unwrap_or_default()
-    );
+pub fn has_memory_review_for_week(conn: &Connection, week_key: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM memory_review_proposals WHERE week_key = ?1 LIMIT 1",
+        params![week_key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(Into::into)
+}
 
-    let bucket_summary = if top_buckets.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " 高频子分类集中在 {}。",
-            top_buckets
-                .iter()
-                .map(|(module, bucket)| {
-                    format!("{} / {}", module_label(module), bucket_label(bucket))
-                })
-                .collect::<Vec<_>>()
-                .join("、")
-        )
-    };
-
-    let generated_summary = format!("{discipline_summary} {action_summary}{bucket_summary}");
+pub fn create_memory_review_proposal(
+    conn: &Connection,
+    week_key: &str,
+    base_summary: &str,
+    proposed_summary: &str,
+) -> Result<MemoryReviewProposal> {
+    let id = format!("memory-review-{week_key}");
+    let created_at = Utc::now();
     conn.execute(
         r#"
-        INSERT INTO daily_interest_memory (day_key, generated_summary, confirmed_summary, memory_enabled, event_count, updated_at)
-        VALUES (?1, ?2, COALESCE((SELECT confirmed_summary FROM daily_interest_memory WHERE day_key = ?1), NULL), ?3, ?4, ?5)
-        ON CONFLICT(day_key) DO UPDATE SET
-          generated_summary = excluded.generated_summary,
-          memory_enabled = excluded.memory_enabled,
-          event_count = excluded.event_count,
-          updated_at = excluded.updated_at
+        INSERT OR REPLACE INTO memory_review_proposals (
+          id, week_key, base_summary, proposed_summary, status, user_response, created_at, decided_at
+        ) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)
         "#,
         params![
-            day_key,
-            generated_summary,
-            bool_to_int(memory_enabled),
-            (opened_count + favorite_count + reminder_view_count + reminder_ignore_count) as i64,
-            Utc::now().to_rfc3339(),
+            id,
+            week_key,
+            base_summary.trim(),
+            proposed_summary.trim(),
+            created_at.to_rfc3339(),
         ],
     )?;
 
-    read_latest_memory(conn)
+    Ok(MemoryReviewProposal {
+        id: format!("memory-review-{week_key}"),
+        week_key: week_key.to_string(),
+        base_summary: base_summary.trim().to_string(),
+        proposed_summary: proposed_summary.trim().to_string(),
+        status: "pending".to_string(),
+        created_at,
+    })
+}
+
+pub fn read_pending_memory_review(conn: &Connection) -> Result<Option<MemoryReviewProposal>> {
+    conn.query_row(
+        r#"
+        SELECT id, week_key, base_summary, proposed_summary, status, created_at
+        FROM memory_review_proposals
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        [],
+        |row| {
+            let created_at_raw: String = row.get(5)?;
+            Ok(MemoryReviewProposal {
+                id: row.get(0)?,
+                week_key: row.get(1)?,
+                base_summary: row.get(2)?,
+                proposed_summary: row.get(3)?,
+                status: row.get(4)?,
+                created_at: parse_datetime(&created_at_raw).unwrap_or_else(Utc::now),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn resolve_memory_review_proposal(
+    conn: &Connection,
+    proposal_id: &str,
+    status: &str,
+    user_response: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE memory_review_proposals
+        SET status = ?2,
+            user_response = ?3,
+            decided_at = ?4
+        WHERE id = ?1
+        "#,
+        params![proposal_id, status, user_response, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn reject_pending_memory_reviews(conn: &Connection) -> Result<usize> {
+    let changed = conn.execute(
+        r#"
+        UPDATE memory_review_proposals
+        SET status = 'rejected',
+            user_response = COALESCE(user_response, 'auto-rejected on app restart'),
+            decided_at = ?1
+        WHERE status = 'pending'
+        "#,
+        params![Utc::now().to_rfc3339()],
+    )?;
+    Ok(changed)
 }
 
 pub fn read_latest_memory(conn: &Connection) -> Result<Option<InterestMemoryRecord>> {
@@ -2623,9 +3055,9 @@ pub fn build_snapshot(
     last_scan_at: Option<DateTime<Utc>>,
 ) -> Result<Snapshot> {
     let settings = read_settings(conn)?;
-    let due_sources = list_due_sources(conn, Utc::now(), false)?.len();
+    let due_sources = count_due_sources(conn, Utc::now())?;
     let selected_disciplines = settings
-        .disciplines
+        .module_preferences
         .iter()
         .filter(|item| item.enabled)
         .count();
@@ -2655,6 +3087,7 @@ pub fn build_snapshot(
         last_scan_at,
         content_pool_stats: content_pool_stats(conn)?,
         memory: read_latest_memory(conn)?,
+        memory_review: read_pending_memory_review(conn)?,
         source_summary: SourceCatalogSummary {
             total_sources,
             enabled_sources,
@@ -2712,7 +3145,7 @@ fn list_user_sources(conn: &Connection) -> Result<Vec<RssSource>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
-          sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.discipline,
+          sc.source_id, sc.name, sc.rss_url, sc.module, sc.bucket, sc.source_group, sc.discipline,
           sc.source_kind, sc.resource_type, sc.language, usp.enabled,
           sc.enabled_by_default, sc.postponed, sc.origin_files
         FROM source_catalog sc
@@ -2722,7 +3155,7 @@ fn list_user_sources(conn: &Connection) -> Result<Vec<RssSource>> {
     )?;
 
     let rows = stmt.query_map([], |row| {
-        let origin_files_json: String = row.get(12)?;
+        let origin_files_json: String = row.get(13)?;
         let origin_files =
             serde_json::from_str::<Vec<String>>(&origin_files_json).unwrap_or_default();
         Ok(RssSource {
@@ -2731,13 +3164,14 @@ fn list_user_sources(conn: &Connection) -> Result<Vec<RssSource>> {
             url: row.get(2)?,
             module: row.get(3)?,
             bucket: row.get(4)?,
-            discipline: parse_discipline(&row.get::<_, String>(5)?),
-            source_kind: parse_source_kind(&row.get::<_, String>(6)?),
-            resource_type: parse_resource_type(&row.get::<_, String>(7)?),
-            language: row.get(8)?,
-            enabled: row.get::<_, i64>(9)? == 1,
-            enabled_by_default: row.get::<_, i64>(10)? == 1,
-            postponed: row.get::<_, i64>(11)? == 1,
+            group: row.get(5)?,
+            discipline: parse_discipline(&row.get::<_, String>(6)?),
+            source_kind: parse_source_kind(&row.get::<_, String>(7)?),
+            resource_type: parse_resource_type(&row.get::<_, String>(8)?),
+            language: row.get(9)?,
+            enabled: row.get::<_, i64>(10)? == 1,
+            enabled_by_default: row.get::<_, i64>(11)? == 1,
+            postponed: row.get::<_, i64>(12)? == 1,
             origin_files,
         })
     })?;
@@ -2769,41 +3203,61 @@ fn list_discipline_preferences(conn: &Connection) -> Result<Vec<UserDisciplinePr
     Ok(items)
 }
 
-fn list_selected_effective_disciplines(conn: &Connection) -> Result<Vec<Discipline>> {
-    Ok(list_discipline_preferences(conn)?
-        .into_iter()
-        .filter(|item| item.enabled)
-        .map(|item| item.discipline)
-        .collect())
+fn list_module_preferences(conn: &Connection) -> Result<Vec<UserModulePreference>> {
+    let mut stmt = conn.prepare(
+        "SELECT module, enabled, preference, selected_buckets FROM user_module_preferences ORDER BY module ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let selected_buckets_raw: String = row.get(3)?;
+        Ok(UserModulePreference {
+            module: row.get(0)?,
+            enabled: row.get::<_, i64>(1)? == 1,
+            preference: row.get(2)?,
+            selected_buckets: serde_json::from_str::<Vec<String>>(&selected_buckets_raw)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|bucket| policy::normalize_bucket(&bucket))
+                .collect(),
+        })
+    })?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
+fn module_bucket_index(sources: &[RssSource]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut output = BTreeMap::<String, BTreeSet<String>>::new();
+    for source in sources {
+        output
+            .entry(policy::normalize_module(&source.module))
+            .or_default()
+            .insert(policy::normalize_bucket(&source.bucket));
+    }
+    output
 }
 
 fn list_dueable_enabled_sources_count(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        r#"
-        SELECT COUNT(*)
-        FROM source_catalog sc
-        JOIN user_source_pool usp ON usp.source_id = sc.source_id
-                WHERE usp.enabled = 1
-        "#,
-        [],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    Ok(list_selected_source_fetch_rows(conn)?.len() as i64)
 }
 
 fn load_catalog(app: &AppHandle) -> Result<Vec<RssSource>> {
     let mut load_errors = Vec::new();
-    for candidate in build_resource_candidates(app, "rss-catalog.opml") {
-        if !candidate.exists() {
-            continue;
-        }
-        match parse_v3_opml_catalog(&candidate) {
-            Ok(catalog) if !catalog.is_empty() => return Ok(catalog),
-            Ok(_) => load_errors.push(format!(
-                "v3 catalog empty after parse: {}",
-                candidate.display()
-            )),
-            Err(err) => load_errors.push(err.to_string()),
+    for resource_name in ["rss-catalog.opml"] {
+        for candidate in build_resource_candidates(app, resource_name) {
+            if !candidate.exists() {
+                continue;
+            }
+            match parse_v3_opml_catalog(&candidate) {
+                Ok(catalog) if !catalog.is_empty() => return Ok(catalog),
+                Ok(_) => load_errors.push(format!(
+                    "v3 catalog empty after parse: {}",
+                    candidate.display()
+                )),
+                Err(err) => load_errors.push(err.to_string()),
+            }
         }
     }
 
@@ -2889,8 +3343,10 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 let category = attrs.get("category").map(String::as_str);
                 let module = attrs.get("module").map(String::as_str);
                 let bucket = attrs.get("bucket").map(String::as_str);
+                let group = attrs.get("group").map(String::as_str);
                 let module_code = normalize_v3_module(module, category);
-                let bucket_code = normalize_v3_bucket(&module_code, bucket, category);
+                let bucket_code = normalize_v3_bucket(bucket, category);
+                let group_code = normalize_v3_group(group, category);
                 let language = attrs
                     .get("language")
                     .map(String::as_str)
@@ -2915,8 +3371,9 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                         url: canonical_url.clone(),
                         module: module_code.clone(),
                         bucket: bucket_code.clone(),
+                        group: group_code.clone(),
                         discipline: map_v3_module_to_discipline(&module_code),
-                        source_kind: map_v3_bucket_to_source_kind(&bucket_code),
+                        source_kind: map_v3_group_to_source_kind(&group_code),
                         resource_type,
                         language: language.clone(),
                         enabled: true,
@@ -2936,8 +3393,9 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
                 source.enabled_by_default = true;
                 source.module = module_code.clone();
                 source.bucket = bucket_code.clone();
+                source.group = group_code.clone();
                 source.discipline = map_v3_module_to_discipline(&module_code);
-                source.source_kind = map_v3_bucket_to_source_kind(&bucket_code);
+                source.source_kind = map_v3_group_to_source_kind(&group_code);
                 source.resource_type = map_v3_resource_type(
                     attrs.get("resourceType").map(String::as_str),
                     &canonical_url,
@@ -2965,6 +3423,7 @@ fn parse_v3_opml_catalog(path: &Path) -> Result<Vec<RssSource>> {
         left.module
             .cmp(&right.module)
             .then_with(|| left.bucket.cmp(&right.bucket))
+            .then_with(|| left.group.cmp(&right.group))
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(catalog)
@@ -2984,19 +3443,32 @@ fn normalize_v3_module(module: Option<&str>, category: Option<&str>) -> String {
         .unwrap_or_else(|| "other".to_string())
 }
 
-fn normalize_v3_bucket(module: &str, bucket: Option<&str>, category: Option<&str>) -> String {
-    let module = policy::normalize_module(module);
+fn normalize_v3_bucket(bucket: Option<&str>, category: Option<&str>) -> String {
     bucket
-        .map(|value| policy::normalize_bucket(&module, value))
+        .map(policy::normalize_bucket)
         .or_else(|| {
             category.and_then(|value| {
                 value
                     .split(',')
                     .nth(1)
-                    .map(|part| policy::normalize_bucket(&module, part.trim()))
+                    .map(|part| policy::normalize_bucket(part.trim()))
             })
         })
-        .unwrap_or_else(|| "unspecified".to_string())
+        .unwrap_or_else(|| "general".to_string())
+}
+
+fn normalize_v3_group(group: Option<&str>, category: Option<&str>) -> String {
+    group
+        .map(policy::normalize_group)
+        .or_else(|| {
+            category.and_then(|value| {
+                value
+                    .split(',')
+                    .nth(2)
+                    .map(|part| policy::normalize_group(part.trim()))
+            })
+        })
+        .unwrap_or_else(|| "general".to_string())
 }
 
 fn map_v3_module_to_discipline(module: &str) -> Discipline {
@@ -3004,24 +3476,22 @@ fn map_v3_module_to_discipline(module: &str) -> Discipline {
         "technology" => Discipline::Technology,
         "social_science" => Discipline::SocialScience,
         "business" => Discipline::Other,
-        "growth" => Discipline::Life,
-        "news_opinion" => Discipline::News,
-        "entertainment" => Discipline::Humanities,
+        "design" => Discipline::Humanities,
         "science" => Discipline::Science,
         "medicine" => Discipline::Medicine,
         _ => Discipline::Other,
     }
 }
 
-fn map_v3_bucket_to_source_kind(bucket: &str) -> SourceKind {
-    match bucket {
-        "research" | "academic_frontier" | "physics" | "chemistry" | "biology" => {
-            SourceKind::AcademicJournal
-        }
-        "official" => SourceKind::OfficialAnnouncement,
-        "blogs" => SourceKind::TechnicalBlog,
-        "community" | "streaming" | "news" | "personal_opinion" | "streaming_opinion"
-        | "community_opinion" | "media_opinion" | "lite_pool" => SourceKind::CommunityHotspot,
+fn map_v3_group_to_source_kind(source_group: &str) -> SourceKind {
+    match source_group {
+        "frontier" | "research" | "academic" | "clinical_trials" | "genomics"
+        | "biostatistics" | "biomaterials" | "biomechanics" | "computational_biology"
+        | "bioinformatics" | "systems_biology" | "pharmacogenomics" | "drug_discovery"
+        | "pharmacology" | "toxicology" => SourceKind::AcademicJournal,
+        "official" | "regulatory_science" | "clinical_safety" => SourceKind::OfficialAnnouncement,
+        "blogs" | "product_engineering" | "cad_and_cae" | "systems_engineering"
+        | "medical_devices" | "medical_imaging" => SourceKind::TechnicalBlog,
         _ => SourceKind::CommunityHotspot,
     }
 }
@@ -3325,9 +3795,7 @@ fn module_label(raw: &str) -> &'static str {
         "technology" => "科技",
         "social_science" => "社科",
         "business" => "商业",
-        "growth" => "成长",
-        "news_opinion" => "新闻观点",
-        "entertainment" => "娱乐",
+        "design" => "设计",
         "science" => "科学",
         "medicine" => "医学",
         _ => "其他",
@@ -3339,9 +3807,9 @@ fn discipline_modules(discipline: &Discipline) -> &'static [&'static str] {
         Discipline::Technology => &["technology"],
         Discipline::SocialScience => &["social_science"],
         Discipline::Other => &["business"],
-        Discipline::Life => &["growth"],
-        Discipline::News => &["news_opinion"],
-        Discipline::Humanities => &["entertainment"],
+        Discipline::Life => &["business"],
+        Discipline::News => &["other"],
+        Discipline::Humanities => &["design"],
         Discipline::Science => &["science"],
         Discipline::Medicine => &["medicine"],
     }
@@ -3350,20 +3818,82 @@ fn discipline_modules(discipline: &Discipline) -> &'static [&'static str] {
 fn bucket_label(raw: &str) -> &'static str {
     match raw {
         "research" => "研究",
-        "academic_frontier" => "学术前沿",
+        "frontier" => "前沿",
         "official" => "官方",
         "blogs" => "博客",
         "community" => "社区",
-        "streaming" => "流媒体",
         "news" => "新闻",
-        "personal_opinion" => "个人观点",
-        "streaming_opinion" => "流媒体观点",
-        "community_opinion" => "社区观点",
-        "media_opinion" => "媒体观点",
-        "lite_pool" => "轻量池",
+        "opinion" => "观点",
         "physics" => "物理",
         "chemistry" => "化学",
         "biology" => "生物",
         _ => "未分类",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone, Utc};
+
+    use super::{module_refresh_due, source_due_for_module_refresh, source_due_for_retry};
+
+    #[test]
+    fn module_refresh_uses_module_clock() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        assert!(module_refresh_due(None, Duration::hours(6), now));
+        assert!(module_refresh_due(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 6, 0, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+        assert!(!module_refresh_due(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 8, 30, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+    }
+
+    #[test]
+    fn module_refresh_source_uses_last_success_time() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        assert!(source_due_for_module_refresh(None, Duration::hours(12), now));
+        assert!(source_due_for_module_refresh(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 0, 0, 0).unwrap()),
+            Duration::hours(12),
+            now,
+        ));
+        assert!(!source_due_for_module_refresh(
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 10, 30, 0).unwrap()),
+            Duration::hours(6),
+            now,
+        ));
+    }
+
+    #[test]
+    fn retry_only_runs_for_unrecovered_failures() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        let failed_at = Utc.with_ymd_and_hms(2026, 4, 24, 10, 0, 0).unwrap();
+        let old_success = Utc.with_ymd_and_hms(2026, 4, 24, 8, 0, 0).unwrap();
+        assert!(source_due_for_retry(
+            Some(failed_at),
+            Some(old_success),
+            true,
+            Duration::hours(2),
+            now,
+        ));
+        assert!(!source_due_for_retry(
+            Some(failed_at),
+            Some(Utc.with_ymd_and_hms(2026, 4, 24, 11, 0, 0).unwrap()),
+            true,
+            Duration::hours(2),
+            now,
+        ));
+        assert!(!source_due_for_retry(
+            Some(failed_at),
+            Some(old_success),
+            false,
+            Duration::hours(2),
+            now,
+        ));
     }
 }

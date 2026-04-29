@@ -1,7 +1,12 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Utc, Weekday};
 use futures::future::join_all;
-use std::{collections::HashSet, fs::OpenOptions, io::Write, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fs::OpenOptions,
+    io::Write,
+    time::Instant,
+};
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Duration as TokioDuration};
 
@@ -18,11 +23,11 @@ const MAX_CONCURRENT_SCORE_BATCHES: usize = 20;
 const MAX_SOURCES_PER_CYCLE: usize = 150;
 const SCHEDULER_TICK_MINUTES: u64 = 15;
 const POLLING_PEEK_SECONDS: u64 = 2;
-const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 7;
-const PUSH_TOP_PER_BUCKET: usize = 3;
+const INITIAL_FETCH_LOOKBACK_DAYS: i64 = 2;
 const PUSH_MAX_AGE_DAYS: i64 = 2;
 const PUSH_MIN_FIT_SCORE: i64 = 60;
 const PENDING_BACKLOG_BATCH_SIZE: usize = 180;
+const MEMORY_REVIEW_TRIGGER_HOUR_BJT: u32 = 21;
 pub const EVENT_SNAPSHOT_UPDATED: &str = "briefy://snapshot-updated";
 pub const EVENT_OVERLAY_UPDATED: &str = "briefy://overlay-updated";
 
@@ -287,7 +292,7 @@ pub fn reconcile_fetch_runtime(app: &AppHandle) -> Result<()> {
         return Ok(());
     }
 
-    if db::list_due_sources(&conn, Utc::now(), false)?.is_empty() {
+    if db::count_due_sources(&conn, Utc::now())? == 0 {
         append_fetch_debug_log(app, "reconcile: skipped because there are no due sources");
         return Ok(());
     }
@@ -373,8 +378,9 @@ async fn run_scheduler_poll_cycle(app: AppHandle) {
         return;
     }
 
-    let due_sources = db::list_due_sources(&conn, Utc::now(), false).unwrap_or_default();
-    if due_sources.is_empty() {
+    let due_sources = db::count_due_sources(&conn, Utc::now()).unwrap_or_default();
+    if due_sources == 0 {
+        let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
         let _ = sync_windows(&app, false);
         let _ = publish_snapshot(&app, false);
         return;
@@ -386,7 +392,7 @@ async fn run_scheduler_poll_cycle(app: AppHandle) {
 pub fn trigger_fetch_now(
     app: &AppHandle,
     delay: Option<std::time::Duration>,
-    force_incremental: bool,
+    force_module_refresh: bool,
 ) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -395,10 +401,12 @@ pub fn trigger_fetch_now(
         }
         append_fetch_debug_log(
             &app_handle,
-            &format!("trigger_fetch_now: firing fetch task force_incremental={force_incremental}"),
+            &format!(
+                "trigger_fetch_now: firing fetch task force_module_refresh={force_module_refresh}"
+            ),
         );
         log_fetch_result(
-            run_fetch_cycle(app_handle.clone(), force_incremental).await,
+            run_fetch_cycle(app_handle.clone(), force_module_refresh).await,
             &app_handle,
         );
     });
@@ -467,7 +475,7 @@ pub async fn validate_api_key_for_settings(
     Ok(())
 }
 
-pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<()> {
+pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Result<()> {
     if !begin_scan(&app) {
         append_fetch_debug_log(
             &app,
@@ -477,7 +485,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     }
     append_fetch_debug_log(
         &app,
-        &format!("run_fetch_cycle: entered force_incremental={force_incremental}"),
+        &format!("run_fetch_cycle: entered force_module_refresh={force_module_refresh}"),
     );
     clear_polling_until(&app);
     clear_loading_until(&app);
@@ -542,11 +550,67 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         .map(|record| PendingArticle {
             article_id: record.id,
             article: record.article,
+            push_eligible: false,
         })
         .collect::<Vec<_>>();
     let interest_context = build_interest_context(&settings);
-    let mut next_force_incremental = force_incremental;
-    let mut total_due_sources = 0usize;
+    let plan_now = Utc::now();
+    let fetch_plan = build_fetch_plan(&conn, plan_now, force_module_refresh)?;
+    let cycle_kind = cycle_kind_label(&fetch_plan).to_string();
+    let modules_for_refresh = fetch_plan.modules_for_refresh.clone();
+    let module_source_count = fetch_plan.module_source_count;
+    let retry_source_count = fetch_plan.retry_source_count;
+    // Only stamp the module clock when there are actually sources to fetch.
+    // If module_sources=0 (all sources fetched recently), updating the clock here
+    // would push the next scheduled refresh far into the future unnecessarily.
+    if module_source_count > 0 {
+        db::update_module_fetch_states(&conn, &modules_for_refresh, plan_now)?;
+    }
+    append_fetch_debug_log(
+        &app,
+        &format!(
+            "run_fetch_cycle: fetch plan kind={} modules={} module_sources={} retry_sources={} backlog={}",
+            cycle_kind.as_str(),
+            describe_modules(&modules_for_refresh),
+            module_source_count,
+            retry_source_count,
+            pending_articles.len()
+        ),
+    );
+
+    if fetch_plan.sources.is_empty()
+        && pending_articles.is_empty()
+        && modules_for_refresh.is_empty()
+    {
+        let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
+        if memory.is_some() {
+            clear_last_error(&app);
+        }
+        let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
+        set_scanning(&app, false);
+        sync_windows(&app, false)?;
+        let _ = publish_snapshot(&app, false);
+        let cycle_ended_at = Utc::now();
+        let _ = db::log_crawl_cycle(
+            &conn,
+            cycle_started_at,
+            cycle_ended_at,
+            "idle-no-due-sources",
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            started_at.elapsed().as_millis(),
+            None,
+            None,
+        );
+        return Ok(());
+    }
+
+    let mut remaining_sources = fetch_plan.sources;
+    let total_due_sources = remaining_sources.len();
     let mut total_pending_articles = 0usize;
     let mut inserted_count = 0usize;
     let mut failed_scoring_count = 0usize;
@@ -554,20 +618,24 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     let mut score_errors = Vec::new();
     let mut total_fetch_duration_ms = 0u128;
     let mut total_llm_duration_ms = 0u128;
-    let mut updated_buckets = std::collections::BTreeSet::<(String, String)>::new();
-    let mut had_any_work = !pending_articles.is_empty();
-
-    loop {
-        let now = Utc::now();
-        let due_sources = db::list_due_sources(&conn, now, next_force_incremental)?;
-        let original_due_count = due_sources.len();
-        let (due_sources, remaining_due_sources) = clamp_due_sources_for_cycle(due_sources);
-        if remaining_due_sources > 0 {
+    let mut updated_modules = BTreeSet::<String>::new();
+    while !remaining_sources.is_empty() || !pending_articles.is_empty() {
+        let current_due_count = remaining_sources.len();
+        let batch_len = current_due_count.min(MAX_SOURCES_PER_CYCLE);
+        let planned_batch = if batch_len > 0 {
+            remaining_sources
+                .drain(..batch_len)
+                .collect::<Vec<PlannedSource>>()
+        } else {
+            Vec::new()
+        };
+        let remaining_due_sources = remaining_sources.len();
+        if current_due_count > batch_len {
             append_fetch_debug_log(
                 &app,
                 &format!(
                     "run_fetch_cycle: limiting due sources this cycle from {} to {}",
-                    original_due_count, MAX_SOURCES_PER_CYCLE
+                    current_due_count, MAX_SOURCES_PER_CYCLE
                 ),
             );
         }
@@ -575,48 +643,24 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
             &app,
             &format!(
                 "run_fetch_cycle: due source resolution complete due_sources={} backlog={} remaining_due_sources={}",
-                due_sources.len(),
+                planned_batch.len(),
                 pending_articles.len(),
                 remaining_due_sources
             ),
         );
 
-        if due_sources.is_empty() && pending_articles.is_empty() {
-            if !had_any_work {
-                let memory = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
-                if memory.is_some() {
-                    clear_last_error(&app);
-                }
-                set_scanning(&app, false);
-                sync_windows(&app, false)?;
-                let _ = publish_snapshot(&app, false);
-                let cycle_ended_at = Utc::now();
-                let _ = db::log_crawl_cycle(
-                    &conn,
-                    cycle_started_at,
-                    cycle_ended_at,
-                    "idle-no-due-sources",
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    started_at.elapsed().as_millis(),
-                    None,
-                    None,
-                );
-                return Ok(());
-            }
-            break;
-        }
-
-        had_any_work = true;
-        total_due_sources += due_sources.len();
-
-        if !due_sources.is_empty() {
+        if !planned_batch.is_empty() {
+            let fetch_timestamp = Utc::now();
+            let fetch_sources = planned_batch
+                .iter()
+                .map(|item| item.source.clone())
+                .collect::<Vec<_>>();
+            let reason_by_source = planned_batch
+                .iter()
+                .map(|item| (item.source.id.clone(), item.reason))
+                .collect::<HashMap<_, _>>();
             let fetch_started_at = Instant::now();
-            let fetch_outcome = match rss::fetch_sources(&due_sources).await {
+            let fetch_outcome = match rss::fetch_sources(&fetch_sources).await {
                 Ok(value) => value,
                 Err(err) => {
                     let cycle_ended_at = Utc::now();
@@ -648,25 +692,32 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                 ),
             );
 
-            let mut successful_source_ids = Vec::new();
             for result in fetch_outcome.results {
+                let push_eligible = reason_by_source
+                    .get(&result.source.id)
+                    .copied()
+                    .unwrap_or(FetchReason::RetryRecovery)
+                    == FetchReason::ModuleRefresh;
+                let is_initial_fetch =
+                    !db::source_has_successful_fetch(&conn, &result.source.id)?;
+                let incremental_cutoff = db::source_last_success_at(&conn, &result.source.id)?;
                 if let Some(error) = result.error {
-                    db::update_fetch_state(&conn, &result.source.id, now, None, Some(&error))?;
+                    db::update_fetch_state(
+                        &conn,
+                        &result.source.id,
+                        fetch_timestamp,
+                        None,
+                        Some(&error),
+                    )?;
                     fetch_errors.push(format!("{}: {}", result.source.name, error));
                     continue;
                 }
 
-                let is_initial_fetch = !db::source_has_successful_fetch(&conn, &result.source.id)?;
-                let incremental_cutoff = if next_force_incremental && !is_initial_fetch {
-                    db::source_last_fetched_at(&conn, &result.source.id)?
-                } else {
-                    None
-                };
                 let filtered = collect_pending_articles(
                     &conn,
                     result.articles,
                     is_initial_fetch,
-                    now,
+                    fetch_timestamp,
                     incremental_cutoff,
                 )?;
                 for article in filtered {
@@ -685,19 +736,22 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                         &article.source_kind,
                         &article.resource_type,
                         article.published_at,
-                        now,
+                        fetch_timestamp,
                         &article.content,
                     )?;
                     pending_articles.push(PendingArticle {
                         article_id,
                         article,
+                        push_eligible,
                     });
                 }
-                successful_source_ids.push(result.source.id);
-            }
-
-            for source_id in successful_source_ids {
-                db::update_fetch_state(&conn, &source_id, now, Some(now), None)?;
+                db::update_fetch_state(
+                    &conn,
+                    &result.source.id,
+                    fetch_timestamp,
+                    Some(fetch_timestamp),
+                    None,
+                )?;
             }
         }
 
@@ -738,10 +792,10 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
             for result in score_outcome.results {
                 if let Some(analysis) = result.analysis {
                     let module = policy::normalize_module(&result.article.module);
-                    let bucket = policy::normalize_bucket(&module, &result.article.bucket);
+                    let bucket = policy::normalize_bucket(&result.article.bucket);
                     let calibrated_fit_level = policy::fit_level_for_score(
                         &module,
-                        &bucket,
+                        &result.article.group,
                         &result.article.source_kind,
                         analysis.fit_score,
                     );
@@ -762,7 +816,9 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                         analysis.fit_score,
                         result.article.published_at,
                     )?;
-                    updated_buckets.insert((module, bucket));
+                    if result.push_eligible {
+                        updated_modules.insert(module);
+                    }
                     inserted_count += 1;
                 } else {
                     failed_scoring_count += 1;
@@ -787,13 +843,12 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
                 "run_fetch_cycle: continuing fetch session with remaining_due_sources={remaining_due_sources}"
             ),
         );
-        next_force_incremental = false;
     }
 
-    let reminder_candidates = db::list_top_bucket_candidates(
+    let reminder_candidates = db::list_top_module_candidates(
         &conn,
-        &updated_buckets,
-        PUSH_TOP_PER_BUCKET,
+        &updated_modules,
+        &settings.module_push_top_n,
         PUSH_MAX_AGE_DAYS,
         PUSH_MIN_FIT_SCORE,
     )?;
@@ -803,6 +858,7 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
     }
 
     let _ = db::refresh_daily_memory(&conn, settings.memory_mode_enabled)?;
+    let _ = maybe_generate_weekly_memory_review(&app, &settings).await;
     let completed_at = Utc::now();
     set_scanning(&app, false);
     set_last_scan_at(&app, Some(completed_at));
@@ -820,15 +876,15 @@ pub async fn run_fetch_cycle(app: AppHandle, force_incremental: bool) -> Result<
         Some(warnings.join(" | "))
     };
     let cycle_status = if warning_summary.is_some() || failed_scoring_count > 0 {
-        "completed-with-warnings"
+        format!("completed-{}-with-warnings", cycle_kind)
     } else {
-        "completed"
+        format!("completed-{}", cycle_kind)
     };
     let _ = db::log_crawl_cycle(
         &conn,
         cycle_started_at,
         cycle_ended_at,
-        cycle_status,
+        &cycle_status,
         total_due_sources,
         total_pending_articles,
         inserted_count,
@@ -1011,6 +1067,7 @@ async fn score_articles_in_batches(
                             .map(|(item, analysis)| ArticleScoreResult {
                                 article_id: item.article_id,
                                 article: item.article,
+                                push_eligible: item.push_eligible,
                                 analysis: Some(analysis),
                                 error: None,
                             })
@@ -1049,6 +1106,7 @@ async fn score_articles_in_batches(
                                 Ok(analysis) => fallback_results.push(ArticleScoreResult {
                                     article_id: item.article_id,
                                     article: item.article,
+                                    push_eligible: item.push_eligible,
                                     analysis: Some(analysis),
                                     error: None,
                                 }),
@@ -1062,6 +1120,7 @@ async fn score_articles_in_batches(
                                     fallback_results.push(ArticleScoreResult {
                                         article_id: item.article_id,
                                         article: item.article,
+                                        push_eligible: item.push_eligible,
                                         analysis: None,
                                         error: Some(message),
                                     });
@@ -1097,6 +1156,7 @@ async fn score_articles_in_batches(
                                 Ok(analysis) => fallback_results.push(ArticleScoreResult {
                                     article_id: item.article_id,
                                     article: item.article,
+                                    push_eligible: item.push_eligible,
                                     analysis: Some(analysis),
                                     error: None,
                                 }),
@@ -1110,6 +1170,7 @@ async fn score_articles_in_batches(
                                     fallback_results.push(ArticleScoreResult {
                                         article_id: item.article_id,
                                         article: item.article,
+                                        push_eligible: item.push_eligible,
                                         analysis: None,
                                         error: Some(message),
                                     });
@@ -1149,15 +1210,21 @@ async fn score_articles_in_batches(
 
 fn build_interest_context(settings: &SettingsPayload) -> String {
     let mut sections = Vec::new();
-    for item in settings.disciplines.iter().filter(|item| item.enabled) {
+    for item in settings.module_preferences.iter().filter(|item| item.enabled) {
+        let selected_buckets = if item.selected_buckets.is_empty() {
+            "未限定二级学科".to_string()
+        } else {
+            item.selected_buckets.join(" / ")
+        };
         sections.push(format!(
-            "- {}: {}",
-            item.discipline.display_name(),
+            "- {}（二级学科：{}）: {}",
+            item.module,
+            selected_buckets,
             item.preference.trim()
         ));
     }
     if settings.memory_mode_enabled && !settings.memory_summary.trim().is_empty() {
-        sections.push(format!("每日兴趣记忆: {}", settings.memory_summary.trim()));
+        sections.push(format!("当前已确认兴趣记忆: {}", settings.memory_summary.trim()));
     }
     sections.join("\n")
 }
@@ -1185,14 +1252,16 @@ fn effective_guid(article: &FeedArticle, article_key: &str) -> String {
 
 fn is_settings_complete(settings: &SettingsPayload) -> bool {
     let selected = settings
-        .disciplines
+        .module_preferences
         .iter()
         .filter(|item| item.enabled)
         .collect::<Vec<_>>();
     !selected.is_empty()
         && selected
             .iter()
-            .all(|item| !item.preference.trim().is_empty())
+            .all(|item| {
+                !item.preference.trim().is_empty() && !item.selected_buckets.is_empty()
+            })
         && llm_settings_complete(settings)
 }
 
@@ -1399,8 +1468,47 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
     publish_snapshot(app, scanning)
 }
 
+pub fn respond_memory_review(
+    app: &AppHandle,
+    action: &str,
+    summary: Option<&str>,
+) -> Result<Snapshot> {
+    let conn = db::connect(app)?;
+    let Some(proposal) = db::read_pending_memory_review(&conn)? else {
+        return snapshot(app, current_scanning(app));
+    };
+
+    match action {
+        "accept" => {
+            db::write_memory_summary(&conn, true, proposal.proposed_summary.trim())?;
+            db::resolve_memory_review_proposal(&conn, &proposal.id, "accepted", None)?;
+        }
+        "modify" => {
+            let revised = summary
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("memory review modify requires a non-empty summary"))?;
+            db::write_memory_summary(&conn, true, revised)?;
+            db::resolve_memory_review_proposal(&conn, &proposal.id, "edited", Some(revised))?;
+        }
+        "reject" => {
+            db::resolve_memory_review_proposal(&conn, &proposal.id, "rejected", summary)?;
+        }
+        _ => return Err(anyhow!("unsupported memory review action: {action}")),
+    }
+
+    let _ = hide_memory_review_window(app);
+    sync_windows(app, current_scanning(app))?;
+    publish_snapshot(app, current_scanning(app))
+}
+
 pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
     let current = publish_overlay(app, is_scanning)?;
+    let has_pending_memory_review = db::connect(app)
+        .and_then(|conn| db::read_pending_memory_review(&conn))
+        .ok()
+        .flatten()
+        .is_some();
     if let Some(window) = app.get_window("bubble") {
         if current.pet_status != PetStatus::Polling && current.active_reminder.is_some() {
             let _ = window.show();
@@ -1413,6 +1521,14 @@ pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
             should_show_pet_window(app, current.active_reminder.is_some(), is_scanning);
         if should_show {
             let _ = window.show();
+        } else {
+            let _ = window.hide();
+        }
+    }
+    if let Some(window) = app.get_window("memory-review") {
+        if has_pending_memory_review {
+            let _ = window.show();
+            let _ = window.set_focus();
         } else {
             let _ = window.hide();
         }
@@ -1436,6 +1552,123 @@ fn should_show_pet_window(app: &AppHandle, has_active_reminder: bool, is_scannin
     }
 
     false
+}
+
+async fn maybe_generate_weekly_memory_review(
+    app: &AppHandle,
+    settings: &SettingsPayload,
+) -> Result<()> {
+    if !settings.memory_mode_enabled || settings.api_key.trim().is_empty() {
+        return Ok(());
+    }
+
+    let Some((week_key, start_at, end_at)) = current_memory_review_window(Utc::now()) else {
+        return Ok(());
+    };
+    let read_conn = db::connect(app)?;
+    if db::has_memory_review_for_week(&read_conn, &week_key)? {
+        return Ok(());
+    }
+
+    let base_summary = current_base_memory(settings);
+    let signals = db::list_weekly_memory_signals(&read_conn, start_at, end_at)?;
+    if signals.is_empty() {
+        return Ok(());
+    }
+
+    let refined = llm::generate_weekly_memory_refinement(
+        &settings.llm_provider,
+        Some(&settings.llm_protocol),
+        Some(&settings.llm_base_url),
+        Some(&settings.llm_model),
+        &settings.api_key,
+        &base_summary,
+        &settings.module_preferences,
+        &signals,
+    )
+    .await?;
+
+    let write_conn = db::connect(app)?;
+    if db::has_memory_review_for_week(&write_conn, &week_key)? {
+        return Ok(());
+    }
+    db::create_memory_review_proposal(&write_conn, &week_key, &base_summary, &refined)?;
+    show_memory_review_window(app)?;
+    Ok(())
+}
+
+pub fn show_memory_review_window(app: &AppHandle) -> Result<()> {
+    if let Some(window) = app.get_window("memory-review") {
+        window.show()?;
+        window.set_focus()?;
+    }
+    Ok(())
+}
+
+pub fn hide_memory_review_window(app: &AppHandle) -> Result<()> {
+    if let Some(window) = app.get_window("memory-review") {
+        window.hide()?;
+    }
+    Ok(())
+}
+
+fn current_memory_review_window(
+    now_utc: DateTime<Utc>,
+) -> Option<(String, DateTime<Utc>, DateTime<Utc>)> {
+    let beijing = FixedOffset::east_opt(8 * 3600)?;
+    let local_now = now_utc.with_timezone(&beijing);
+    let weekday_offset = local_now.weekday().num_days_from_monday() as i64;
+    let monday = local_now.date_naive() - chrono::Duration::days(weekday_offset);
+    let review_trigger = beijing
+        .with_ymd_and_hms(
+            monday.year(),
+            monday.month(),
+            monday.day(),
+            MEMORY_REVIEW_TRIGGER_HOUR_BJT,
+            0,
+            0,
+        )
+        .single()?
+        + chrono::Duration::days(Weekday::Fri.num_days_from_monday() as i64);
+
+    if local_now < review_trigger {
+        return None;
+    }
+
+    let week_key = format!("{}-W{:02}", monday.year(), local_now.iso_week().week());
+    let start_at = review_trigger - chrono::Duration::days(7);
+    Some((
+        week_key,
+        start_at.with_timezone(&Utc),
+        review_trigger.with_timezone(&Utc),
+    ))
+}
+
+fn current_base_memory(settings: &SettingsPayload) -> String {
+    if !settings.memory_summary.trim().is_empty() {
+        return settings.memory_summary.trim().to_string();
+    }
+
+    let merged = settings
+        .module_preferences
+        .iter()
+        .filter(|item| item.enabled)
+        .map(|item| {
+            if item.selected_buckets.is_empty() {
+                item.preference.trim().to_string()
+            } else {
+                format!("{}（{}）", item.preference.trim(), item.selected_buckets.join(" / "))
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("；");
+
+    if merged.is_empty() {
+        "用户尚未写下清晰的一句话兴趣描述，请保留当前偏好方向。".to_string()
+    } else {
+        merged
+    }
 }
 
 fn set_last_error(app: &AppHandle, message: String) {
@@ -1537,11 +1770,32 @@ fn current_polling(app: &AppHandle, now: Option<DateTime<Utc>>) -> bool {
 struct PendingArticle {
     article_id: i64,
     article: FeedArticle,
+    push_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchReason {
+    ModuleRefresh,
+    RetryRecovery,
+}
+
+#[derive(Clone)]
+struct PlannedSource {
+    source: crate::models::RssSource,
+    reason: FetchReason,
+}
+
+struct FetchPlan {
+    modules_for_refresh: BTreeSet<String>,
+    sources: Vec<PlannedSource>,
+    module_source_count: usize,
+    retry_source_count: usize,
 }
 
 struct ArticleScoreResult {
     article_id: i64,
     article: FeedArticle,
+    push_eligible: bool,
     analysis: Option<LlmResult>,
     error: Option<String>,
 }
@@ -1554,6 +1808,62 @@ struct ScoreOutcome {
 struct BatchScoreOutcome {
     results: Vec<ArticleScoreResult>,
     errors: Vec<String>,
+}
+
+fn describe_modules(modules: &BTreeSet<String>) -> String {
+    if modules.is_empty() {
+        return "none".to_string();
+    }
+    modules.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+fn cycle_kind_label(plan: &FetchPlan) -> &'static str {
+    match (
+        !plan.modules_for_refresh.is_empty(),
+        plan.retry_source_count > 0,
+    ) {
+        (true, true) => "mixed",
+        (true, false) => "module-refresh",
+        (false, true) => "retry-only",
+        (false, false) => "idle",
+    }
+}
+
+fn build_fetch_plan(
+    conn: &rusqlite::Connection,
+    now: DateTime<Utc>,
+    force_module_refresh: bool,
+) -> Result<FetchPlan> {
+    let modules_for_refresh = if force_module_refresh {
+        db::list_enabled_modules(conn)?
+    } else {
+        db::list_due_modules(conn, now)?
+    };
+    // When force_module_refresh is true (e.g. on app startup), bypass per-source
+    // timing so every source in enabled modules is fetched regardless of last_success_at.
+    let module_sources = db::list_module_refresh_sources(conn, &modules_for_refresh, now, force_module_refresh)?;
+    let retry_sources = db::list_retry_due_sources(conn, now, &modules_for_refresh)?;
+
+    let module_source_count = module_sources.len();
+    let retry_source_count = retry_sources.len();
+    let mut sources = module_sources
+        .into_iter()
+        .map(|source| PlannedSource {
+            source,
+            reason: FetchReason::ModuleRefresh,
+        })
+        .collect::<Vec<_>>();
+    sources.extend(retry_sources.into_iter().map(|source| PlannedSource {
+        source,
+        reason: FetchReason::RetryRecovery,
+    }));
+
+    Ok(FetchPlan {
+        modules_for_refresh,
+        sources,
+        module_source_count,
+        retry_source_count,
+    })
 }
 
 fn clamp_due_sources_for_cycle<T>(mut items: Vec<T>) -> (Vec<T>, usize) {
@@ -1575,6 +1885,7 @@ mod tests {
     };
     use crate::models::{
         Discipline, PetStatus, RssSource, SettingsPayload, SourceKind, UserDisciplinePreference,
+        UserModulePreference,
     };
 
     fn sample_settings() -> SettingsPayload {
@@ -1587,7 +1898,15 @@ mod tests {
             llm_model_name: String::new(),
             llm_model: String::new(),
             provider_api_keys: BTreeMap::from([("deepseek".to_string(), "demo-key".to_string())]),
+            module_fetch_intervals: crate::policy::default_module_fetch_intervals(),
+            module_push_top_n: crate::policy::default_module_push_top_n_map(),
             auto_start: false,
+            module_preferences: vec![UserModulePreference {
+                module: "technology".into(),
+                enabled: true,
+                preference: "关注 AI 工具和工程实践".into(),
+                selected_buckets: vec!["ai_and_cs".into()],
+            }],
             disciplines: vec![UserDisciplinePreference {
                 discipline: Discipline::Technology,
                 enabled: true,
@@ -1600,7 +1919,8 @@ mod tests {
                 name: "Demo".into(),
                 url: "https://example.com/feed.xml".into(),
                 module: "technology".into(),
-                bucket: "blogs".into(),
+                bucket: "ai_and_cs".into(),
+                group: "blogs".into(),
                 discipline: Discipline::Technology,
                 source_kind: SourceKind::TechnicalBlog,
                 resource_type: crate::models::ResourceType::Article,
@@ -1617,7 +1937,10 @@ mod tests {
     fn settings_need_selected_disciplines_and_preference() {
         let mut settings = sample_settings();
         assert!(is_settings_complete(&settings));
-        settings.disciplines[0].preference.clear();
+        settings.module_preferences[0].preference.clear();
+        assert!(!is_settings_complete(&settings));
+        settings.module_preferences[0].preference = "关注 AI 工具和工程实践".into();
+        settings.module_preferences[0].selected_buckets.clear();
         assert!(!is_settings_complete(&settings));
     }
 

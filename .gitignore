@@ -26,3 +26,7 @@ tmp_*.tsv
 *.bak
 *.swp
 src-tauri/target/release/bundle/
+landingpage.html
+rss_catalog
+icon_drafts
+.agents
