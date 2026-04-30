@@ -46,13 +46,13 @@ fn provider_config(provider: &str) -> ProviderConfig {
     match normalize_provider(provider).as_str() {
         "qwen" => ProviderConfig {
             protocol: "openai-compatible",
-            base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            default_model: "qwen3.5-flash",
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            default_model: "qwen-plus",
         },
         "minimax" => ProviderConfig {
             protocol: "openai-compatible",
             base_url: "https://api.minimaxi.com/v1",
-            default_model: "MiniMax-M2.5",
+            default_model: "MiniMax-M2.7-highspeed",
         },
         "glm" => ProviderConfig {
             protocol: "openai-compatible",
@@ -77,7 +77,7 @@ fn provider_config(provider: &str) -> ProviderConfig {
         "anthropic" => ProviderConfig {
             protocol: "anthropic-native",
             base_url: "https://api.anthropic.com",
-            default_model: "claude-sonnet-4-20250514",
+            default_model: "claude-sonnet-4-6",
         },
         "siliconflow" => ProviderConfig {
             protocol: "openai-compatible",
@@ -87,7 +87,7 @@ fn provider_config(provider: &str) -> ProviderConfig {
         _ => ProviderConfig {
             protocol: "openai-compatible",
             base_url: "https://api.deepseek.com",
-            default_model: "deepseek-chat",
+            default_model: "deepseek-v4-flash",
         },
     }
 }
@@ -920,7 +920,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_json_response, parse_batch_result, parse_fit_level, parse_fit_score};
+    use super::{
+        normalize_json_response, parse_batch_result, parse_fit_level, parse_fit_score,
+        resolve_base_url, resolve_model,
+    };
     use crate::models::FitLevel;
     use serde_json::json;
 
@@ -983,5 +986,17 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].summary, "first");
         assert_eq!(parsed[1].summary, "second");
+    }
+
+    #[test]
+    fn provider_defaults_match_curated_models() {
+        assert_eq!(
+            resolve_base_url("qwen", None),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(resolve_model("qwen", None), "qwen-plus");
+        assert_eq!(resolve_model("minimax", None), "MiniMax-M2.7-highspeed");
+        assert_eq!(resolve_model("deepseek", None), "deepseek-v4-flash");
+        assert_eq!(resolve_model("anthropic", None), "claude-sonnet-4-6");
     }
 }

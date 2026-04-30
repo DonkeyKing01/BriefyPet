@@ -26,6 +26,7 @@ import type {
   Discipline,
   FitLevel,
   HistoryItem,
+  InterestMemoryRecord,
   LlmProtocol,
   LlmProvider,
   MemoryReviewProposal,
@@ -244,6 +245,7 @@ const PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "anthropic", label: "Anthropic" },
+  { value: "siliconflow", label: "SiliconFlow" },
   { value: "custom", label: "自定义" }
 ];
 
@@ -266,19 +268,19 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.deepseek.com",
     models: [
-      { id: "deepseek-chat", name: "DeepSeek Chat" },
-      { id: "deepseek-reasoner", name: "DeepSeek Reasoner" }
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
   qwen: {
     label: "Qwen",
     protocol: "openai-compatible",
-    baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     models: [
-      { id: "qwen3.5-flash", name: "Qwen 3.5 Flash" },
-      { id: "qwen3.5-plus", name: "Qwen 3.5 Plus" },
-      { id: "qwen3-max", name: "Qwen 3 Max" }
+      { id: "qwen-plus", name: "Qwen Plus" },
+      { id: "qwen-flash", name: "Qwen Flash" },
+      { id: "qwen-max", name: "Qwen Max" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
@@ -287,8 +289,6 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.minimaxi.com/v1",
     models: [
-      { id: "MiniMax-M2.5-highspeed", name: "MiniMax M2.5 Highspeed" },
-      { id: "MiniMax-M2.5", name: "MiniMax M2.5" },
       { id: "MiniMax-M2.7-highspeed", name: "MiniMax M2.7 Highspeed" },
       { id: "MiniMax-M2.7", name: "MiniMax M2.7" }
     ],
@@ -321,8 +321,8 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.openai.com/v1",
     models: [
-      { id: "gpt-5.4-nano", name: "GPT-5.4 Nano" },
       { id: "gpt-5.4-mini", name: "GPT-5.4 Mini" },
+      { id: "gpt-5.4-nano", name: "GPT-5.4 Nano" },
       { id: "gpt-5.4", name: "GPT-5.4" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
@@ -343,9 +343,9 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "anthropic-native",
     baseUrl: "https://api.anthropic.com",
     models: [
-      { id: "claude-3-5-haiku-latest", name: "Claude Haiku 3.5" },
-      { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
-      { id: "claude-opus-4-1-20250805", name: "Claude Opus 4.1" }
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
+      { id: "claude-opus-4-7", name: "Claude Opus 4.7" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
@@ -360,7 +360,9 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     label: "SiliconFlow",
     protocol: "openai-compatible",
     baseUrl: "https://api.siliconflow.cn/v1",
-    models: [{ id: "Qwen/Qwen2.5-72B-Instruct", name: "Qwen 2.5 72B Instruct" }],
+    models: [
+      { id: "Qwen/Qwen2.5-72B-Instruct", name: "Qwen 2.5 72B Instruct" }
+    ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   }
 };
@@ -406,6 +408,23 @@ const MODULE_OPTIONS = MODULE_ORDER.filter((module) => module !== "other");
 
 function getProviderDefinition(provider: LlmProvider): ProviderDefinition {
   return PROVIDER_DEFINITIONS[provider] ?? PROVIDER_DEFINITIONS.deepseek;
+}
+
+function moduleDisplayName(module: string) {
+  return MODULE_LABELS[module as SourceModule] ?? module;
+}
+
+function toErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const maybeMessage = Reflect.get(error, "message");
+    if (typeof maybeMessage === "string" && maybeMessage.trim()) {
+      return maybeMessage;
+    }
+  }
+  return fallback;
 }
 
 function activeProviderApiKeyKey(provider: LlmProvider, customProviderName: string) {
@@ -662,9 +681,14 @@ function snapshotFingerprint(snapshot: Snapshot) {
     .map((item) => `${item.id}:${item.batchId}:${item.fitScore}`)
     .join(",");
   const enabledDisciplineCount = snapshot.settings.modulePreferences.filter((item) => item.enabled).length;
-  const memoryReviewKey = snapshot.memoryReview
-    ? `${snapshot.memoryReview.id}:${snapshot.memoryReview.status}:${snapshot.memoryReview.createdAt}`
-    : "none";
+  const memoryReviewKey = snapshot.memoryReviews
+    .slice(0, 24)
+    .map((item) => `${item.id}:${item.status}:${item.createdAt}`)
+    .join(",") || "none";
+  const memoryEdge = snapshot.memories
+    .slice(0, 24)
+    .map((item) => `${item.module}:${item.updatedAt ?? ""}:${item.summary}`)
+    .join(",");
 
   return [
     snapshot.petStatus,
@@ -678,7 +702,7 @@ function snapshotFingerprint(snapshot: Snapshot) {
     reminderKey,
     snapshot.articles.length,
     snapshot.historyArticles.length,
-    snapshot.memory?.updatedAt ?? "",
+    memoryEdge,
     memoryReviewKey,
     snapshot.sourceSummary.dueSources,
     articleEdge,
@@ -729,7 +753,7 @@ function useSnapshotEvents(enabled: boolean) {
         if (!active) {
           return;
         }
-        setError(err instanceof Error ? err.message : "加载失败");
+        setError(toErrorMessage(err, "加载失败"));
       } finally {
         if (active) {
           setLoading(false);
@@ -953,7 +977,9 @@ function dedupeArticles(items: Article[]) {
 
 function dedupeHistoryItems(items: HistoryItem[]) {
   const sorted = [...items].sort(
-    (left, right) => toSafeTimestamp(right.batchCreatedAt) - toSafeTimestamp(left.batchCreatedAt)
+    (left, right) =>
+      toSafeTimestamp(right.publishedAt ?? right.batchCreatedAt) -
+      toSafeTimestamp(left.publishedAt ?? left.batchCreatedAt)
   );
   const seenIds = new Set<number>();
   const seenFingerprints = new Set<string>();
@@ -1508,33 +1534,57 @@ function HelpWindow() {
   );
 }
 
-function MemoryReviewWindow({ proposal }: { proposal: MemoryReviewProposal | null | undefined }) {
-  const [draft, setDraft] = useState(proposal?.proposedSummary ?? "");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function MemoryReviewWindow({
+  proposals
+}: {
+  proposals: MemoryReviewProposal[] | null | undefined;
+}) {
+  const pending = proposals ?? [];
+  const pendingKey = pending
+    .map((proposal) => `${proposal.id}:${proposal.proposedSummary}:${proposal.status}`)
+    .join("|");
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    setDraft(proposal?.proposedSummary ?? "");
-    setError(null);
-  }, [proposal?.id, proposal?.proposedSummary]);
+    setDrafts(
+      Object.fromEntries(pending.map((proposal) => [proposal.id, proposal.proposedSummary]))
+    );
+    setErrors({});
+  }, [pendingKey]);
 
-  async function handleSubmit(action: "accept" | "modify" | "reject") {
-    if (!proposal) {
-      return;
-    }
+  async function handleSubmit(
+    proposal: MemoryReviewProposal,
+    action: "accept" | "modify" | "reject"
+  ) {
+    const draft = drafts[proposal.id] ?? proposal.proposedSummary;
     if (action === "modify" && !draft.trim()) {
-      setError("修改后的兴趣记忆不能为空。");
+      setErrors((prev) => ({
+        ...prev,
+        [proposal.id]: "修改后的兴趣记忆不能为空。"
+      }));
       return;
     }
 
-    setSaving(true);
-    setError(null);
+    setSavingId(proposal.id);
+    setErrors((prev) => ({
+      ...prev,
+      [proposal.id]: ""
+    }));
     try {
-      await submitMemoryReview(action, action === "modify" ? draft.trim() : undefined);
+      await submitMemoryReview(
+        proposal.id,
+        action,
+        action === "modify" ? draft.trim() : undefined
+      );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "提交记忆确认失败");
+      setErrors((prev) => ({
+        ...prev,
+        [proposal.id]: toErrorMessage(err, "提交记忆确认失败")
+      }));
     } finally {
-      setSaving(false);
+      setSavingId((current) => (current === proposal.id ? null : current));
     }
   }
 
@@ -1545,43 +1595,55 @@ function MemoryReviewWindow({ proposal }: { proposal: MemoryReviewProposal | nul
           <span className="help-eyebrow">Weekly Memory Review</span>
           <strong>本周兴趣记忆更新</strong>
         </div>
-        {proposal ? (
+        {pending.length > 0 ? (
           <>
             <p className="memory-review-copy">
-              系统已根据你本周的收藏内容、笔记和原始兴趣描述，生成一条更细的兴趣记忆。此窗口不能直接关闭，请选择接受、修改或拒绝。
+              系统已根据你本周的收藏内容、笔记和原始兴趣描述，按一级学科生成候选兴趣记忆。此窗口不能直接关闭，请对每个学科分别接受、修改或拒绝。
             </p>
-            <div className="memory-review-panel">
-              <h3>当前基线</h3>
-              <p>{proposal.baseSummary || "暂无已确认兴趣记忆，将以你当前填写的兴趣偏好为主。"}</p>
-            </div>
-            <div className="memory-review-panel">
-              <h3>候选更新</h3>
-              <textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="在这里修改本周候选兴趣记忆"
-              />
-            </div>
-            {error && <div className="error-banner">{error}</div>}
-            <div className="memory-review-actions">
-              <button
-                className="ghost"
-                disabled={saving}
-                onClick={() => void handleSubmit("reject")}
-              >
-                拒绝
-              </button>
-              <button
-                className="ghost"
-                disabled={saving}
-                onClick={() => void handleSubmit("modify")}
-              >
-                {saving ? "提交中..." : "修改后接受"}
-              </button>
-              <button disabled={saving} onClick={() => void handleSubmit("accept")}>
-                {saving ? "提交中..." : "直接接受"}
-              </button>
-            </div>
+            {pending.map((proposal) => {
+              const saving = savingId === proposal.id;
+              return (
+                <div key={proposal.id} className="memory-review-panel">
+                  <h3>{moduleDisplayName(proposal.module)}</h3>
+                  <p>{proposal.baseSummary || "暂无已确认兴趣记忆，将以当前一级学科的一句话兴趣描述为基线。"}</p>
+                  <textarea
+                    value={drafts[proposal.id] ?? ""}
+                    onChange={(event) =>
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [proposal.id]: event.target.value
+                      }))
+                    }
+                    placeholder="在这里修改本周候选兴趣记忆"
+                  />
+                  {errors[proposal.id] ? (
+                    <div className="error-banner">{errors[proposal.id]}</div>
+                  ) : null}
+                  <div className="memory-review-actions">
+                    <button
+                      className="ghost"
+                      disabled={saving}
+                      onClick={() => void handleSubmit(proposal, "reject")}
+                    >
+                      拒绝
+                    </button>
+                    <button
+                      className="ghost"
+                      disabled={saving}
+                      onClick={() => void handleSubmit(proposal, "modify")}
+                    >
+                      {saving ? "提交中..." : "修改后接受"}
+                    </button>
+                    <button
+                      disabled={saving}
+                      onClick={() => void handleSubmit(proposal, "accept")}
+                    >
+                      {saving ? "提交中..." : "直接接受"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </>
         ) : (
           <div className="memory-review-panel">
@@ -1630,6 +1692,19 @@ function SettingsView({
     () => sortModulePrefs(snapshot.settings.modulePreferences),
     [snapshot.settings.modulePreferences]
   );
+  const confirmedMemoryByModule = useMemo(
+    () => new Map(snapshot.memories.map((item) => [item.module, item])),
+    [snapshot.memories]
+  );
+  const providerOptions = useMemo(() => {
+    if (PROVIDER_OPTIONS.some((item) => item.value === llmProvider)) {
+      return PROVIDER_OPTIONS;
+    }
+    return [
+      { value: llmProvider, label: `${getProviderDefinition(llmProvider).label}（当前）` },
+      ...PROVIDER_OPTIONS
+    ];
+  }, [llmProvider]);
 
   const groupedSources = useMemo(
     () => groupSources(snapshot.settings.rssSources),
@@ -1824,7 +1899,7 @@ function SettingsView({
       const next = await saveSettings(payload);
       setSnapshot(next);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "保存设置失败");
+      setSubmitError(toErrorMessage(err, "保存设置失败"));
     } finally {
       setSaving(false);
     }
@@ -1852,7 +1927,7 @@ function SettingsView({
       setCustomBucket(customBucketOptions[0]);
       setCustomGroup(customGroupOptions[0]);
     } catch (err) {
-      setAddSourceError(err instanceof Error ? err.message : "新增 RSS 失败");
+      setAddSourceError(toErrorMessage(err, "新增 RSS 失败"));
     } finally {
       setAddingSource(false);
     }
@@ -1932,7 +2007,7 @@ function SettingsView({
               applyProviderDefaults(nextProvider);
             }}
           >
-            {PROVIDER_OPTIONS.map((provider) => (
+            {providerOptions.map((provider) => (
               <option key={provider.value} value={provider.value}>
                 {provider.label}
               </option>
@@ -2105,7 +2180,7 @@ function SettingsView({
         <section className="settings-card">
         <div className="settings-section-head">
           <h2>周度兴趣记忆</h2>
-          <p>系统会在每周五晚九点（北京时间）基于本周星标、摘要和批注，生成一条更细化的兴趣描述，供你确认或修改。</p>
+          <p>系统会在每周五晚九点（北京时间）按一级学科分别汇总本周星标、摘要和批注，生成候选兴趣记忆，等待你逐项确认。</p>
         </div>
         <label className="checkbox-row">
           <input
@@ -2115,6 +2190,44 @@ function SettingsView({
           />
           <span>启用周度兴趣记忆</span>
         </label>
+        <div className="settings-hint">关闭后不会清空已确认记忆，只会暂停它参与后续评分；重新开启后会继续沿用。</div>
+        <div className="memory-status-grid">
+          <div className="memory-status-card">
+            <h3>当前已确认记忆</h3>
+            {modulePrefs
+              .filter((item) => item.enabled)
+              .map((item) => {
+                const module = item.module;
+                const memory = confirmedMemoryByModule.get(module);
+                return (
+                  <div key={`confirmed-${module}`} className="memory-status-item">
+                    <strong>{moduleDisplayName(module)}</strong>
+                    <p>
+                      {memory?.summary?.trim()
+                        ? memory.summary
+                        : "暂无已确认记忆，当前仍以该一级学科的一句话兴趣描述作为基线。"}
+                    </p>
+                  </div>
+                );
+              })}
+          </div>
+          <div className="memory-status-card">
+            <h3>待确认校准</h3>
+            {snapshot.memoryReviews.length > 0 ? (
+              snapshot.memoryReviews.map((proposal) => (
+                <div key={proposal.id} className="memory-status-item">
+                  <strong>{moduleDisplayName(proposal.module)}</strong>
+                  <p>{proposal.proposedSummary}</p>
+                  <span className="memory-status-badge">待处理</span>
+                </div>
+              ))
+            ) : (
+              <p className="settings-hint">
+                当前没有待确认校准。若生成新记忆时应用被强制关闭，未处理项会保留在这里。
+              </p>
+            )}
+          </div>
+        </div>
       </section>
         </div>{/* end memory */}
 
@@ -2765,7 +2878,7 @@ function MainWindow({
         if (cancelled) {
           return;
         }
-        setInteractionMessage(err instanceof Error ? err.message : "加载原文失败");
+        setInteractionMessage(toErrorMessage(err, "加载原文失败"));
       })
       .finally(() => {
         if (!cancelled) {
@@ -2879,7 +2992,7 @@ function MainWindow({
         setHistoryHasMore(false);
       }
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "加载历史推送失败");
+      setInteractionMessage(toErrorMessage(err, "加载历史推送失败"));
     } finally {
       setHistoryLoadingMore(false);
     }
@@ -2917,7 +3030,7 @@ function MainWindow({
       const next = await openArticle(articleId);
       setSnapshot(next);
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "打开文章失败");
+      setInteractionMessage(toErrorMessage(err, "打开文章失败"));
     }
   }
 
@@ -2940,7 +3053,7 @@ function MainWindow({
       const next = await toggleFavorite(selectedArticle.id);
       setSnapshot(next);
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "收藏操作失败");
+      setInteractionMessage(toErrorMessage(err, "收藏操作失败"));
     }
   }
 
@@ -2962,7 +3075,7 @@ function MainWindow({
       setSnapshot(next);
       setInteractionMessage("笔记已保存");
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "保存笔记失败");
+      setInteractionMessage(toErrorMessage(err, "保存笔记失败"));
     } finally {
       setNoteSaving(false);
     }
@@ -3696,7 +3809,7 @@ export default function App() {
   }
 
   if (windowLabel === "memory-review") {
-    return <MemoryReviewWindow proposal={snapshot?.memoryReview} />;
+    return <MemoryReviewWindow proposals={snapshot?.memoryReviews} />;
   }
 
   return (

@@ -171,7 +171,6 @@ fn main() {
             }
 
             let conn = db::connect(&app.handle())?;
-            let _ = db::reject_pending_memory_reviews(&conn)?;
             let settings = db::read_settings(&conn)?;
             let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
             if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
@@ -235,18 +234,10 @@ fn main() {
                 memory_window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        if let Ok(conn) = db::connect(&app_handle) {
-                            if let Ok(Some(proposal)) = db::read_pending_memory_review(&conn) {
-                                let _ = db::resolve_memory_review_proposal(
-                                    &conn,
-                                    &proposal.id,
-                                    "rejected",
-                                    Some("closed without confirmation"),
-                                );
-                            }
-                        }
-                        let _ = memory_window_handle.hide();
-                        let _ = service::sync_windows(&app_handle, service::current_scanning(&app_handle));
+                        let _ = memory_window_handle.show();
+                        let _ = memory_window_handle.set_focus();
+                        let _ =
+                            service::sync_windows(&app_handle, service::current_scanning(&app_handle));
                     }
                 });
             }

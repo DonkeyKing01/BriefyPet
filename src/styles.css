@@ -1401,6 +1401,54 @@ a {
   gap: 10px;
 }
 
+.memory-status-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.memory-status-card {
+  border-radius: 16px;
+  border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface) 95%, transparent);
+  padding: 14px;
+}
+
+.memory-status-card h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.memory-status-item + .memory-status-item {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.memory-status-item strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.memory-status-item p {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.68;
+  white-space: pre-line;
+}
+
+.memory-status-badge {
+  display: inline-flex;
+  margin-top: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #2f67d5 14%, var(--surface));
+  color: #2453b6;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .settings-danger-card {
   border-color: color-mix(in srgb, #b13a24 26%, var(--line-soft));
   background: color-mix(in srgb, #fff3ee 74%, var(--surface));
@@ -1593,6 +1641,12 @@ a {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+@media (max-width: 960px) {
+  .memory-status-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .rss-list {

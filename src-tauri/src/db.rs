@@ -159,6 +159,28 @@ pub fn connect(app: &AppHandle) -> Result<Connection> {
           created_at TEXT NOT NULL,
           decided_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS module_interest_memory (
+          day_key TEXT NOT NULL,
+          module TEXT NOT NULL,
+          generated_summary TEXT NOT NULL DEFAULT '',
+          confirmed_summary TEXT,
+          memory_enabled INTEGER NOT NULL DEFAULT 1,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(day_key, module)
+        );
+        CREATE TABLE IF NOT EXISTS module_memory_review_proposals (
+          id TEXT PRIMARY KEY,
+          week_key TEXT NOT NULL,
+          module TEXT NOT NULL,
+          base_summary TEXT NOT NULL DEFAULT '',
+          proposed_summary TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending',
+          user_response TEXT,
+          created_at TEXT NOT NULL,
+          decided_at TEXT,
+          UNIQUE(week_key, module)
+        );
                 CREATE TABLE IF NOT EXISTS crawl_cycle_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     started_at TEXT NOT NULL,
@@ -741,9 +763,7 @@ pub fn read_settings(conn: &Connection) -> Result<SettingsPayload> {
         memory_mode_enabled: read_setting(conn, "memory_mode_enabled")?
             .unwrap_or_else(|| "true".into())
             == "true",
-        memory_summary: read_latest_memory(conn)?
-            .map(|memory| memory.summary)
-            .unwrap_or_default(),
+        memory_summary: aggregate_memory_summary(conn)?,
         rss_sources: list_user_sources(conn)?,
     })
 }
@@ -987,20 +1007,13 @@ pub fn write_settings(conn: &Connection, settings: &SettingsPayload) -> Result<(
         }
     }
 
-    if !settings.memory_mode_enabled {
-        write_memory_summary(conn, false, "")?;
-    } else {
-        conn.execute("UPDATE daily_interest_memory SET memory_enabled = 1", [])?;
-    }
-
-    write_memory_summary(
-        conn,
-        settings.memory_mode_enabled,
-        if settings.memory_mode_enabled {
-            settings.memory_summary.trim()
-        } else {
-            ""
-        },
+    conn.execute(
+        "UPDATE module_interest_memory SET memory_enabled = ?1",
+        params![bool_to_int(settings.memory_mode_enabled)],
+    )?;
+    conn.execute(
+        "UPDATE daily_interest_memory SET memory_enabled = ?1",
+        params![bool_to_int(settings.memory_mode_enabled)],
     )?;
     Ok(())
 }
@@ -1517,7 +1530,7 @@ pub fn list_history_articles_page(
         LEFT JOIN source_catalog sc ON sc.source_id = a.source_id
         WHERE rb.status IN ('opened', 'ignored')
           AND (?1 IS NULL OR rb.id != ?1)
-        ORDER BY rb.created_at DESC, a.fit_score DESC
+        ORDER BY COALESCE(a.published_at, rb.created_at) DESC, rb.created_at DESC, a.fit_score DESC
         LIMIT ?2 OFFSET ?3
         "#,
     )?;
@@ -1798,6 +1811,25 @@ pub fn list_push_history_articles_page(
         };
         output.push(history_item);
     }
+
+    output.sort_by(|left, right| {
+        let left_time = left
+            .published_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .or_else(|| parse_datetime(&left.batch_created_at))
+            .unwrap_or_else(Utc::now);
+        let right_time = right
+            .published_at
+            .as_deref()
+            .and_then(parse_datetime)
+            .or_else(|| parse_datetime(&right.batch_created_at))
+            .unwrap_or_else(Utc::now);
+        right_time
+            .cmp(&left_time)
+            .then_with(|| right.fit_score.cmp(&left.fit_score))
+            .then_with(|| right.id.cmp(&left.id))
+    });
 
     Ok(output)
 }
@@ -2155,6 +2187,8 @@ pub fn reset_runtime_data(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM ranked_content_pool", [])?;
     conn.execute("DELETE FROM user_behavior_events", [])?;
     conn.execute("DELETE FROM daily_interest_memory", [])?;
+    conn.execute("DELETE FROM module_interest_memory", [])?;
+    conn.execute("DELETE FROM module_memory_review_proposals", [])?;
     conn.execute("DELETE FROM articles", [])?;
     conn.execute("DELETE FROM source_fetch_state", [])?;
     conn.execute("DELETE FROM module_fetch_state", [])?;
@@ -2859,17 +2893,18 @@ pub fn refresh_daily_memory(
     conn: &Connection,
     _memory_enabled: bool,
 ) -> Result<Option<InterestMemoryRecord>> {
-    read_latest_memory(conn)
+    Ok(list_latest_memories(conn)?.into_iter().next())
 }
 
-pub fn list_weekly_memory_signals(
+pub fn list_weekly_memory_signals_by_module(
     conn: &Connection,
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
-) -> Result<Vec<(String, String, String, String)>> {
+) -> Result<BTreeMap<String, Vec<(String, String, String, String)>>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT DISTINCT
+          COALESCE(sc.module, 'other') AS module,
           a.title,
           COALESCE(a.summary, ''),
           COALESCE(a.note, ''),
@@ -2889,20 +2924,28 @@ pub fn list_weekly_memory_signals(
     )?;
     let rows = stmt.query_map(
         params![start_at.to_rfc3339(), end_at.to_rfc3339()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
 
-    let mut output = Vec::new();
+    let mut output = BTreeMap::<String, Vec<(String, String, String, String)>>::new();
     for row in rows {
-        output.push(row?);
+        let (module, title, summary, note, source_path) = row?;
+        output
+            .entry(module)
+            .or_default()
+            .push((title, summary, note, source_path));
     }
     Ok(output)
 }
 
-pub fn has_memory_review_for_week(conn: &Connection, week_key: &str) -> Result<bool> {
+pub fn has_memory_review_for_week_module(
+    conn: &Connection,
+    week_key: &str,
+    module: &str,
+) -> Result<bool> {
     conn.query_row(
-        "SELECT 1 FROM memory_review_proposals WHERE week_key = ?1 LIMIT 1",
-        params![week_key],
+        "SELECT 1 FROM module_memory_review_proposals WHERE week_key = ?1 AND module = ?2 LIMIT 1",
+        params![week_key, module],
         |_| Ok(()),
     )
     .optional()
@@ -2913,20 +2956,22 @@ pub fn has_memory_review_for_week(conn: &Connection, week_key: &str) -> Result<b
 pub fn create_memory_review_proposal(
     conn: &Connection,
     week_key: &str,
+    module: &str,
     base_summary: &str,
     proposed_summary: &str,
 ) -> Result<MemoryReviewProposal> {
-    let id = format!("memory-review-{week_key}");
+    let id = format!("memory-review-{week_key}-{module}");
     let created_at = Utc::now();
     conn.execute(
         r#"
-        INSERT OR REPLACE INTO memory_review_proposals (
-          id, week_key, base_summary, proposed_summary, status, user_response, created_at, decided_at
-        ) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, NULL)
+        INSERT OR REPLACE INTO module_memory_review_proposals (
+          id, week_key, module, base_summary, proposed_summary, status, user_response, created_at, decided_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, NULL)
         "#,
         params![
             id,
             week_key,
+            module,
             base_summary.trim(),
             proposed_summary.trim(),
             created_at.to_rfc3339(),
@@ -2934,8 +2979,9 @@ pub fn create_memory_review_proposal(
     )?;
 
     Ok(MemoryReviewProposal {
-        id: format!("memory-review-{week_key}"),
+        id: format!("memory-review-{week_key}-{module}"),
         week_key: week_key.to_string(),
+        module: module.to_string(),
         base_summary: base_summary.trim().to_string(),
         proposed_summary: proposed_summary.trim().to_string(),
         status: "pending".to_string(),
@@ -2943,30 +2989,33 @@ pub fn create_memory_review_proposal(
     })
 }
 
-pub fn read_pending_memory_review(conn: &Connection) -> Result<Option<MemoryReviewProposal>> {
-    conn.query_row(
+pub fn list_pending_memory_reviews(conn: &Connection) -> Result<Vec<MemoryReviewProposal>> {
+    let mut stmt = conn.prepare(
         r#"
-        SELECT id, week_key, base_summary, proposed_summary, status, created_at
-        FROM memory_review_proposals
+        SELECT id, week_key, module, base_summary, proposed_summary, status, created_at
+        FROM module_memory_review_proposals
         WHERE status = 'pending'
-        ORDER BY created_at DESC
-        LIMIT 1
+        ORDER BY created_at DESC, module ASC
         "#,
-        [],
-        |row| {
-            let created_at_raw: String = row.get(5)?;
-            Ok(MemoryReviewProposal {
-                id: row.get(0)?,
-                week_key: row.get(1)?,
-                base_summary: row.get(2)?,
-                proposed_summary: row.get(3)?,
-                status: row.get(4)?,
-                created_at: parse_datetime(&created_at_raw).unwrap_or_else(Utc::now),
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let created_at_raw: String = row.get(6)?;
+        Ok(MemoryReviewProposal {
+            id: row.get(0)?,
+            week_key: row.get(1)?,
+            module: row.get(2)?,
+            base_summary: row.get(3)?,
+            proposed_summary: row.get(4)?,
+            status: row.get(5)?,
+            created_at: parse_datetime(&created_at_raw).unwrap_or_else(Utc::now),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn read_pending_memory_review(conn: &Connection) -> Result<Option<MemoryReviewProposal>> {
+    Ok(list_pending_memory_reviews(conn)?.into_iter().next())
 }
 
 pub fn resolve_memory_review_proposal(
@@ -2977,7 +3026,7 @@ pub fn resolve_memory_review_proposal(
 ) -> Result<()> {
     conn.execute(
         r#"
-        UPDATE memory_review_proposals
+        UPDATE module_memory_review_proposals
         SET status = ?2,
             user_response = ?3,
             decided_at = ?4
@@ -2991,7 +3040,7 @@ pub fn resolve_memory_review_proposal(
 pub fn reject_pending_memory_reviews(conn: &Connection) -> Result<usize> {
     let changed = conn.execute(
         r#"
-        UPDATE memory_review_proposals
+        UPDATE module_memory_review_proposals
         SET status = 'rejected',
             user_response = COALESCE(user_response, 'auto-rejected on app restart'),
             decided_at = ?1
@@ -3002,34 +3051,141 @@ pub fn reject_pending_memory_reviews(conn: &Connection) -> Result<usize> {
     Ok(changed)
 }
 
+pub fn read_memory_for_module(
+    conn: &Connection,
+    module: &str,
+) -> Result<Option<InterestMemoryRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT day_key, module, generated_summary,
+               COALESCE(NULLIF(confirmed_summary, ''), generated_summary),
+               memory_enabled, event_count, updated_at
+        FROM module_interest_memory
+        WHERE module = ?1
+        ORDER BY updated_at DESC, day_key DESC
+        "#,
+    )?;
+    stmt.query_row(params![module], |row| {
+        let updated_at_raw: Option<String> = row.get(6)?;
+        Ok(InterestMemoryRecord {
+            day_key: row.get(0)?,
+            module: row.get(1)?,
+            generated_summary: row.get(2)?,
+            summary: row.get(3)?,
+            memory_mode_enabled: row.get::<_, i64>(4)? == 1,
+            event_count: row.get::<_, i64>(5)? as usize,
+            updated_at: parse_optional_datetime(updated_at_raw),
+        })
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn list_latest_memories(conn: &Connection) -> Result<Vec<InterestMemoryRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT day_key, module, generated_summary,
+               COALESCE(NULLIF(confirmed_summary, ''), generated_summary),
+               memory_enabled, event_count, updated_at
+        FROM module_interest_memory
+        ORDER BY updated_at DESC, day_key DESC, module ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let updated_at_raw: Option<String> = row.get(6)?;
+        Ok(InterestMemoryRecord {
+            day_key: row.get(0)?,
+            module: row.get(1)?,
+            generated_summary: row.get(2)?,
+            summary: row.get(3)?,
+            memory_mode_enabled: row.get::<_, i64>(4)? == 1,
+            event_count: row.get::<_, i64>(5)? as usize,
+            updated_at: parse_optional_datetime(updated_at_raw),
+        })
+    })?;
+
+    let mut result = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        let record = row?;
+        if seen.insert(record.module.clone()) {
+            result.push(record);
+        }
+    }
+    result.sort_by(|left, right| left.module.cmp(&right.module));
+    Ok(result)
+}
+
 pub fn read_latest_memory(conn: &Connection) -> Result<Option<InterestMemoryRecord>> {
+    Ok(list_latest_memories(conn)?.into_iter().next())
+}
+
+pub fn read_legacy_memory_summary(conn: &Connection) -> Result<Option<String>> {
     conn.query_row(
         r#"
-        SELECT day_key, generated_summary, COALESCE(NULLIF(confirmed_summary, ''), generated_summary),
-               memory_enabled, event_count, updated_at
+        SELECT COALESCE(NULLIF(confirmed_summary, ''), generated_summary)
         FROM daily_interest_memory
-        ORDER BY day_key DESC
+        ORDER BY updated_at DESC, day_key DESC
         LIMIT 1
         "#,
         [],
-        |row| {
-            let updated_at_raw: Option<String> = row.get(5)?;
-            Ok(InterestMemoryRecord {
-                day_key: row.get(0)?,
-                generated_summary: row.get(1)?,
-                summary: row.get(2)?,
-                memory_mode_enabled: row.get::<_, i64>(3)? == 1,
-                event_count: row.get::<_, i64>(4)? as usize,
-                updated_at: parse_optional_datetime(updated_at_raw),
-            })
-        },
+        |row| row.get::<_, String>(0),
     )
     .optional()
     .map_err(Into::into)
 }
 
+pub fn aggregate_memory_summary(conn: &Connection) -> Result<String> {
+    let current = list_latest_memories(conn)?;
+    if !current.is_empty() {
+        return Ok(current
+            .into_iter()
+            .map(|memory| memory.summary)
+            .filter(|summary| !summary.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("；"));
+    }
+
+    Ok(read_legacy_memory_summary(conn)?.unwrap_or_default())
+}
+
+pub fn write_module_memory_summary(
+    conn: &Connection,
+    module: &str,
+    memory_enabled: bool,
+    summary: &str,
+    event_count: usize,
+) -> Result<()> {
+    if summary.trim().is_empty() && read_memory_for_module(conn, module)?.is_none() {
+        return Ok(());
+    }
+    let day_key = Utc::now().format("%Y-%m-%d").to_string();
+    conn.execute(
+        r#"
+        INSERT INTO module_interest_memory (
+          day_key, module, generated_summary, confirmed_summary, memory_enabled, event_count, updated_at
+        )
+        VALUES (?1, ?2, '', ?3, ?4, ?5, ?6)
+        ON CONFLICT(day_key, module) DO UPDATE SET
+          confirmed_summary = excluded.confirmed_summary,
+          memory_enabled = excluded.memory_enabled,
+          event_count = excluded.event_count,
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            day_key,
+            module,
+            summary.trim(),
+            bool_to_int(memory_enabled),
+            event_count as i64,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn write_memory_summary(conn: &Connection, memory_enabled: bool, summary: &str) -> Result<()> {
-    if summary.is_empty() && read_latest_memory(conn)?.is_none() {
+    if summary.trim().is_empty() && read_latest_memory(conn)?.is_none() {
         return Ok(());
     }
     let day_key = Utc::now().format("%Y-%m-%d").to_string();
@@ -3042,7 +3198,7 @@ pub fn write_memory_summary(conn: &Connection, memory_enabled: bool, summary: &s
           memory_enabled = excluded.memory_enabled,
           updated_at = excluded.updated_at
         "#,
-        params![day_key, summary, bool_to_int(memory_enabled), Utc::now().to_rfc3339()],
+        params![day_key, summary.trim(), bool_to_int(memory_enabled), Utc::now().to_rfc3339()],
     )?;
     Ok(())
 }
@@ -3086,8 +3242,8 @@ pub fn build_snapshot(
         api_key_valid,
         last_scan_at,
         content_pool_stats: content_pool_stats(conn)?,
-        memory: read_latest_memory(conn)?,
-        memory_review: read_pending_memory_review(conn)?,
+        memories: list_latest_memories(conn)?,
+        memory_reviews: list_pending_memory_reviews(conn)?,
         source_summary: SourceCatalogSummary {
             total_sources,
             enabled_sources,

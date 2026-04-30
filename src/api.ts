@@ -38,10 +38,11 @@ export async function dismissHelpWindow(completeOnboarding: boolean): Promise<vo
 }
 
 export async function submitMemoryReview(
+  proposalId: string,
   action: "accept" | "modify" | "reject",
   summary?: string,
 ): Promise<Snapshot> {
-  return invoke("submit_memory_review", { action, summary });
+  return invoke("submit_memory_review", { proposalId, action, summary });
 }
 
 export async function setActiveView(view: AppView): Promise<Snapshot> {

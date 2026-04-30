@@ -13,7 +13,8 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use crate::{
     db, llm,
     models::{
-        AppView, FeedArticle, LlmResult, OverlaySnapshot, PetStatus, SettingsPayload, Snapshot,
+        AppView, FeedArticle, InterestMemoryRecord, LlmResult, OverlaySnapshot, PetStatus,
+        SettingsPayload, Snapshot, UserModulePreference,
     },
     policy, rss, AppState,
 };
@@ -553,7 +554,8 @@ pub async fn run_fetch_cycle(app: AppHandle, force_module_refresh: bool) -> Resu
             push_eligible: false,
         })
         .collect::<Vec<_>>();
-    let interest_context = build_interest_context(&settings);
+    let current_memories = db::list_latest_memories(&conn)?;
+    let interest_context = build_interest_context(&settings, &current_memories);
     let plan_now = Utc::now();
     let fetch_plan = build_fetch_plan(&conn, plan_now, force_module_refresh)?;
     let cycle_kind = cycle_kind_label(&fetch_plan).to_string();
@@ -1208,23 +1210,33 @@ async fn score_articles_in_batches(
     })
 }
 
-fn build_interest_context(settings: &SettingsPayload) -> String {
+fn build_interest_context(
+    settings: &SettingsPayload,
+    memories: &[InterestMemoryRecord],
+) -> String {
     let mut sections = Vec::new();
     for item in settings.module_preferences.iter().filter(|item| item.enabled) {
+        let module = policy::normalize_module(&item.module);
         let selected_buckets = if item.selected_buckets.is_empty() {
             "未限定二级学科".to_string()
         } else {
             item.selected_buckets.join(" / ")
         };
-        sections.push(format!(
+        let mut section = format!(
             "- {}（二级学科：{}）: {}",
-            item.module,
+            module,
             selected_buckets,
             item.preference.trim()
-        ));
-    }
-    if settings.memory_mode_enabled && !settings.memory_summary.trim().is_empty() {
-        sections.push(format!("当前已确认兴趣记忆: {}", settings.memory_summary.trim()));
+        );
+        if settings.memory_mode_enabled {
+            if let Some(memory) = memories
+                .iter()
+                .find(|memory| memory.module == module && !memory.summary.trim().is_empty())
+            {
+                section.push_str(&format!("\n  当前已确认记忆: {}", memory.summary.trim()));
+            }
+        }
+        sections.push(section);
     }
     sections.join("\n")
 }
@@ -1422,8 +1434,15 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
         match action {
             "view" => {
                 db::set_push_snooze_until(app, None)?;
+                let viewed_count = db::mark_all_waiting_pushed(app)?;
                 db::write_active_view(&conn, &AppView::Reading)?;
-                db::log_user_event(&conn, "bubble-view", batch.top_article_id, None, None)?;
+                db::log_user_event(
+                    &conn,
+                    "bubble-view",
+                    batch.top_article_id,
+                    None,
+                    Some(&format!(r#"{{"viewedCount":{viewed_count}}}"#)),
+                )?;
                 if let Some(top_article_id) = batch.top_article_id {
                     db::write_selected_article_id(&conn, Some(top_article_id))?;
                     let source_id = db::article_source_id(&conn, top_article_id)?;
@@ -1470,17 +1489,28 @@ pub fn handle_bubble_action(app: &AppHandle, action: &str) -> Result<Snapshot> {
 
 pub fn respond_memory_review(
     app: &AppHandle,
+    proposal_id: &str,
     action: &str,
     summary: Option<&str>,
 ) -> Result<Snapshot> {
     let conn = db::connect(app)?;
-    let Some(proposal) = db::read_pending_memory_review(&conn)? else {
+    let settings = db::read_settings(&conn)?;
+    let Some(proposal) = db::list_pending_memory_reviews(&conn)?
+        .into_iter()
+        .find(|item| item.id == proposal_id)
+    else {
         return snapshot(app, current_scanning(app));
     };
 
     match action {
         "accept" => {
-            db::write_memory_summary(&conn, true, proposal.proposed_summary.trim())?;
+            db::write_module_memory_summary(
+                &conn,
+                &proposal.module,
+                settings.memory_mode_enabled,
+                proposal.proposed_summary.trim(),
+                0,
+            )?;
             db::resolve_memory_review_proposal(&conn, &proposal.id, "accepted", None)?;
         }
         "modify" => {
@@ -1488,7 +1518,13 @@ pub fn respond_memory_review(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("memory review modify requires a non-empty summary"))?;
-            db::write_memory_summary(&conn, true, revised)?;
+            db::write_module_memory_summary(
+                &conn,
+                &proposal.module,
+                settings.memory_mode_enabled,
+                revised,
+                0,
+            )?;
             db::resolve_memory_review_proposal(&conn, &proposal.id, "edited", Some(revised))?;
         }
         "reject" => {
@@ -1497,7 +1533,9 @@ pub fn respond_memory_review(
         _ => return Err(anyhow!("unsupported memory review action: {action}")),
     }
 
-    let _ = hide_memory_review_window(app);
+    if db::list_pending_memory_reviews(&conn)?.is_empty() {
+        let _ = hide_memory_review_window(app);
+    }
     sync_windows(app, current_scanning(app))?;
     publish_snapshot(app, current_scanning(app))
 }
@@ -1505,10 +1543,9 @@ pub fn respond_memory_review(
 pub fn sync_windows(app: &AppHandle, is_scanning: bool) -> Result<()> {
     let current = publish_overlay(app, is_scanning)?;
     let has_pending_memory_review = db::connect(app)
-        .and_then(|conn| db::read_pending_memory_review(&conn))
-        .ok()
-        .flatten()
-        .is_some();
+        .and_then(|conn| db::list_pending_memory_reviews(&conn))
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
     if let Some(window) = app.get_window("bubble") {
         if current.pet_status != PetStatus::Polling && current.active_reminder.is_some() {
             let _ = window.show();
@@ -1566,34 +1603,54 @@ async fn maybe_generate_weekly_memory_review(
         return Ok(());
     };
     let read_conn = db::connect(app)?;
-    if db::has_memory_review_for_week(&read_conn, &week_key)? {
-        return Ok(());
+    let current_memories = db::list_latest_memories(&read_conn)?;
+    let signals_by_module = db::list_weekly_memory_signals_by_module(&read_conn, start_at, end_at)?;
+    let enabled_modules = settings
+        .module_preferences
+        .iter()
+        .filter(|item| item.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut created_any = false;
+
+    for module_pref in enabled_modules {
+        let module = policy::normalize_module(&module_pref.module);
+        let Some(signals) = signals_by_module.get(&module) else {
+            continue;
+        };
+        if signals.is_empty() || db::has_memory_review_for_week_module(&read_conn, &week_key, &module)? {
+            continue;
+        }
+
+        let base_summary = current_base_memory_for_module(&module_pref, &current_memories);
+        let refined = llm::generate_weekly_memory_refinement(
+            &settings.llm_provider,
+            Some(&settings.llm_protocol),
+            Some(&settings.llm_base_url),
+            Some(&settings.llm_model),
+            &settings.api_key,
+            &base_summary,
+            std::slice::from_ref(&module_pref),
+            signals,
+        )
+        .await?;
+
+        let refined = refined.trim();
+        if refined.is_empty() || refined == base_summary.trim() {
+            continue;
+        }
+
+        let write_conn = db::connect(app)?;
+        if db::has_memory_review_for_week_module(&write_conn, &week_key, &module)? {
+            continue;
+        }
+        db::create_memory_review_proposal(&write_conn, &week_key, &module, &base_summary, refined)?;
+        created_any = true;
     }
 
-    let base_summary = current_base_memory(settings);
-    let signals = db::list_weekly_memory_signals(&read_conn, start_at, end_at)?;
-    if signals.is_empty() {
-        return Ok(());
+    if created_any {
+        show_memory_review_window(app)?;
     }
-
-    let refined = llm::generate_weekly_memory_refinement(
-        &settings.llm_provider,
-        Some(&settings.llm_protocol),
-        Some(&settings.llm_base_url),
-        Some(&settings.llm_model),
-        &settings.api_key,
-        &base_summary,
-        &settings.module_preferences,
-        &signals,
-    )
-    .await?;
-
-    let write_conn = db::connect(app)?;
-    if db::has_memory_review_for_week(&write_conn, &week_key)? {
-        return Ok(());
-    }
-    db::create_memory_review_proposal(&write_conn, &week_key, &base_summary, &refined)?;
-    show_memory_review_window(app)?;
     Ok(())
 }
 
@@ -1635,7 +1692,8 @@ fn current_memory_review_window(
         return None;
     }
 
-    let week_key = format!("{}-W{:02}", monday.year(), local_now.iso_week().week());
+    let iso_week = local_now.iso_week();
+    let week_key = format!("{}-W{:02}", iso_week.year(), iso_week.week());
     let start_at = review_trigger - chrono::Duration::days(7);
     Some((
         week_key,
@@ -1644,27 +1702,30 @@ fn current_memory_review_window(
     ))
 }
 
-fn current_base_memory(settings: &SettingsPayload) -> String {
-    if !settings.memory_summary.trim().is_empty() {
-        return settings.memory_summary.trim().to_string();
+fn current_base_memory_for_module(
+    module_pref: &UserModulePreference,
+    memories: &[InterestMemoryRecord],
+) -> String {
+    let module = policy::normalize_module(&module_pref.module);
+    if let Some(summary) = memories
+        .iter()
+        .find(|item| item.module == module && !item.summary.trim().is_empty())
+        .map(|item| item.summary.trim().to_string())
+    {
+        return summary;
     }
 
-    let merged = settings
-        .module_preferences
-        .iter()
-        .filter(|item| item.enabled)
-        .map(|item| {
-            if item.selected_buckets.is_empty() {
-                item.preference.trim().to_string()
-            } else {
-                format!("{}（{}）", item.preference.trim(), item.selected_buckets.join(" / "))
-            }
-        })
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("；");
+    let merged = if module_pref.selected_buckets.is_empty() {
+        module_pref.preference.trim().to_string()
+    } else {
+        format!(
+            "{}（{}）",
+            module_pref.preference.trim(),
+            module_pref.selected_buckets.join(" / ")
+        )
+    };
 
-    if merged.is_empty() {
+    if merged.trim().is_empty() {
         "用户尚未写下清晰的一句话兴趣描述，请保留当前偏好方向。".to_string()
     } else {
         merged
@@ -1877,15 +1938,17 @@ fn clamp_due_sources_for_cycle<T>(mut items: Vec<T>) -> (Vec<T>, usize) {
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use chrono::{Datelike, FixedOffset, TimeZone, Utc};
     use std::collections::BTreeMap;
 
     use super::{
-        clamp_due_sources_for_cycle, classify_error_for_display, derive_pet_status,
-        is_settings_complete, MAX_SOURCES_PER_CYCLE,
+        build_interest_context, clamp_due_sources_for_cycle, classify_error_for_display,
+        current_memory_review_window, derive_pet_status, is_settings_complete,
+        MAX_SOURCES_PER_CYCLE,
     };
     use crate::models::{
-        Discipline, PetStatus, RssSource, SettingsPayload, SourceKind, UserDisciplinePreference,
-        UserModulePreference,
+        Discipline, InterestMemoryRecord, PetStatus, RssSource, SettingsPayload, SourceKind,
+        UserDisciplinePreference, UserModulePreference,
     };
 
     fn sample_settings() -> SettingsPayload {
@@ -1979,5 +2042,37 @@ mod tests {
         let (clamped, remaining) = clamp_due_sources_for_cycle(items);
         assert_eq!(clamped.len(), MAX_SOURCES_PER_CYCLE);
         assert_eq!(remaining, 5);
+    }
+
+    #[test]
+    fn weekly_memory_window_uses_iso_week_year() {
+        let now_utc = Utc.with_ymd_and_hms(2027, 1, 1, 13, 30, 0).unwrap();
+        let (week_key, _, _) =
+            current_memory_review_window(now_utc).expect("friday evening in bjt should trigger");
+        let beijing = FixedOffset::east_opt(8 * 3600).unwrap();
+        let local_now = now_utc.with_timezone(&beijing);
+        let iso_week = local_now.iso_week();
+        assert_eq!(week_key, format!("{}-W{:02}", iso_week.year(), iso_week.week()));
+    }
+
+    #[test]
+    fn interest_context_includes_module_scoped_memory() {
+        let settings = sample_settings();
+        let context = build_interest_context(
+            &settings,
+            &[InterestMemoryRecord {
+                day_key: "2026-04-30".into(),
+                module: "technology".into(),
+                generated_summary: String::new(),
+                summary: "偏好能沉淀工程判断标准的 AI 工具和工作流".into(),
+                memory_mode_enabled: true,
+                event_count: 3,
+                updated_at: None,
+            }],
+        );
+
+        assert!(context.contains("technology"));
+        assert!(context.contains("当前已确认记忆"));
+        assert!(context.contains("AI 工具和工作流"));
     }
 }

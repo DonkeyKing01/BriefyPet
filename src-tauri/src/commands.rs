@@ -150,10 +150,12 @@ pub fn dismiss_help_window(app: AppHandle, complete_onboarding: bool) -> Result<
 #[tauri::command]
 pub fn submit_memory_review(
     app: AppHandle,
+    proposal_id: String,
     action: String,
     summary: Option<String>,
 ) -> Result<Snapshot, String> {
-    service::respond_memory_review(&app, &action, summary.as_deref()).map_err(|err| err.to_string())
+    service::respond_memory_review(&app, &proposal_id, &action, summary.as_deref())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
