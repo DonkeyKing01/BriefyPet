@@ -74,30 +74,57 @@ pub fn default_module_push_top_n(_module: &str) -> i64 {
 
 pub fn default_module_fetch_intervals() -> BTreeMap<String, i64> {
     BTreeMap::from([
-        ("technology".to_string(), default_module_fetch_interval_hours("technology")),
+        (
+            "technology".to_string(),
+            default_module_fetch_interval_hours("technology"),
+        ),
         (
             "social_science".to_string(),
             default_module_fetch_interval_hours("social_science"),
         ),
-        ("business".to_string(), default_module_fetch_interval_hours("business")),
-        ("design".to_string(), default_module_fetch_interval_hours("design")),
-        ("science".to_string(), default_module_fetch_interval_hours("science")),
-        ("medicine".to_string(), default_module_fetch_interval_hours("medicine")),
-        ("other".to_string(), default_module_fetch_interval_hours("other")),
+        (
+            "business".to_string(),
+            default_module_fetch_interval_hours("business"),
+        ),
+        (
+            "design".to_string(),
+            default_module_fetch_interval_hours("design"),
+        ),
+        (
+            "science".to_string(),
+            default_module_fetch_interval_hours("science"),
+        ),
+        (
+            "medicine".to_string(),
+            default_module_fetch_interval_hours("medicine"),
+        ),
+        (
+            "other".to_string(),
+            default_module_fetch_interval_hours("other"),
+        ),
     ])
 }
 
 pub fn default_module_push_top_n_map() -> BTreeMap<String, i64> {
     BTreeMap::from([
-        ("technology".to_string(), default_module_push_top_n("technology")),
+        (
+            "technology".to_string(),
+            default_module_push_top_n("technology"),
+        ),
         (
             "social_science".to_string(),
             default_module_push_top_n("social_science"),
         ),
-        ("business".to_string(), default_module_push_top_n("business")),
+        (
+            "business".to_string(),
+            default_module_push_top_n("business"),
+        ),
         ("design".to_string(), default_module_push_top_n("design")),
         ("science".to_string(), default_module_push_top_n("science")),
-        ("medicine".to_string(), default_module_push_top_n("medicine")),
+        (
+            "medicine".to_string(),
+            default_module_push_top_n("medicine"),
+        ),
         ("other".to_string(), default_module_push_top_n("other")),
     ])
 }
@@ -115,9 +142,8 @@ pub fn policy_for_source(
         ("medicine", "regulatory_science", _) | ("medicine", "clinical_safety", _) => (80, 64),
         ("science", _, SourceKind::AcademicJournal) => (79, 61),
         (_, "official", SourceKind::OfficialAnnouncement) => (78, 60),
-        (_, "frontier", SourceKind::AcademicJournal) | (_, "academic", SourceKind::AcademicJournal) => {
-            (77, 59)
-        }
+        (_, "frontier", SourceKind::AcademicJournal)
+        | (_, "academic", SourceKind::AcademicJournal) => (77, 59),
         (_, "research", SourceKind::AcademicJournal) => (76, 58),
         (_, "opinion", _) => (74, 56),
         (_, "blogs", _) => (72, 54),
@@ -137,7 +163,11 @@ pub fn policy_for_source(
     )
 }
 
-pub fn fetch_interval_for_source(module: &str, source_group: &str, source_kind: &SourceKind) -> Duration {
+pub fn fetch_interval_for_source(
+    module: &str,
+    source_group: &str,
+    source_kind: &SourceKind,
+) -> Duration {
     policy_for_source(module, source_group, source_kind).fetch_interval
 }
 
@@ -202,7 +232,9 @@ fn slugify(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_level_for_score, normalize_bucket, normalize_group, normalize_module, policy_for_source};
+    use super::{
+        fit_level_for_score, normalize_bucket, normalize_group, normalize_module, policy_for_source,
+    };
     use crate::models::SourceKind;
 
     #[test]
@@ -220,12 +252,20 @@ mod tests {
 
     #[test]
     fn exposes_group_aware_policy() {
-        let official = policy_for_source("technology", "official", &SourceKind::OfficialAnnouncement);
-        let frontier = policy_for_source("social_science", "frontier", &SourceKind::AcademicJournal);
+        let official =
+            policy_for_source("technology", "official", &SourceKind::OfficialAnnouncement);
+        let frontier =
+            policy_for_source("social_science", "frontier", &SourceKind::AcademicJournal);
 
         assert_eq!(official.fetch_interval.num_hours(), 6);
         assert_eq!(frontier.fetch_interval.num_hours(), 12);
-        assert!(fit_level_for_score("technology", "official", &SourceKind::OfficialAnnouncement, 79)
-            == crate::models::FitLevel::High);
+        assert!(
+            fit_level_for_score(
+                "technology",
+                "official",
+                &SourceKind::OfficialAnnouncement,
+                79
+            ) == crate::models::FitLevel::High
+        );
     }
 }

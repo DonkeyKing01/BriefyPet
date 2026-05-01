@@ -156,6 +156,7 @@ export type ContentPoolStat = {
 
 export type InterestMemoryRecord = {
   dayKey: string;
+  module: string;
   generatedSummary: string;
   summary: string;
   memoryModeEnabled: boolean;
@@ -166,6 +167,7 @@ export type InterestMemoryRecord = {
 export type MemoryReviewProposal = {
   id: string;
   weekKey: string;
+  module: string;
   baseSummary: string;
   proposedSummary: string;
   status: string;
@@ -192,8 +194,8 @@ export type Snapshot = {
   apiKeyValid: boolean;
   lastScanAt: string | null;
   contentPoolStats: ContentPoolStat[];
-  memory: InterestMemoryRecord | null;
-  memoryReview: MemoryReviewProposal | null;
+  memories: InterestMemoryRecord[];
+  memoryReviews: MemoryReviewProposal[];
   sourceSummary: SourceCatalogSummary;
 };
 

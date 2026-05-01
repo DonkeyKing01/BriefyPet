@@ -45,7 +45,7 @@ fn build_pet_window(app: &tauri::App) -> tauri::Result<()> {
 fn build_bubble_window(app: &tauri::App) -> tauri::Result<()> {
     WindowBuilder::new(app, "bubble", WindowUrl::App("index.html".into()))
         .title("Briefy Pet Bubble")
-        .inner_size(420.0, 300.0)
+        .inner_size(480.0, 360.0)
         .transparent(true)
         .decorations(false)
         .always_on_top(true)
@@ -104,8 +104,8 @@ fn position_overlay_windows(app: &tauri::App) -> tauri::Result<()> {
     let bottom_margin = 36.0;
     let pet_width = 188.0;
     let pet_height = 214.0;
-    let bubble_width = 420.0;
-    let bubble_height = 300.0;
+    let bubble_width = 480.0;
+    let bubble_height = 360.0;
 
     let pet_x = (logical_size.width - pet_width - right_margin).max(0.0);
     let pet_y = (logical_size.height - pet_height - bottom_margin).max(0.0);
@@ -159,7 +159,6 @@ fn main() {
             }
 
             let conn = db::connect(&app.handle())?;
-            let _ = db::reject_pending_memory_reviews(&conn)?;
             let settings = db::read_settings(&conn)?;
             let persisted_api_key_valid = db::read_api_key_valid(&conn)?;
             if let Ok(mut api_key_valid) = app.state::<AppState>().api_key_valid.lock() {
@@ -223,18 +222,12 @@ fn main() {
                 memory_window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        if let Ok(conn) = db::connect(&app_handle) {
-                            if let Ok(Some(proposal)) = db::read_pending_memory_review(&conn) {
-                                let _ = db::resolve_memory_review_proposal(
-                                    &conn,
-                                    &proposal.id,
-                                    "rejected",
-                                    Some("closed without confirmation"),
-                                );
-                            }
-                        }
-                        let _ = memory_window_handle.hide();
-                        let _ = service::sync_windows(&app_handle, service::current_scanning(&app_handle));
+                        let _ = memory_window_handle.show();
+                        let _ = memory_window_handle.set_focus();
+                        let _ = service::sync_windows(
+                            &app_handle,
+                            service::current_scanning(&app_handle),
+                        );
                     }
                 });
             }

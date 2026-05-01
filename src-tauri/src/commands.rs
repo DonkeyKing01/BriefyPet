@@ -150,10 +150,12 @@ pub fn dismiss_help_window(app: AppHandle, complete_onboarding: bool) -> Result<
 #[tauri::command]
 pub fn submit_memory_review(
     app: AppHandle,
+    proposal_id: String,
     action: String,
     summary: Option<String>,
 ) -> Result<Snapshot, String> {
-    service::respond_memory_review(&app, &action, summary.as_deref()).map_err(|err| err.to_string())
+    service::respond_memory_review(&app, &proposal_id, &action, summary.as_deref())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -307,15 +309,22 @@ fn map_module_to_discipline(module: &str) -> Discipline {
 
 fn map_group_to_source_kind(source_group: &str) -> SourceKind {
     match source_group {
-        "frontier" | "research" | "academic" | "clinical_trials" | "genomics"
-        | "biostatistics" | "biomaterials" | "biomechanics" | "computational_biology"
-        | "bioinformatics" | "systems_biology" | "pharmacogenomics" | "drug_discovery"
-        | "pharmacology" | "toxicology" => {
-            SourceKind::AcademicJournal
-        }
-        "official" | "regulatory_science" | "clinical_safety" => {
-            SourceKind::OfficialAnnouncement
-        }
+        "frontier"
+        | "research"
+        | "academic"
+        | "clinical_trials"
+        | "genomics"
+        | "biostatistics"
+        | "biomaterials"
+        | "biomechanics"
+        | "computational_biology"
+        | "bioinformatics"
+        | "systems_biology"
+        | "pharmacogenomics"
+        | "drug_discovery"
+        | "pharmacology"
+        | "toxicology" => SourceKind::AcademicJournal,
+        "official" | "regulatory_science" | "clinical_safety" => SourceKind::OfficialAnnouncement,
         "blogs" => SourceKind::TechnicalBlog,
         _ => SourceKind::CommunityHotspot,
     }

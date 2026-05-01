@@ -46,13 +46,13 @@ fn provider_config(provider: &str) -> ProviderConfig {
     match normalize_provider(provider).as_str() {
         "qwen" => ProviderConfig {
             protocol: "openai-compatible",
-            base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            default_model: "qwen3.5-flash",
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            default_model: "qwen-plus",
         },
         "minimax" => ProviderConfig {
             protocol: "openai-compatible",
             base_url: "https://api.minimaxi.com/v1",
-            default_model: "MiniMax-M2.5",
+            default_model: "MiniMax-M2.7-highspeed",
         },
         "glm" => ProviderConfig {
             protocol: "openai-compatible",
@@ -77,7 +77,7 @@ fn provider_config(provider: &str) -> ProviderConfig {
         "anthropic" => ProviderConfig {
             protocol: "anthropic-native",
             base_url: "https://api.anthropic.com",
-            default_model: "claude-sonnet-4-20250514",
+            default_model: "claude-sonnet-4-6",
         },
         "siliconflow" => ProviderConfig {
             protocol: "openai-compatible",
@@ -87,7 +87,7 @@ fn provider_config(provider: &str) -> ProviderConfig {
         _ => ProviderConfig {
             protocol: "openai-compatible",
             base_url: "https://api.deepseek.com",
-            default_model: "deepseek-chat",
+            default_model: "deepseek-v4-flash",
         },
     }
 }
@@ -221,8 +221,7 @@ Rules:\n\
 - fit_level must be one of high, medium, low.\n\
 - fit_score must be an integer from 0 to 100.\n\
 - fit_score must prioritize relevance, reliability, and freshness.\n\
-- Do not output markdown, code fences, explanation, or extra keys.\n\
-\n\
+- Do not output markdown, code fences, explanation, or extra keys.\n\n\
 Personalization context:\n{interest_context}\n\
 \n\
 Articles:\n{article_payload}"
@@ -310,12 +309,12 @@ pub async fn generate_weekly_memory_refinement(
         .iter()
         .filter(|item| item.enabled)
         .map(|item| {
-            let buckets = if item.selected_buckets.is_empty() {
-                "未限定二级学科".to_string()
+            let preference = item.preference.trim();
+            if preference.is_empty() {
+                format!("{}: no one-sentence preference provided", item.module)
             } else {
-                item.selected_buckets.join(" / ")
-            };
-            format!("{}（{}）: {}", item.module, buckets, item.preference.trim())
+                format!("{}: {}", item.module, preference)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -323,38 +322,78 @@ pub async fn generate_weekly_memory_refinement(
         .iter()
         .enumerate()
         .map(|(index, (title, summary, note, source_path))| {
+            let cleaned_summary = if summary.trim().is_empty() {
+                "(no summary captured)"
+            } else {
+                summary.trim()
+            };
             format!(
-                "{}. 标题：{}\n来源分区：{}\n摘要：{}\n用户评论：{}",
+                "{}. Title: {}\nSummary: {}\nUser note: {}\nSource path: {}",
                 index + 1,
                 title.trim(),
-                source_path.trim(),
-                truncate(summary.trim(), 220),
+                truncate(cleaned_summary, 220),
                 if note.trim().is_empty() {
-                    "无"
+                    "none"
                 } else {
                     note.trim()
-                }
+                },
+                source_path.trim(),
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
 
     let prompt = format!(
-        "你是 BriefyPet 的用户兴趣记忆整理助手。\n\
-请根据用户原本的兴趣描述、本周收藏内容摘要和用户批注，提炼更底层、更稳定的兴趣母题与判断标准，输出一句更精细但不偏离原意的中文兴趣描述。\n\
-要求：\n\
-- 只输出一句中文，不要编号，不要解释，不要引号。\n\
-- 保留用户原本的主体兴趣方向，只做细化，不要改写成完全不同的偏好。\n\
-- 语气像用户自己写的兴趣说明，长度尽量控制在 45 到 110 个中文字符。\n\
-- 优先提炼用户反复在意的问题意识、分析框架、审美偏好和判断标准，而不是机械复述看过哪些产品或领域。\n\
-- 如果用户评论里透露了偏好原因、排斥点、选择标准，请优先把这些抽象出来。\n\
-- 如果本周信号不足，就以原描述为主做很轻微的整理。\n\n\
-用户当前兴趣：\n{base_summary}\n\n\
-用户分学科偏好：\n{preferences}\n\n\
-本周收藏与评论信号：\n{signal_text}"
+        "You are BriefyPet's weekly memory calibration writer.
+\
+Write exactly one sentence in Simplified Chinese that the user can directly save as their current interest calibration for one top-level module.
+
+\
+Goal:
+\
+- Use the current memory as the anchor.
+- Use only the user's stronger behavior signals from this review window: saved article summaries and user notes.
+- Sharpen the user's long-term curiosity, evaluative lens, taste, or decision rule.
+- Write from the user's own perspective.
+- Prefer a sentence that says what I consistently care about, how I judge value, or what kind of signal I keep tracking.
+
+\
+Hard constraints:
+\
+- Do not summarize this week's reading.
+- Do not restate source groups, bucket names, or topic lists.
+- Do not write acknowledgements, approvals, or meta text such as ack, approved, got it, suggestion below.
+- Do not produce weekly-report language such as this week I focused on, recently I read, or this week's reading mainly covered.
+- Do not use second-person framing.
+- Do not talk about the user from outside.
+- Do not sound like the AI is explaining the user.
+- Do not copy the current memory unless the evidence truly adds nothing new.
+
+\
+Output requirements:
+\
+- Output exactly one sentence in Simplified Chinese.
+- No bullets, no numbering, no quotation marks, no markdown.
+- Target length: 35 to 90 Chinese characters.
+- The sentence should feel like a durable self-description, not a temporary recap.
+- Prefer natural first-person Chinese phrasing when helpful.
+- Prefer expressing what I keep caring about, how I judge value, or what kind of signal I keep tracking.
+
+\
+Current memory:
+{base_summary}
+
+\
+User's own module preference:
+{preferences}
+
+\
+Evidence from the user's saved articles and notes in the current Friday-to-Friday review window:
+{signal_text}"
     );
-    let body = build_request_body(&protocol, &model, &prompt, 180, false);
-    let payload = send_request_with_retries(&protocol, &base_url, trimmed_key, &model, &body).await?;
+    let body = build_request_body(&protocol, &model, &prompt, 220, false);
+    let payload =
+        send_request_with_retries(&protocol, &base_url, trimmed_key, &model, &body).await?;
     let raw_content = match normalize_protocol(&protocol).as_str() {
         "anthropic-native" => {
             extract_anthropic_content(&payload).context("missing anthropic response content")?
@@ -366,7 +405,7 @@ pub async fn generate_weekly_memory_refinement(
     };
     let output = raw_content
         .replace('\n', " ")
-        .replace('\"', "")
+        .replace('"', "")
         .trim()
         .trim_matches('`')
         .trim()

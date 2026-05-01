@@ -26,6 +26,7 @@ import type {
   Discipline,
   FitLevel,
   HistoryItem,
+  InterestMemoryRecord,
   LlmProtocol,
   LlmProvider,
   MemoryReviewProposal,
@@ -101,6 +102,10 @@ const MODULE_LABELS: Record<SourceModule, string> = {
   medicine: "医学",
   other: "其他"
 };
+
+function moduleDisplayName(module: string) {
+  return MODULE_LABELS[module as SourceModule] ?? module;
+}
 
 const BUCKET_LABELS: Record<string, string> = {
   research: "研究",
@@ -244,6 +249,7 @@ const PROVIDER_OPTIONS: Array<{ value: LlmProvider; label: string }> = [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "anthropic", label: "Anthropic" },
+  { value: "siliconflow", label: "SiliconFlow" },
   { value: "custom", label: "自定义" }
 ];
 
@@ -266,19 +272,19 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.deepseek.com",
     models: [
-      { id: "deepseek-chat", name: "DeepSeek Chat" },
-      { id: "deepseek-reasoner", name: "DeepSeek Reasoner" }
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
   qwen: {
     label: "Qwen",
     protocol: "openai-compatible",
-    baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     models: [
-      { id: "qwen3.5-flash", name: "Qwen 3.5 Flash" },
-      { id: "qwen3.5-plus", name: "Qwen 3.5 Plus" },
-      { id: "qwen3-max", name: "Qwen 3 Max" }
+      { id: "qwen-plus", name: "Qwen Plus" },
+      { id: "qwen-flash", name: "Qwen Flash" },
+      { id: "qwen-max", name: "Qwen Max" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
@@ -287,8 +293,6 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.minimaxi.com/v1",
     models: [
-      { id: "MiniMax-M2.5-highspeed", name: "MiniMax M2.5 Highspeed" },
-      { id: "MiniMax-M2.5", name: "MiniMax M2.5" },
       { id: "MiniMax-M2.7-highspeed", name: "MiniMax M2.7 Highspeed" },
       { id: "MiniMax-M2.7", name: "MiniMax M2.7" }
     ],
@@ -321,8 +325,8 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.openai.com/v1",
     models: [
-      { id: "gpt-5.4-nano", name: "GPT-5.4 Nano" },
       { id: "gpt-5.4-mini", name: "GPT-5.4 Mini" },
+      { id: "gpt-5.4-nano", name: "GPT-5.4 Nano" },
       { id: "gpt-5.4", name: "GPT-5.4" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
@@ -343,9 +347,9 @@ const PROVIDER_DEFINITIONS: Record<string, ProviderDefinition> = {
     protocol: "anthropic-native",
     baseUrl: "https://api.anthropic.com",
     models: [
-      { id: "claude-3-5-haiku-latest", name: "Claude Haiku 3.5" },
-      { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
-      { id: "claude-opus-4-1-20250805", name: "Claude Opus 4.1" }
+      { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
+      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
+      { id: "claude-opus-4-7", name: "Claude Opus 4.7" }
     ],
     apiKeyHint: "这里填写当前所选服务商的 API Key"
   },
@@ -662,9 +666,14 @@ function snapshotFingerprint(snapshot: Snapshot) {
     .map((item) => `${item.id}:${item.batchId}:${item.fitScore}`)
     .join(",");
   const enabledDisciplineCount = snapshot.settings.modulePreferences.filter((item) => item.enabled).length;
-  const memoryReviewKey = snapshot.memoryReview
-    ? `${snapshot.memoryReview.id}:${snapshot.memoryReview.status}:${snapshot.memoryReview.createdAt}`
-    : "none";
+  const memoryEdge = snapshot.memories
+    .slice(0, 24)
+    .map((item) => `${item.module}:${item.updatedAt ?? ""}:${item.summary}`)
+    .join(",");
+  const memoryReviewKey = snapshot.memoryReviews
+    .slice(0, 24)
+    .map((item) => `${item.id}:${item.module}:${item.status}:${item.createdAt}`)
+    .join(",");
 
   return [
     snapshot.petStatus,
@@ -678,7 +687,7 @@ function snapshotFingerprint(snapshot: Snapshot) {
     reminderKey,
     snapshot.articles.length,
     snapshot.historyArticles.length,
-    snapshot.memory?.updatedAt ?? "",
+    memoryEdge,
     memoryReviewKey,
     snapshot.sourceSummary.dueSources,
     articleEdge,
@@ -1508,33 +1517,43 @@ function HelpWindow() {
   );
 }
 
-function MemoryReviewWindow({ proposal }: { proposal: MemoryReviewProposal | null | undefined }) {
-  const [draft, setDraft] = useState(proposal?.proposedSummary ?? "");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+function MemoryReviewWindow({
+  proposals
+}: {
+  proposals: MemoryReviewProposal[] | null | undefined;
+}) {
+  const items = proposals ?? [];
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
+  const [errors, setErrors] = useState<Record<string, string | null>>({});
 
   useEffect(() => {
-    setDraft(proposal?.proposedSummary ?? "");
-    setError(null);
-  }, [proposal?.id, proposal?.proposedSummary]);
+    setDrafts(Object.fromEntries(items.map((proposal) => [proposal.id, proposal.proposedSummary])));
+    setErrors({});
+  }, [items]);
 
-  async function handleSubmit(action: "accept" | "modify" | "reject") {
-    if (!proposal) {
-      return;
-    }
-    if (action === "modify" && !draft.trim()) {
-      setError("修改后的兴趣记忆不能为空。");
+  async function handleSubmit(proposal: MemoryReviewProposal, action: "accept" | "reject") {
+    const draft = (drafts[proposal.id] ?? proposal.proposedSummary).trim();
+    if (action === "accept" && !draft) {
+      setErrors((prev) => ({ ...prev, [proposal.id]: "\u63a5\u53d7\u65f6\u5185\u5bb9\u4e0d\u80fd\u4e3a\u7a7a\u3002" }));
       return;
     }
 
-    setSaving(true);
-    setError(null);
+    setSavingIds((prev) => ({ ...prev, [proposal.id]: true }));
+    setErrors((prev) => ({ ...prev, [proposal.id]: null }));
     try {
-      await submitMemoryReview(action, action === "modify" ? draft.trim() : undefined);
+      await submitMemoryReview(
+        proposal.id,
+        action,
+        action === "accept" ? draft : undefined
+      );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "提交记忆确认失败");
+      setErrors((prev) => ({
+        ...prev,
+        [proposal.id]: err instanceof Error ? err.message : "\u63d0\u4ea4\u5468\u5ea6\u8bb0\u5fc6\u6821\u51c6\u5931\u8d25\u3002"
+      }));
     } finally {
-      setSaving(false);
+      setSavingIds((prev) => ({ ...prev, [proposal.id]: false }));
     }
   }
 
@@ -1543,49 +1562,62 @@ function MemoryReviewWindow({ proposal }: { proposal: MemoryReviewProposal | nul
       <div className="memory-review-card">
         <div className="memory-review-head">
           <span className="help-eyebrow">Weekly Memory Review</span>
-          <strong>本周兴趣记忆更新</strong>
+          <strong>{"\u672c\u5468\u5174\u8da3\u8bb0\u5fc6\u66f4\u65b0"}</strong>
         </div>
-        {proposal ? (
+        {items.length > 0 ? (
           <>
             <p className="memory-review-copy">
-              系统已根据你本周的收藏内容、笔记和原始兴趣描述，生成一条更细的兴趣记忆。此窗口不能直接关闭，请选择接受、修改或拒绝。
+              {"\u7cfb\u7edf\u4f1a\u5728\u6bcf\u5468\u4e94\u665a 9 \u70b9\u5de6\u53f3\uff0c\u57fa\u4e8e\u4f60\u5df2\u52fe\u9009\u7684\u4e00\u7ea7\u5b66\u79d1\uff0c\u4f18\u5148\u53c2\u8003\u4e0a\u4e00\u4e2a\u5468\u4e94\u63d0\u9192\u65f6\u523b\u5230\u672c\u6b21\u5468\u4e94\u63d0\u9192\u65f6\u523b\u4e4b\u95f4\u4f60\u6536\u85cf\u8fc7\u3001\u6216\u5199\u8fc7\u7b14\u8bb0\u7684\u6587\u7ae0\u6458\u8981\u4e0e\u6279\u6ce8\uff0c\u751f\u6210\u5019\u9009\u5174\u8da3\u8bb0\u5fc6\u3002\u4f60\u53ef\u4ee5\u76f4\u63a5\u4fee\u6539\u6587\u672c\uff0c\u786e\u8ba4\u540e\u70b9\u51fb\u63a5\u53d7\u5373\u53ef\u5199\u56de\u5174\u8da3\u96f7\u8fbe\u3002"}
             </p>
-            <div className="memory-review-panel">
-              <h3>当前基线</h3>
-              <p>{proposal.baseSummary || "暂无已确认兴趣记忆，将以你当前填写的兴趣偏好为主。"}</p>
-            </div>
-            <div className="memory-review-panel">
-              <h3>候选更新</h3>
-              <textarea
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="在这里修改本周候选兴趣记忆"
-              />
-            </div>
-            {error && <div className="error-banner">{error}</div>}
-            <div className="memory-review-actions">
-              <button
-                className="ghost"
-                disabled={saving}
-                onClick={() => void handleSubmit("reject")}
-              >
-                拒绝
-              </button>
-              <button
-                className="ghost"
-                disabled={saving}
-                onClick={() => void handleSubmit("modify")}
-              >
-                {saving ? "提交中..." : "修改后接受"}
-              </button>
-              <button disabled={saving} onClick={() => void handleSubmit("accept")}>
-                {saving ? "提交中..." : "直接接受"}
-              </button>
+            <div className="memory-review-list">
+              {items.map((proposal) => {
+                const saving = Boolean(savingIds[proposal.id]);
+                const draft = drafts[proposal.id] ?? proposal.proposedSummary;
+                const error = errors[proposal.id];
+                return (
+                  <div key={proposal.id} className="memory-review-panel">
+                    <h3>{moduleDisplayName(proposal.module)}</h3>
+                    <div className="memory-review-section">
+                      <strong className="memory-review-label">
+                        {"\u5f53\u524d\u5174\u8da3\u4e00\u53e5\u8bdd"}
+                      </strong>
+                      <p className="memory-review-current">
+                        {proposal.baseSummary || "\u6682\u65e0\u5df2\u786e\u8ba4\u5174\u8da3\u8bb0\u5fc6\uff0c\u5c06\u4ee5\u5f53\u524d\u4e00\u7ea7\u5b66\u79d1\u7684\u4e00\u53e5\u8bdd\u5174\u8da3\u63cf\u8ff0\u4e3a\u57fa\u7ebf\u3002"}
+                      </p>
+                    </div>
+                    <div className="memory-review-section">
+                      <strong className="memory-review-label">
+                        {"\u672c\u5468\u65b0\u7684\u6821\u51c6\u5efa\u8bae"}
+                      </strong>
+                    <textarea
+                      value={draft}
+                      onChange={(event) =>
+                        setDrafts((prev) => ({ ...prev, [proposal.id]: event.target.value }))
+                      }
+                      placeholder={"\u5728\u8fd9\u91cc\u4fee\u6539\u672c\u5468\u5019\u9009\u5174\u8da3\u8bb0\u5fc6"}
+                    />
+                    </div>
+                    {error && <div className="error-banner">{error}</div>}
+                    <div className="memory-review-actions">
+                      <button
+                        className="ghost"
+                        disabled={saving}
+                        onClick={() => void handleSubmit(proposal, "reject")}
+                      >
+                        {"\u62d2\u7edd"}
+                      </button>
+                      <button disabled={saving} onClick={() => void handleSubmit(proposal, "accept")}>
+                        {saving ? "\u63d0\u4ea4\u4e2d..." : "\u63a5\u53d7"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </>
         ) : (
           <div className="memory-review-panel">
-            <p>当前没有待确认的周度兴趣记忆。</p>
+            <p>{"\u5f53\u524d\u6ca1\u6709\u5f85\u786e\u8ba4\u7684\u5468\u5ea6\u5174\u8da3\u8bb0\u5fc6\u3002"}</p>
           </div>
         )}
       </div>
@@ -1625,10 +1657,21 @@ function SettingsView({
   const [providerApiKeyDrafts, setProviderApiKeyDrafts] = useState<Record<string, string>>(
     snapshot.settings.providerApiKeys
   );
+  const [modulePreferenceDrafts, setModulePreferenceDrafts] = useState<Record<string, string>>(
+    Object.fromEntries(snapshot.settings.modulePreferences.map((item) => [item.module, item.preference]))
+  );
 
   const modulePrefs = useMemo(
     () => sortModulePrefs(snapshot.settings.modulePreferences),
     [snapshot.settings.modulePreferences]
+  );
+  const confirmedMemoryByModule = useMemo(
+    () => new Map<string, InterestMemoryRecord>(snapshot.memories.map((item) => [item.module, item])),
+    [snapshot.memories]
+  );
+  const pendingReviewsByModule = useMemo(
+    () => new Map(snapshot.memoryReviews.map((item) => [item.module, item] as const)),
+    [snapshot.memoryReviews]
   );
 
   const groupedSources = useMemo(
@@ -1669,6 +1712,12 @@ function SettingsView({
     snapshot.settings.llmProvider,
     snapshot.settings.providerApiKeys
   ]);
+
+  useEffect(() => {
+    setModulePreferenceDrafts(
+      Object.fromEntries(snapshot.settings.modulePreferences.map((item) => [item.module, item.preference]))
+    );
+  }, [snapshot.settings.modulePreferences]);
 
   useEffect(() => {
     if (!customBucketOptions.includes(customBucket)) {
@@ -1730,7 +1779,7 @@ function SettingsView({
     const modulePreferences = modulePrefs.map((item) => ({
       module: item.module,
       enabled: formData.get(`module-enabled-${item.module}`) === "on",
-      preference: String(formData.get(`module-pref-${item.module}`) ?? ""),
+      preference: modulePreferenceDrafts[item.module] ?? "",
       selectedBuckets: formData
         .getAll(`module-bucket-${item.module}`)
         .map((value) => String(value))
@@ -2088,7 +2137,13 @@ function SettingsView({
               </div>
               <textarea
                 name={`module-pref-${item.module}`}
-                defaultValue={item.preference}
+                value={modulePreferenceDrafts[item.module] ?? ""}
+                onChange={(event) =>
+                  setModulePreferenceDrafts((prev) => ({
+                    ...prev,
+                    [item.module]: event.target.value
+                  }))
+                }
                 placeholder={`例如：围绕${MODULE_LABELS[module] ?? item.module}，优先看${bucketOptions
                   .slice(0, 3)
                   .map((bucket) => bucketLabel(bucket))
@@ -2100,12 +2155,12 @@ function SettingsView({
       </section>
         </div>{/* end radar */}
 
-        {/* ── 周度记忆 ── */}
+        {/* Memory review */}
         <div className={activeSection === "memory" ? "" : "settings-section-hidden"}>
         <section className="settings-card">
         <div className="settings-section-head">
           <h2>周度兴趣记忆</h2>
-          <p>系统会在每周五晚九点（北京时间）基于本周星标、摘要和批注，生成一条更细化的兴趣描述，供你确认或修改。</p>
+          <p>{"\u7cfb\u7edf\u4f1a\u5728\u6bcf\u5468\u4e94\u89e6\u53d1\u65f6\u523b\uff08\u5317\u4eac\u65f6\u95f4\uff09\u6309\u4e00\u7ea7\u5b66\u79d1\u5206\u522b\u6c47\u603b\u4e0a\u4e00\u4e2a\u5468\u4e94\u63d0\u9192\u65f6\u523b\u5230\u672c\u6b21\u5468\u4e94\u63d0\u9192\u65f6\u523b\u4e4b\u95f4\u7684\u7cbe\u9009\u5185\u5bb9\uff0c\u751f\u6210\u5019\u9009\u5174\u8da3\u8bb0\u5fc6\uff0c\u7b49\u5f85\u4f60\u9010\u9879\u786e\u8ba4\u3002"}</p>
         </div>
         <label className="checkbox-row">
           <input
@@ -2115,6 +2170,30 @@ function SettingsView({
           />
           <span>启用周度兴趣记忆</span>
         </label>
+        <div className="memory-status-grid">
+          {modulePrefs
+            .filter((item) => item.enabled)
+            .map((item) => {
+              const memory = confirmedMemoryByModule.get(item.module);
+              const review = pendingReviewsByModule.get(item.module);
+              return (
+                <article key={item.module} className="memory-status-card">
+                  <div className="memory-review-head">
+                    <strong>{moduleDisplayName(item.module)}</strong>
+                    <span className="memory-status-badge">{review ? "待处理" : "已同步"}</span>
+                  </div>
+                  <div className="memory-status-item">
+                    <strong>当前已确认记忆</strong>
+                    <p>{memory?.summary?.trim() || "暂无已确认记忆，将以当前一级学科的一句话兴趣描述为基线。"}</p>
+                  </div>
+                  <div className="memory-status-item">
+                    <strong>待确认校准</strong>
+                    <p>{review?.proposedSummary?.trim() || "当前没有待确认校准。若生成新记忆时应用被强制关闭，未处理项会保留在这里。"}</p>
+                  </div>
+                </article>
+              );
+            })}
+        </div>
       </section>
         </div>{/* end memory */}
 
@@ -3698,7 +3777,7 @@ export default function App() {
   }
 
   if (windowLabel === "memory-review") {
-    return <MemoryReviewWindow proposal={snapshot?.memoryReview} />;
+    return <MemoryReviewWindow proposals={snapshot?.memoryReviews} />;
   }
 
   return (
