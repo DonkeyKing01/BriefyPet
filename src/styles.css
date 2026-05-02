@@ -227,7 +227,7 @@ a {
 .bubble-window {
   width: 100%;
   height: 100%;
-  padding: 12px;
+  padding: 14px;
   display: flex;
   align-items: stretch;
   cursor: grab;
@@ -247,16 +247,18 @@ a {
   width: 100%;
   min-height: 0;
   height: 100%;
-  padding: 18px;
+  padding: 20px;
   border-radius: 24px;
   border: 1px solid var(--line-soft);
   display: flex;
   flex-direction: column;
+  gap: 10px;
   background:
     radial-gradient(circle at top right, rgba(58, 92, 168, 0.12), rgba(58, 92, 168, 0) 44%),
     linear-gradient(180deg, rgba(248, 250, 255, 0.98), rgba(235, 240, 252, 0.98));
   box-shadow: var(--shadow-1);
   animation: bubble-appear 180ms ease;
+  overflow: auto;
 }
 
 .bubble-kicker {
@@ -268,23 +270,22 @@ a {
 }
 
 .bubble-card h2 {
-  margin: 8px 0 0;
+  margin: 4px 0 0;
   font-family: var(--font-heading);
-  font-size: clamp(22px, 6.2vw, 28px);
-  line-height: 1.18;
+  font-size: clamp(22px, 5.2vw, 30px);
+  line-height: 1.22;
   font-weight: 500;
   letter-spacing: -0.02em;
+  word-break: break-word;
 }
 
 .bubble-copy {
-  margin: 10px 0 0;
+  margin: 0;
   color: var(--text-soft);
-  line-height: 1.45;
+  line-height: 1.55;
   font-size: 13px;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  display: block;
+  overflow: visible;
 }
 
 .bubble-actions {
@@ -292,13 +293,13 @@ a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: auto;
-  padding-top: 12px;
+  padding-top: 8px;
 }
 
 .bubble-actions button {
   border-radius: 9px;
-  min-height: 34px;
-  padding: 0 10px;
+  min-height: 36px;
+  padding: 0 12px;
   font-size: 12px;
   background: linear-gradient(180deg, var(--accent) 0%, var(--accent-strong) 100%);
   color: #f0f4ff;
@@ -1337,16 +1338,18 @@ a {
 .memory-review-window {
   width: 100%;
   height: 100%;
-  padding: 20px;
+  padding: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
   background: transparent;
+  overflow: hidden;
 }
 
 .memory-review-card {
   width: min(100%, 700px);
-  min-height: 540px;
+  height: min(100%, 720px);
+  min-height: 0;
   border-radius: 24px;
   border: 1px solid var(--line-soft);
   background:
@@ -1357,6 +1360,7 @@ a {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  overflow: hidden;
 }
 
 .memory-review-head {
@@ -1369,6 +1373,17 @@ a {
   margin: 0;
   color: var(--text-soft);
   line-height: 1.72;
+  flex: 0 0 auto;
+}
+
+.memory-review-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 6px;
 }
 
 .memory-review-panel {
@@ -1376,6 +1391,7 @@ a {
   border: 1px solid var(--line-soft);
   background: color-mix(in srgb, var(--surface-muted) 88%, transparent);
   padding: 14px;
+  flex: 0 0 auto;
 }
 
 .memory-review-panel h3,
@@ -1394,22 +1410,110 @@ a {
   white-space: pre-line;
 }
 
+.memory-review-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.memory-review-section:first-of-type {
+  margin-top: 0;
+}
+
+.memory-review-label {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.memory-review-current {
+  border-radius: 12px;
+  border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  padding: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .memory-review-panel textarea {
   width: 100%;
-  min-height: 160px;
+  min-height: 140px;
+  max-height: 280px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: color-mix(in srgb, var(--surface) 95%, transparent);
   color: var(--text);
   padding: 12px;
   line-height: 1.65;
+  overflow-y: auto;
   resize: vertical;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .memory-review-actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.memory-review-actions button {
+  min-width: 76px;
+  min-height: 38px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+
+
+.memory-status-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.memory-status-card {
+  border-radius: 16px;
+  border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--surface) 95%, transparent);
+  padding: 14px;
+}
+
+.memory-status-card h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.memory-status-item + .memory-status-item {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.memory-status-item strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.memory-status-item p {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.68;
+  white-space: pre-line;
+}
+
+.memory-status-badge {
+  display: inline-flex;
+  margin-top: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #2f67d5 14%, var(--surface));
+  color: #2453b6;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .settings-danger-card {
@@ -1604,6 +1708,12 @@ a {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.45;
+}
+
+@media (max-width: 960px) {
+  .memory-status-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .rss-list {

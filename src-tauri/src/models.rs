@@ -240,6 +240,7 @@ pub struct ContentPoolStat {
 #[serde(rename_all = "camelCase")]
 pub struct InterestMemoryRecord {
     pub day_key: String,
+    pub module: String,
     pub generated_summary: String,
     pub summary: String,
     pub memory_mode_enabled: bool,
@@ -252,6 +253,7 @@ pub struct InterestMemoryRecord {
 pub struct MemoryReviewProposal {
     pub id: String,
     pub week_key: String,
+    pub module: String,
     pub base_summary: String,
     pub proposed_summary: String,
     pub status: String,
@@ -282,8 +284,8 @@ pub struct Snapshot {
     pub api_key_valid: bool,
     pub last_scan_at: Option<DateTime<Utc>>,
     pub content_pool_stats: Vec<ContentPoolStat>,
-    pub memory: Option<InterestMemoryRecord>,
-    pub memory_review: Option<MemoryReviewProposal>,
+    pub memories: Vec<InterestMemoryRecord>,
+    pub memory_reviews: Vec<MemoryReviewProposal>,
     pub source_summary: SourceCatalogSummary,
 }
 
