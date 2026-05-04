@@ -35,6 +35,17 @@ BriefyPet，一个智能桌面阅读助手，正致力于从信源、个性化�
 
 它不是传统意义上的 RSS 阅读器，而是一个集收集、筛选与提醒于一体的智能桌面助手：先把控一手信源入口质量，再按用户兴趣偏好做摘要、契合度判断和推荐理由，最后只在真正值得优先阅读的内容出现时提醒你。
 
+## 运行效果
+
+### 阅读页
+
+![BriefyPet reading view](docs/reading.png)
+
+### 设置页
+
+![BriefyPet settings view](docs/setting.png)
+
+
 ## 功能
 
 - 可直接安装和运行的本地桌面应用，无需账号注册和源码安装；
@@ -47,8 +58,6 @@ BriefyPet，一个智能桌面阅读助手，正致力于从信源、个性化�
 - 数据本地保存，不依赖云端账号。
 
 ## 快速开始
-
-### 下载安装包
 
 访问 [Release](https://github.com/DonkeyKing01/BriefyPet/releases) 或 [产品发布页](https://briefypet.netlify.app/) 下载安装包。首次启动后需要：
 
@@ -70,7 +79,61 @@ BriefyPet，一个智能桌面阅读助手，正致力于从信源、个性化�
 - [GLM API Key](https://docs.bigmodel.cn/)
 - [Kimi API Key](https://platform.moonshot.ai/console/api-keys)
 
-### 本地编译运行
+
+
+## 信源
+
+当前信源目录位于 `src-tauri/resources/rss-catalog.opml`，覆盖 6 个一级大类领域、24 个二级下属学科、47 个细分分类，总计 760+ 条订阅入口。重点关注科技、医学、基础科学、社会科学、设计和商业中的高质量来源。
+
+| 一级领域 | 示例二级分类 | 典型来源 |
+| --- | --- | --- |
+| 科技与 AI | AI 与计算机、具身智能与机器人、HCI 研究 | 官方账号、研究团队、工程博客和高密度创作者观点 |
+| 社会科学 | 经济学、社会学、政治学 | 经济学、社会学、政治学前沿，以及严肃评论来源 |
+| 医学 | 临床医学、公共卫生、药物研发、生物医学工程 | 临床、公共卫生、生物工程和药物研发信号 |
+| 基础科学 | 生物、物理、化学与材料、环境科学、数学 | 物理、化学、生物与交叉前沿来源 |
+| 设计 | 产品与 UX、工程设计、创意设计、设计方法 | 产品与 UX 设计、HCI 研究和工程设计 |
+| 商业 | 媒体报道、行业观察、长期观点 | 商业媒体、行业观察和长期观点来源 |
+
+用户也可以在设置页新增自定义 RSS 源。新增信源会被归入对应模块与分类，并进入后续抓取、摘要和评分流程。
+
+## IP 形象
+
+我们选用有着中华田园企鹅之称的夜鹭夜师傅作为我们的桌宠形象，它是安静、机敏又睿智的，默默筛选高价值信息，守护用户宝贵的注意力。
+
+期待你在使用过程中触发夜鹭的以下状态：
+
+| 状态 | 含义 | 预览 |
+| --- | --- | --- |
+| loading | 应用启动或加载中 | <img src="public/pets/briefy-ip/gifs/loading.gif" alt="loading" width="96" /><br>`public/pets/briefy-ip/gifs/loading.gif` |
+| needs-config | 尚未完成必要配置 | <img src="public/pets/briefy-ip/gifs/needs-config.gif" alt="needs-config" width="96" /><br>`public/pets/briefy-ip/gifs/needs-config.gif` |
+| polling | 定时轮询信源 | <img src="public/pets/briefy-ip/gifs/polling.gif" alt="polling" width="96" /><br>`public/pets/briefy-ip/gifs/polling.gif` |
+| scanning | 正在抓取、摘要和筛选 | <img src="public/pets/briefy-ip/gifs/scanning.gif" alt="scanning" width="96" /><br>`public/pets/briefy-ip/gifs/scanning.gif` |
+| idle | 当前无高优先级提醒 | <img src="public/pets/briefy-ip/gifs/idle.gif" alt="idle" width="96" /><br>`public/pets/briefy-ip/gifs/idle.gif` |
+| new-info | 有新内容值得阅读 | <img src="public/pets/briefy-ip/gifs/new-info.gif" alt="new-info" width="96" /><br>`public/pets/briefy-ip/gifs/new-info.gif` |
+
+
+
+## 数据与隐私
+
+BriefyPet 不要求注册云账号。文章、收藏、笔记、提醒队列、兴趣记忆和运行状态默认存储在本地 SQLite 数据库中。
+
+需要注意的是，摘要、评分和记忆提炼会调用用户配置的 LLM Provider。也就是说，发送给模型供应商的内容取决于你选择的接口和模型服务条款。项目本身不提供云端账号体系，也不会把本地数据库同步到项目服务器。
+
+## Q&A
+
+### BriefyPet 是传统 RSS 阅读器吗？
+
+不是。它更像一个“信源入口 + LLM 初筛 + 桌面提醒 + 阅读沉淀”的组合。你不需要不断手动打开信息流，BriefyPet 会筛除低质量噪音，把真正高契合的内容呈现给你。
+
+### 为什么强调一手优质信源？
+
+学术前沿、官方发布和 Creator 观点更靠近信号源头，信息密度与价值更高，也更适合进入长期知识沉淀，而不是停留在二次包装后的热点消费。
+
+### 没有 API Key 可以使用吗？
+
+当前版本不支持无 Key 模式。没有可用 API Key 时，桌宠会停留在待配置状态，无法进入后续的摘要、契合度判断和推荐流程。
+
+## 本地编译运行
 
 环境要求：
 
@@ -158,66 +221,6 @@ BriefyPet/
 ├── package.json                  # 前端依赖和脚本
 └── vite.config.ts                # Vite 配置
 ```
-
-## 信源
-
-当前信源目录位于 `src-tauri/resources/rss-catalog.opml`，覆盖 6 个一级大类领域、24 个二级下属学科、47 个细分分类，总计 760+ 条订阅入口。重点关注科技、医学、基础科学、社会科学、设计和商业中的高质量来源。
-
-| 一级领域 | 示例二级分类 | 典型来源 |
-| --- | --- | --- |
-| 科技与 AI | AI 与计算机、具身智能与机器人、HCI 研究 | 官方账号、研究团队、工程博客和高密度创作者观点 |
-| 社会科学 | 经济学、社会学、政治学 | 经济学、社会学、政治学前沿，以及严肃评论来源 |
-| 医学 | 临床医学、公共卫生、药物研发、生物医学工程 | 临床、公共卫生、生物工程和药物研发信号 |
-| 基础科学 | 生物、物理、化学与材料、环境科学、数学 | 物理、化学、生物与交叉前沿来源 |
-| 设计 | 产品与 UX、工程设计、创意设计、设计方法 | 产品与 UX 设计、HCI 研究和工程设计 |
-| 商业 | 媒体报道、行业观察、长期观点 | 商业媒体、行业观察和长期观点来源 |
-
-用户也可以在设置页新增自定义 RSS 源。新增信源会被归入对应模块与分类，并进入后续抓取、摘要和评分流程。
-
-## IP 形象
-
-我们选用有着中华田园企鹅之称的夜鹭夜师傅作为我们的桌宠形象，它是安静、机敏又睿智的，默默筛选高价值信息，守护用户宝贵的注意力。
-
-期待你在使用过程中触发夜鹭的以下状态：
-
-| 状态 | 含义 | 预览 |
-| --- | --- | --- |
-| loading | 应用启动或加载中 | <img src="public/pets/briefy-ip/gifs/loading.gif" alt="loading" width="96" /><br>`public/pets/briefy-ip/gifs/loading.gif` |
-| needs-config | 尚未完成必要配置 | <img src="public/pets/briefy-ip/gifs/needs-config.gif" alt="needs-config" width="96" /><br>`public/pets/briefy-ip/gifs/needs-config.gif` |
-| polling | 定时轮询信源 | <img src="public/pets/briefy-ip/gifs/polling.gif" alt="polling" width="96" /><br>`public/pets/briefy-ip/gifs/polling.gif` |
-| scanning | 正在抓取、摘要和筛选 | <img src="public/pets/briefy-ip/gifs/scanning.gif" alt="scanning" width="96" /><br>`public/pets/briefy-ip/gifs/scanning.gif` |
-| idle | 当前无高优先级提醒 | <img src="public/pets/briefy-ip/gifs/idle.gif" alt="idle" width="96" /><br>`public/pets/briefy-ip/gifs/idle.gif` |
-| new-info | 有新内容值得阅读 | <img src="public/pets/briefy-ip/gifs/new-info.gif" alt="new-info" width="96" /><br>`public/pets/briefy-ip/gifs/new-info.gif` |
-
-## 运行效果
-
-### 设置页
-
-![BriefyPet settings view](docs/setting.png)
-
-### 阅读页
-
-![BriefyPet reading view](docs/reading.png)
-
-## 数据与隐私
-
-BriefyPet 不要求注册云账号。文章、收藏、笔记、提醒队列、兴趣记忆和运行状态默认存储在本地 SQLite 数据库中。
-
-需要注意的是，摘要、评分和记忆提炼会调用用户配置的 LLM Provider。也就是说，发送给模型供应商的内容取决于你选择的接口和模型服务条款。项目本身不提供云端账号体系，也不会把本地数据库同步到项目服务器。
-
-## Q&A
-
-### BriefyPet 是传统 RSS 阅读器吗？
-
-不是。它更像一个“信源入口 + LLM 初筛 + 桌面提醒 + 阅读沉淀”的组合。你不需要不断手动打开信息流，BriefyPet 会筛除低质量噪音，把真正高契合的内容呈现给你。
-
-### 为什么强调一手优质信源？
-
-学术前沿、官方发布和 Creator 观点更靠近信号源头，信息密度与价值更高，也更适合进入长期知识沉淀，而不是停留在二次包装后的热点消费。
-
-### 没有 API Key 可以使用吗？
-
-当前版本不支持无 Key 模式。没有可用 API Key 时，桌宠会停留在待配置状态，无法进入后续的摘要、契合度判断和推荐流程。
 
 ## 致谢
 
