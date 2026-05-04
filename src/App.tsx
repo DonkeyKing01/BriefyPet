@@ -503,6 +503,13 @@ function settingsSaveFailureSummary(rawMessage: string): { summary: string; advi
   const lower = rawMessage.toLowerCase();
   const statusCode = statusCodeFromError(rawMessage);
 
+  if (rawMessage.includes("开机自启设置失败") || lower.includes("autolaunch")) {
+    return {
+      summary: "开机自启设置失败。",
+      advice: "内容配置和 API Key 不一定有问题。请检查应用是否有写入启动项权限，或先关闭开机自启后保存；如果仍失败，原始异常会显示系统返回的原因。"
+    };
+  }
+
   if (lower.includes("missing api key")) {
     return {
       summary: "API Key 未填写。",

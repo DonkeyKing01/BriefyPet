@@ -10,6 +10,30 @@ use crate::{
     policy, service, AppState,
 };
 
+fn is_missing_autostart_entry_error(message: &str) -> bool {
+    message.contains("os error 2")
+        || message.contains("系统找不到指定的文件")
+        || message.contains("The system cannot find the file specified")
+}
+
+fn sync_auto_start(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        app.autolaunch()
+            .enable()
+            .map_err(|err| format!("开机自启设置失败: {err}"))?;
+        return Ok(());
+    }
+
+    if let Err(err) = app.autolaunch().disable() {
+        let message = err.to_string();
+        if !is_missing_autostart_entry_error(&message) {
+            return Err(format!("开机自启设置失败: {message}"));
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn bootstrap(app: AppHandle, state: State<AppState>) -> Result<Snapshot, String> {
     service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
@@ -45,11 +69,7 @@ pub async fn save_settings(
             let mut scanning = state.is_scanning.lock().map_err(|err| err.to_string())?;
             *scanning = false;
         }
-        if settings.auto_start {
-            app.autolaunch().enable().map_err(|err| err.to_string())?;
-        } else {
-            app.autolaunch().disable().map_err(|err| err.to_string())?;
-        }
+        sync_auto_start(&app, settings.auto_start)?;
         service::sync_windows(&app, false).map_err(|err| err.to_string())?;
         return service::publish_snapshot(&app, false).map_err(|err| err.to_string());
     }
@@ -61,11 +81,7 @@ pub async fn save_settings(
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::write_settings(&conn, &settings).map_err(|err| err.to_string())?;
     db::write_active_view(&conn, &AppView::Reading).map_err(|err| err.to_string())?;
-    if settings.auto_start {
-        app.autolaunch().enable().map_err(|err| err.to_string())?;
-    } else {
-        app.autolaunch().disable().map_err(|err| err.to_string())?;
-    }
+    sync_auto_start(&app, settings.auto_start)?;
 
     service::reconcile_fetch_runtime(&app).map_err(|err| err.to_string())?;
     let scanning = service::current_scanning(&app);
