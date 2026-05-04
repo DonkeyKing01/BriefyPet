@@ -15,4 +15,11 @@ if [[ -z "$DMG_PATH" ]]; then
   exit 1
 fi
 
+TARGET_DMG_PATH="$MACOS_DIR/Briefy-pet_0.1.0_mac.dmg"
+if [[ "$DMG_PATH" != "$TARGET_DMG_PATH" ]]; then
+  rm -f "$TARGET_DMG_PATH"
+  mv "$DMG_PATH" "$TARGET_DMG_PATH"
+  DMG_PATH="$TARGET_DMG_PATH"
+fi
+
 echo "Release DMG generated: $DMG_PATH"
