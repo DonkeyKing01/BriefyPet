@@ -441,6 +441,8 @@ a {
 .error-banner {
   color: #fff;
   background: color-mix(in srgb, var(--danger) 88%, black);
+  line-height: 1.45;
+  white-space: pre-line;
 }
 
 .interaction-banner {

@@ -93,6 +93,66 @@ const PET_ASSET_BY_STATUS = {
   }
 } as const;
 
+function extractErrorText(value: unknown, seen = new Set<unknown>()): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (seen.has(value)) {
+    return null;
+  }
+  seen.add(value);
+
+  const record = value as {
+    message?: unknown;
+    cause?: unknown;
+    error?: unknown;
+    data?: unknown;
+  };
+
+  const message = extractErrorText(record.message, seen);
+  const cause = extractErrorText(record.cause, seen);
+  const nestedError = extractErrorText(record.error, seen);
+  const nestedData = extractErrorText(record.data, seen);
+
+  const parts = [message, cause, nestedError, nestedData].filter(
+    (item, index, array): item is string => Boolean(item) && array.indexOf(item) === index
+  );
+
+  if (parts.length > 0) {
+    return parts.join(": ");
+  }
+
+  const serialized = JSON.stringify(value);
+  if (serialized && serialized !== "{}") {
+    return serialized;
+  }
+  return null;
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error) {
+    const fromError = extractErrorText({
+      message: err.message,
+      cause: "cause" in err ? (err as Error & { cause?: unknown }).cause : undefined
+    });
+    if (fromError) {
+      return fromError;
+    }
+  }
+
+  const extracted = extractErrorText(err);
+  if (extracted) {
+    return extracted;
+  }
+  return fallback;
+}
+
 const MODULE_LABELS: Record<SourceModule, string> = {
   technology: "科技",
   social_science: "社科",
@@ -420,6 +480,129 @@ function activeProviderApiKeyKey(provider: LlmProvider, customProviderName: stri
   return name ? `custom:${name}` : "custom";
 }
 
+type SettingsSaveErrorContext = {
+  providerLabel: string;
+  protocol: string;
+  baseUrl: string;
+  model: string;
+  hasApiKey: boolean;
+};
+
+function statusCodeFromError(message: string): number | null {
+  const match =
+    message.match(/\bHTTP\s+(\d{3})\b/i) ??
+    message.match(/\bstatus(?: code)?[:= ]+(\d{3})\b/i);
+  if (!match) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function settingsSaveFailureSummary(rawMessage: string): { summary: string; advice: string } {
+  const lower = rawMessage.toLowerCase();
+  const statusCode = statusCodeFromError(rawMessage);
+
+  if (lower.includes("missing api key")) {
+    return {
+      summary: "API Key 未填写。",
+      advice: "请确认当前服务商这一栏已经填入 API Key，且不是只填在了其他服务商下面。"
+    };
+  }
+
+  if (
+    statusCode === 401 ||
+    statusCode === 403 ||
+    lower.includes("unauthorized") ||
+    lower.includes("forbidden") ||
+    lower.includes("invalid api key") ||
+    lower.includes("authentication")
+  ) {
+    return {
+      summary: "API Key 没有通过服务商认证。",
+      advice: "请检查 Key 是否属于当前服务商、是否复制完整、是否已启用模型调用权限，并确认账号余额或套餐可用。"
+    };
+  }
+
+  if (
+    statusCode === 404 ||
+    lower.includes("model_not_found") ||
+    lower.includes("model not found") ||
+    lower.includes("not found")
+  ) {
+    return {
+      summary: "接口地址或模型 ID 不匹配。",
+      advice: "请重点检查 Base URL 是否包含正确版本路径，以及 Model ID 是否是该服务商真实可调用的模型名。"
+    };
+  }
+
+  if (
+    statusCode === 400 ||
+    lower.includes("bad request") ||
+    lower.includes("invalid_request") ||
+    lower.includes("invalid request")
+  ) {
+    return {
+      summary: "服务商拒绝了验证请求格式。",
+      advice: "如果使用自定义服务，请检查 API 协议、Base URL 和 Model ID 是否互相匹配。"
+    };
+  }
+
+  if (
+    statusCode === 402 ||
+    statusCode === 429 ||
+    lower.includes("quota") ||
+    lower.includes("rate limit") ||
+    lower.includes("insufficient") ||
+    lower.includes("billing")
+  ) {
+    return {
+      summary: "账号额度、余额或频率限制导致验证失败。",
+      advice: "请检查服务商控制台的余额、账单状态、调用频率限制，稍后也可以重新保存再试。"
+    };
+  }
+
+  if (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("connect") ||
+    lower.includes("connection") ||
+    lower.includes("dns") ||
+    lower.includes("resolve") ||
+    lower.includes("network") ||
+    lower.includes("certificate") ||
+    lower.includes("tls")
+  ) {
+    return {
+      summary: "网络连接到服务商失败。",
+      advice: "请检查网络、代理/VPN、系统防火墙，以及 Base URL 是否能从当前电脑访问。"
+    };
+  }
+
+  if (statusCode && statusCode >= 500) {
+    return {
+      summary: "服务商接口暂时不可用或返回异常。",
+      advice: "请稍后重试；如果一直失败，再检查服务商状态页或换一个模型验证。"
+    };
+  }
+
+  return {
+    summary: "配置验证没有通过。",
+    advice: "请先按下面的配置摘要核对服务商、协议、Base URL、Model ID 和 API Key；原始异常里通常会包含服务商给出的更具体原因。"
+  };
+}
+
+function settingsSaveErrorMessage(err: unknown, context: SettingsSaveErrorContext): string {
+  const raw = errorMessage(err, "保存设置失败");
+  const { summary, advice } = settingsSaveFailureSummary(raw);
+  return [
+    `保存失败：${summary}`,
+    `自查项：服务商 ${context.providerLabel}；API 协议 ${context.protocol || "未设置"}；Base URL ${context.baseUrl || "未设置"}；Model ID ${context.model || "未设置"}；API Key ${context.hasApiKey ? "已填写" : "未填写"}。`,
+    advice,
+    `原始异常：${raw}`
+  ].join("\n");
+}
+
 const DEMO_SOURCES: RssSource[] = [
   {
     id: "demo-social-frontier",
@@ -738,7 +921,7 @@ function useSnapshotEvents(enabled: boolean) {
         if (!active) {
           return;
         }
-        setError(err instanceof Error ? err.message : "加载失败");
+      setError(errorMessage(err, "加载失败"));
       } finally {
         if (active) {
           setLoading(false);
@@ -1550,7 +1733,7 @@ function MemoryReviewWindow({
     } catch (err) {
       setErrors((prev) => ({
         ...prev,
-        [proposal.id]: err instanceof Error ? err.message : "\u63d0\u4ea4\u5468\u5ea6\u8bb0\u5fc6\u6821\u51c6\u5931\u8d25\u3002"
+        [proposal.id]: errorMessage(err, "\u63d0\u4ea4\u5468\u5ea6\u8bb0\u5fc6\u6821\u51c6\u5931\u8d25\u3002")
       }));
     } finally {
       setSavingIds((prev) => ({ ...prev, [proposal.id]: false }));
@@ -1771,6 +1954,15 @@ function SettingsView({
     event.preventDefault();
 
     const formData = new FormData(event.currentTarget);
+    const saveErrorContext: SettingsSaveErrorContext = {
+      providerLabel: llmProvider === "custom"
+        ? llmCustomProviderName.trim() || "自定义"
+        : providerDefinition.label,
+      protocol: llmProvider === "custom" ? llmProtocol : providerDefinition.protocol,
+      baseUrl: llmProvider === "custom" ? llmBaseUrl.trim() : providerDefinition.baseUrl,
+      model: llmModel.trim(),
+      hasApiKey: activeApiKey.trim().length > 0
+    };
     const providerApiKeys = Object.fromEntries(
       Object.entries(providerApiKeyDrafts).map(([key, value]) => [key, value.trim()])
     );
@@ -1823,9 +2015,18 @@ function SettingsView({
         return;
       }
       if (!activeApiKey.trim()) {
-        setSubmitError("自定义服务请填写 API Key。");
+        setSubmitError(
+          settingsSaveErrorMessage("API Key validation failed: missing API Key", saveErrorContext)
+        );
         return;
       }
+    }
+
+    if (!activeApiKey.trim()) {
+      setSubmitError(
+        settingsSaveErrorMessage("API Key validation failed: missing API Key", saveErrorContext)
+      );
+      return;
     }
 
     const rssSources = snapshot.settings.rssSources.map((source) => ({
@@ -1873,7 +2074,7 @@ function SettingsView({
       const next = await saveSettings(payload);
       setSnapshot(next);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "保存设置失败");
+      setSubmitError(settingsSaveErrorMessage(err, saveErrorContext));
     } finally {
       setSaving(false);
     }
@@ -1901,7 +2102,7 @@ function SettingsView({
       setCustomBucket(customBucketOptions[0]);
       setCustomGroup(customGroupOptions[0]);
     } catch (err) {
-      setAddSourceError(err instanceof Error ? err.message : "新增 RSS 失败");
+      setAddSourceError(errorMessage(err, "新增 RSS 失败"));
     } finally {
       setAddingSource(false);
     }
@@ -2844,7 +3045,7 @@ function MainWindow({
         if (cancelled) {
           return;
         }
-        setInteractionMessage(err instanceof Error ? err.message : "加载原文失败");
+      setInteractionMessage(errorMessage(err, "加载原文失败"));
       })
       .finally(() => {
         if (!cancelled) {
@@ -2958,7 +3159,7 @@ function MainWindow({
         setHistoryHasMore(false);
       }
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "加载历史推送失败");
+      setInteractionMessage(errorMessage(err, "加载历史推送失败"));
     } finally {
       setHistoryLoadingMore(false);
     }
@@ -2996,7 +3197,7 @@ function MainWindow({
       const next = await openArticle(articleId);
       setSnapshot(next);
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "打开文章失败");
+      setInteractionMessage(errorMessage(err, "打开文章失败"));
     }
   }
 
@@ -3019,7 +3220,7 @@ function MainWindow({
       const next = await toggleFavorite(selectedArticle.id);
       setSnapshot(next);
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "收藏操作失败");
+      setInteractionMessage(errorMessage(err, "收藏操作失败"));
     }
   }
 
@@ -3041,7 +3242,7 @@ function MainWindow({
       setSnapshot(next);
       setInteractionMessage("笔记已保存");
     } catch (err) {
-      setInteractionMessage(err instanceof Error ? err.message : "保存笔记失败");
+      setInteractionMessage(errorMessage(err, "保存笔记失败"));
     } finally {
       setNoteSaving(false);
     }
