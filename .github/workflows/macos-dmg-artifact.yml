@@ -1,0 +1,43 @@
+name: Build macOS DMG Artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - windows
+
+jobs:
+  build-dmg:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Build macOS app and DMG
+        run: npm run tauri:build:mac:release-dmg
+
+      - name: Upload macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Briefy-pet_0.1.0_mac.dmg
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/dmg/Briefy-pet_0.1.0_mac.dmg

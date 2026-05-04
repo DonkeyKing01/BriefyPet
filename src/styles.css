@@ -441,6 +441,8 @@ a {
 .error-banner {
   color: #fff;
   background: color-mix(in srgb, var(--danger) 88%, black);
+  line-height: 1.45;
+  white-space: pre-line;
 }
 
 .interaction-banner {
@@ -573,10 +575,9 @@ a {
 .folder-row {
   min-height: 30px;
   width: 100%;
-  display: flex;
+  display: grid;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  column-gap: 8px;
   padding: 0 8px;
   border-radius: 8px;
   background: transparent;
@@ -585,11 +586,14 @@ a {
   text-align: left;
 }
 
+.feed-row:not(.child),
+.folder-row {
+  grid-template-columns: 16px 16px minmax(0, 1fr) auto;
+}
+
 .feed-row-left {
   min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+  display: contents;
 }
 
 .feed-name {
@@ -611,17 +615,33 @@ a {
 
 .feed-row.child {
   min-height: 28px;
-  padding-left: 24px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding-left: 52px;
 }
 
 .folder-row.module-row {
-  padding-left: 18px;
+  padding-left: 28px;
 }
 
 .row-icon {
   width: 14px;
   height: 14px;
+  justify-self: center;
   flex: 0 0 auto;
+}
+
+.feed-row:not(.child) .row-icon {
+  grid-column: 2;
+}
+
+.feed-row:not(.child) .feed-row-left > :not(.row-icon) {
+  grid-column: 3;
+  min-width: 0;
+}
+
+.feed-row:not(.child) .count-badge,
+.folder-row .count-badge {
+  grid-column: 4;
 }
 
 .folder-block + .folder-block {
@@ -630,6 +650,7 @@ a {
 
 .folder-chevron {
   display: inline-flex;
+  justify-content: center;
   transition: transform 120ms ease;
 }
 

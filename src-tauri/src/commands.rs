@@ -56,7 +56,7 @@ pub async fn save_settings(
 
     service::validate_api_key_for_settings(&app, &settings)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("{err:#}"))?;
 
     let conn = db::connect(&app).map_err(|err| err.to_string())?;
     db::write_settings(&conn, &settings).map_err(|err| err.to_string())?;
