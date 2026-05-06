@@ -14,6 +14,10 @@
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-B7410E">
 </p>
 
+<p align="center">
+  <a href="./README.md">中文</a> | <a href="./README.en.md">English</a>
+</p>
+
 ## 什么是 BriefyPet
 
 > 信息过载深感焦虑？
