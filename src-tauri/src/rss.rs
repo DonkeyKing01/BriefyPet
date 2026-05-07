@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use anyhow::{anyhow, Context, Result};
 use atom_syndication::Feed;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures::{stream, StreamExt};
 use reqwest::{
     header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL},
@@ -234,10 +234,7 @@ fn parse_rss_items(source: &RssSource, channel: &Channel) -> Vec<FeedArticle> {
             .map(|guid| guid.value().trim().to_string())
             .filter(|guid| !guid.is_empty())
             .unwrap_or_else(|| format!("{}::{link}", source.id));
-        let published_at = item
-            .pub_date()
-            .and_then(parse_datetime)
-            .map(|value| value.with_timezone(&Utc));
+        let published_at = item.pub_date().and_then(parse_datetime);
         let content = item
             .content()
             .or_else(|| item.description())
@@ -286,10 +283,7 @@ fn parse_atom_entries(source: &RssSource, feed: &Feed) -> Vec<FeedArticle> {
         } else {
             entry.id().to_string()
         };
-        let published_at = entry
-            .published()
-            .map(|value| value.with_timezone(&Utc))
-            .or_else(|| Some(entry.updated().with_timezone(&Utc)));
+        let published_at = entry.published().map(|value| value.with_timezone(&Utc));
         let content = entry
             .content()
             .and_then(|content| content.value())
@@ -318,10 +312,39 @@ fn parse_atom_entries(source: &RssSource, feed: &Feed) -> Vec<FeedArticle> {
     articles
 }
 
-fn parse_datetime(value: &str) -> Option<DateTime<chrono::FixedOffset>> {
-    DateTime::parse_from_rfc2822(value)
-        .ok()
-        .or_else(|| DateTime::parse_from_rfc3339(value).ok())
+fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(parsed) = DateTime::parse_from_rfc2822(trimmed) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+
+    for pattern in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y.%m.%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(trimmed, pattern) {
+            return Some(Utc.from_utc_datetime(&parsed));
+        }
+    }
+
+    for pattern in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"] {
+        if let Ok(parsed) = NaiveDate::parse_from_str(trimmed, pattern) {
+            return parsed
+                .and_hms_opt(0, 0, 0)
+                .map(|datetime| Utc.from_utc_datetime(&datetime));
+        }
+    }
+
+    None
 }
 
 fn normalize_url(url: &str) -> String {
