@@ -30,3 +30,4 @@ landingpage.html
 rss_catalog
 icon_drafts
 .agents
+src-tauri/Cargo.toml

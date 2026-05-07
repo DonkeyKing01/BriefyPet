@@ -3319,8 +3319,8 @@ function MainWindow({
     ? bucketLabel(selectedArticleMeta.bucket)
     : "未分类";
   const selectedSourceLabel = selectedArticleMeta?.sourceName ?? selectedArticle?.sourceName ?? "未知来源";
-  const selectedPublishedTime = selectedArticle
-    ? formatArticleTime(selectedArticle.publishedAt ?? selectedArticle.fetchedAt)
+  const selectedPublishedTime = selectedArticle?.publishedAt
+    ? formatArticleTime(selectedArticle.publishedAt)
     : "未知";
   const selectedPushedTime = selectedArticleMeta?.pushedAt
     ? formatArticleTime(selectedArticleMeta.pushedAt)
@@ -3746,9 +3746,13 @@ function MainWindow({
                     ? bucketLabel(meta.bucket)
                     : "未分类";
                   const sourceLabel = meta?.sourceName ?? article.sourceName;
-                  const timelineTime = formatArticleTime(
-                    article.publishedAt ?? article.fetchedAt ?? meta?.pushedAt ?? null
-                  );
+                  const timelineTimeLabel = article.publishedAt
+                    ? `PUB ${formatArticleTime(article.publishedAt)}`
+                    : article.fetchedAt
+                      ? `FETCH ${formatArticleTime(article.fetchedAt)}`
+                      : meta?.pushedAt
+                        ? `PUSH ${formatArticleTime(meta.pushedAt)}`
+                        : "TIME Unknown";
                   const selected = selectedArticle?.id === article.id;
                   const isUnreadItem = unreadIdSet.has(article.id) || manualUnreadSet.has(article.id);
 
@@ -3767,7 +3771,7 @@ function MainWindow({
                         <h3>{article.title}</h3>
                       </div>
                       <p className="timeline-meta">
-                        MOD {moduleLabel} · BKT {bucketDisplayLabel} · PUB {timelineTime}
+                        MOD {moduleLabel} · BKT {bucketDisplayLabel} · {timelineTimeLabel}
                         {article.fitScore > 0 && (
                           <span className="score-chip"> · {article.fitScore}分</span>
                         )}
